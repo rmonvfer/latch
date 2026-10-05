@@ -95,7 +95,9 @@ _terminal_compadd() {
   local -a hits descriptions
   if [[ -n ${opts[d]-} ]]; then
     if [[ ${opts[d]} == \(* ]]; then
-      eval "descriptions=${opts[d]}"
+      # An inline array: split it into words without evaluating it, since
+      # its text can come from file names or other untrusted data.
+      descriptions=("${(@Q)${(z)${${opts[d]#\(}%\)}}}")
     else
       descriptions=("${(@P)opts[d]}")
     fi
