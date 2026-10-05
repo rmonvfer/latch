@@ -2,8 +2,8 @@
 //! rows, drag and drop, and the menus for tabs, groups, and view options.
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Hsla, MouseButton, MouseDownEvent, SharedString, anchored,
-    deferred, div, prelude::*, px,
+    AnyElement, ClickEvent, Context, CursorStyle, Hsla, MouseButton, MouseDownEvent, SharedString,
+    anchored, deferred, div, prelude::*, px,
 };
 
 use serde::{Deserialize, Serialize};
@@ -161,7 +161,8 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(theme::SIDEBAR_WIDTH)
+            .relative()
+            .w(self.sidebar_width)
             .h_full()
             .min_h_0()
             .bg(theme.surface)
@@ -198,8 +199,14 @@ impl Workspace {
                         icon_button("new-tab", "plus", theme)
                             .size(px(22.))
                             .rounded(px(5.))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.new_tab_in(None, window, cx)
+                            .when(
+                                self.context_menu
+                                    .as_ref()
+                                    .is_some_and(|menu| menu.kind == MenuKind::NewTab),
+                                |button| button.bg(theme.ghost_selected),
+                            )
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                this.open_context_menu(MenuKind::NewTab, event.position(), cx);
                             })),
                     ),
             )
@@ -246,6 +253,30 @@ impl Workspace {
                                 this.layout_changed(cx);
                             })),
                     ),
+            )
+            .child(
+                div()
+                    .id("sidebar-resize-handle")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_full()
+                    .w(theme::SIDEBAR_RESIZE_HANDLE_WIDTH)
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.sidebar_resizing = true;
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        // Double-clicking the edge restores the default width.
+                        if event.click_count() == 2 {
+                            this.sidebar_width = theme::SIDEBAR_WIDTH;
+                            this.layout_changed(cx);
+                        }
+                    })),
             )
     }
 
@@ -578,6 +609,7 @@ impl Workspace {
             MenuKind::ViewOptions => {
                 render_view_options_menu(&SettingsStore::get(cx).sidebar, theme).into_any_element()
             }
+            MenuKind::NewTab => self.render_new_tab_menu(theme, cx).into_any_element(),
         };
         Some(deferred(
             anchored()
@@ -758,6 +790,49 @@ impl Workspace {
                     )),
                 ),
         )
+    }
+
+    fn render_new_tab_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let profiles = SettingsStore::get(cx).agent_profiles.clone();
+        let settings_path = SettingsStore::path(cx);
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                menu_item("menu-new-terminal", "terminal", "New Terminal", theme).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.close_context_menu(cx);
+                        this.new_tab_in(None, window, cx);
+                    }),
+                ),
+            )
+            .when(!profiles.is_empty(), |menu| {
+                menu.child(menu_separator(theme))
+                    .child(menu_caption("Agents", theme))
+            })
+            .children(profiles.into_iter().enumerate().map(|(index, profile)| {
+                let icon_name = profile.icon.map(TabIcon::asset).unwrap_or("bot");
+                menu_item(
+                    ("menu-agent", index),
+                    icon_name,
+                    profile.name.clone(),
+                    theme,
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.close_context_menu(cx);
+                    this.open_agent(&profile, window, cx);
+                }))
+            }))
+            .child(menu_separator(theme))
+            .child(
+                menu_item("menu-edit-agents", "pencil", "Edit Agent Profiles…", theme).on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        cx.open_with_system(&settings_path);
+                    }),
+                ),
+            )
     }
 
     fn render_color_choices(

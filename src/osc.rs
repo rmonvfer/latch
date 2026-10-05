@@ -4,6 +4,8 @@
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OscEvent {
+    /// OSC 133;A — the shell is drawing a prompt.
+    PromptStarted,
     /// OSC 133;C — a command started running.
     CommandStarted,
     /// OSC 133;D — the command finished, with its exit status if reported.
@@ -89,6 +91,7 @@ fn parse(body: &[u8]) -> Option<OscEvent> {
         "133" => {
             let mut parts = rest.split(';');
             match parts.next()? {
+                "A" => Some(OscEvent::PromptStarted),
                 "C" => Some(OscEvent::CommandStarted),
                 "D" => Some(OscEvent::CommandFinished(
                     parts.next().and_then(|status| status.trim().parse().ok()),
@@ -140,7 +143,11 @@ mod tests {
         let events = scanner.scan(b"out\x1b]133;A\x07$ \x1b]133;C\x1b\\ls\x1b]133;D;2\x07");
         assert_eq!(
             events,
-            vec![OscEvent::CommandStarted, OscEvent::CommandFinished(Some(2))]
+            vec![
+                OscEvent::PromptStarted,
+                OscEvent::CommandStarted,
+                OscEvent::CommandFinished(Some(2))
+            ]
         );
     }
 
@@ -194,7 +201,7 @@ mod tests {
         let mut scanner = OscScanner::default();
         assert!(
             scanner
-                .scan(b"\x1b]9;4;1;50\x07\x1b]0;title\x07\x1b]133;A\x07")
+                .scan(b"\x1b]9;4;1;50\x07\x1b]0;title\x07\x1b]133;B\x07")
                 .is_empty()
         );
     }

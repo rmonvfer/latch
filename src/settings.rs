@@ -8,7 +8,11 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AsyncApp, Global};
 use serde::{Deserialize, Serialize};
 
-use crate::{sidebar::SidebarSettings, status_bar::StatusBarSettings};
+use crate::{
+    agents::{self, AgentProfile},
+    sidebar::SidebarSettings,
+    status_bar::StatusBarSettings,
+};
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -35,6 +39,8 @@ pub struct Settings {
     pub notifications: bool,
     /// Ask before closing a pane, tab, or window with a running program.
     pub confirm_close: bool,
+    /// Agents offered in the sidebar's `+` menu.
+    pub agent_profiles: Vec<AgentProfile>,
 }
 
 impl Default for Settings {
@@ -49,6 +55,7 @@ impl Default for Settings {
             shell_integration: true,
             notifications: true,
             confirm_close: true,
+            agent_profiles: agents::default_profiles(),
         }
     }
 }
@@ -87,7 +94,18 @@ impl SettingsStore {
     pub fn init(cx: &mut App) {
         let path = settings_path();
         let settings = match read_settings(&path) {
-            Ok(Some(settings)) => settings,
+            Ok(Some(settings)) => {
+                // Write back keys the file is missing, so every setting
+                // (such as agent profiles) is there to edit.
+                let complete = serde_json::to_string_pretty(&settings).ok();
+                let current = fs::read_to_string(&path).ok();
+                if complete.as_deref().map(str::trim) != current.as_deref().map(str::trim)
+                    && let Err(error) = write_settings(&path, &settings)
+                {
+                    log::warn!("failed to update {}: {error:#}", path.display());
+                }
+                settings
+            }
             Ok(None) => {
                 let settings = Settings::default();
                 if let Err(error) = write_settings(&path, &settings) {

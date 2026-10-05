@@ -5,12 +5,13 @@ use std::{
 };
 
 use gpui::{
-    Action, AnyElement, App, AsyncApp, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    MouseButton, Pixels, Point, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
-    actions, div, prelude::*, px,
+    Action, AnyElement, App, AsyncApp, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
+    Focusable, MouseButton, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString,
+    Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 
 use crate::{
+    agents::AgentProfile,
     components::{icon, icon_button, keybinding},
     confirm::confirm_close,
     notifications,
@@ -39,6 +40,10 @@ actions!(
         Quit
     ]
 );
+
+fn clamp_sidebar_width(width: Pixels) -> Pixels {
+    width.clamp(theme::SIDEBAR_MIN_WIDTH, theme::SIDEBAR_MAX_WIDTH)
+}
 
 /// Activate the tab at the given index; `usize::MAX` selects the last tab.
 #[derive(Clone, Debug, PartialEq, Action)]
@@ -86,6 +91,7 @@ pub(crate) enum MenuKind {
     Tab(TabId),
     Group(GroupId),
     ViewOptions,
+    NewTab,
 }
 
 pub(crate) struct ContextMenu {
@@ -122,6 +128,8 @@ pub struct Workspace {
     open_tabs: HashMap<TabId, OpenTab>,
     pub(crate) active: Option<TabId>,
     pub(crate) sidebar_open: bool,
+    pub(crate) sidebar_width: Pixels,
+    pub(crate) sidebar_resizing: bool,
     titlebar_dragging: bool,
     pub(crate) tab_scroll: ScrollHandle,
     pub(crate) context_menu: Option<ContextMenu>,
@@ -173,6 +181,8 @@ impl Workspace {
             open_tabs: HashMap::new(),
             active: None,
             sidebar_open: true,
+            sidebar_width: theme::SIDEBAR_WIDTH,
+            sidebar_resizing: false,
             titlebar_dragging: false,
             tab_scroll: ScrollHandle::new(),
             context_menu: None,
@@ -187,13 +197,14 @@ impl Workspace {
             workspace.restore(state, window, cx);
         }
         if workspace.open_tabs.is_empty() {
-            workspace.open_terminal(None, None, TabStyle::default(), window, cx);
+            workspace.open_terminal(None, None, None, TabStyle::default(), window, cx);
         }
         workspace
     }
 
     fn restore(&mut self, state: SessionState, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = state.sidebar_open;
+        self.sidebar_width = clamp_sidebar_width(px(state.sidebar_width));
         for entry in state.entries {
             match entry {
                 EntryState::Tab(tab) => self.restore_tab(tab, None, window, cx),
@@ -237,7 +248,7 @@ impl Workspace {
             TabKind::Terminal => {
                 let panes = match &tab.panes {
                     Some(state) => PaneGroup::restore(state, window, cx),
-                    None => PaneGroup::build(None, window, cx),
+                    None => PaneGroup::build(None, None, window, cx),
                 };
                 match panes {
                     Ok(panes) => {
@@ -257,12 +268,13 @@ impl Workspace {
     fn open_terminal(
         &mut self,
         cwd: Option<&Path>,
+        startup: Option<&str>,
         group: Option<GroupId>,
         style: TabStyle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<TabId> {
-        match PaneGroup::build(cwd, window, cx) {
+        match PaneGroup::build(cwd, startup, window, cx) {
             Ok(panes) => Some(self.add_terminal_tab(panes, group, style, window, cx)),
             Err(error) => {
                 log::error!("failed to open terminal: {error:#}");
@@ -402,7 +414,26 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let cwd = self.active_metadata(cx).and_then(|metadata| metadata.cwd);
-        self.open_terminal(cwd.as_deref(), group, TabStyle::default(), window, cx);
+        self.open_terminal(cwd.as_deref(), None, group, TabStyle::default(), window, cx);
+    }
+
+    /// Open a tab running an agent, next to the active tab.
+    pub(crate) fn open_agent(
+        &mut self,
+        profile: &AgentProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let group = self.active.and_then(|id| self.layout.group_of(id));
+        let cwd = self.active_metadata(cx).and_then(|metadata| metadata.cwd);
+        let style = TabStyle {
+            name: None,
+            color: profile.color,
+            icon: profile.icon,
+            pinned: false,
+        };
+        let command = profile.command_line();
+        self.open_terminal(cwd.as_deref(), Some(&command), group, style, window, cx);
     }
 
     pub(crate) fn active_grid_size(&self, cx: &App) -> Option<(u16, u16)> {
@@ -701,6 +732,7 @@ impl Workspace {
             entries,
             active,
             sidebar_open: self.sidebar_open,
+            sidebar_width: f32::from(self.sidebar_width),
         }
     }
 
@@ -833,6 +865,30 @@ impl Workspace {
         self.sidebar_open = !self.sidebar_open;
         self.focus_content(window, cx);
         self.layout_changed(cx);
+    }
+
+    /// Follows the pointer while the sidebar's edge is being dragged. The
+    /// sidebar starts at the window's left edge, so its width is the
+    /// pointer's horizontal position.
+    fn on_sidebar_resize(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.finish_sidebar_resize(cx);
+            return;
+        }
+        self.sidebar_width = clamp_sidebar_width(event.position.x);
+        cx.notify();
+    }
+
+    pub(crate) fn finish_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_resizing {
+            self.sidebar_resizing = false;
+            self.layout_changed(cx);
+        }
     }
 
     pub(crate) fn open_settings(
@@ -1014,6 +1070,18 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::rename_tab))
             .on_action(cx.listener(Self::quit))
+            .when(self.sidebar_resizing, |root| {
+                root.cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_move(cx.listener(Self::on_sidebar_resize))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.finish_sidebar_resize(cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.finish_sidebar_resize(cx)),
+                    )
+            })
             .child(self.render_titlebar(&theme, cx))
             .child(
                 div()

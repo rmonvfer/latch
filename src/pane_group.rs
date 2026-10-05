@@ -97,10 +97,11 @@ impl PaneGroup {
     /// A group with one terminal started in `cwd`.
     pub fn build(
         cwd: Option<&std::path::Path>,
+        startup: Option<&str>,
         window: &mut Window,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
-        let view = TerminalView::build(cwd, cx)?;
+        let view = TerminalView::build(cwd, startup, cx)?;
         Ok(cx.new(|cx| Self::from_tree(PaneTree::new(view.clone()), view, window, cx)))
     }
 
@@ -184,7 +185,7 @@ impl PaneGroup {
 
     fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.active_metadata(cx).cwd.clone();
-        let view = match TerminalView::build(cwd.as_deref(), cx) {
+        let view = match TerminalView::build(cwd.as_deref(), None, cx) {
             Ok(view) => view,
             Err(error) => {
                 log::error!("failed to open terminal: {error:#}");
@@ -534,7 +535,7 @@ fn snapshot_node(node: &PaneNode<Entity<TerminalView>>, cx: &App) -> PaneState {
 
 fn restore_node(state: &PaneState, cx: &mut App) -> Option<PaneNode<Entity<TerminalView>>> {
     match state {
-        PaneState::Terminal { cwd } => match TerminalView::build(cwd.as_deref(), cx) {
+        PaneState::Terminal { cwd } => match TerminalView::build(cwd.as_deref(), None, cx) {
             Ok(view) => Some(PaneNode::Leaf(view)),
             Err(error) => {
                 log::error!("failed to restore terminal: {error:#}");

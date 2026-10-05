@@ -29,6 +29,10 @@ const FONT_FALLBACKS: [&str; 2] = ["JetBrains Mono", "Menlo"];
 pub const UI_FONT_FAMILY: &str = "IBM Plex Sans";
 
 pub const SIDEBAR_WIDTH: Pixels = px(260.);
+pub const SIDEBAR_MIN_WIDTH: Pixels = px(180.);
+pub const SIDEBAR_MAX_WIDTH: Pixels = px(480.);
+/// Width of the grabbable strip on the sidebar's right edge.
+pub const SIDEBAR_RESIZE_HANDLE_WIDTH: Pixels = px(5.);
 pub const TITLEBAR_HEIGHT: Pixels = px(34.);
 pub const STATUS_BAR_HEIGHT: Pixels = px(30.);
 /// Horizontal space reserved for the macOS traffic lights.

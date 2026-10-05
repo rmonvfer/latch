@@ -10,6 +10,7 @@ use crate::{
     pane_group::PaneState,
     settings::SettingsStore,
     tabs::{TabColor, TabStyle},
+    theme,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,10 +55,16 @@ pub struct SessionState {
     pub active: usize,
     #[serde(default = "default_true")]
     pub sidebar_open: bool,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_sidebar_width() -> f32 {
+    f32::from(theme::SIDEBAR_WIDTH)
 }
 
 fn session_path() -> PathBuf {
@@ -130,6 +137,7 @@ mod tests {
             ],
             active: 1,
             sidebar_open: false,
+            sidebar_width: 320.,
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<SessionState>(&json).unwrap(), state);
@@ -141,6 +149,7 @@ mod tests {
             serde_json::from_str(r#"{ "entries": [ { "type": "tab", "kind": "terminal" } ] }"#)
                 .unwrap();
         assert!(state.sidebar_open);
+        assert_eq!(state.sidebar_width, f32::from(theme::SIDEBAR_WIDTH));
         assert_eq!(state.active, 0);
         let EntryState::Tab(tab) = &state.entries[0] else {
             panic!("expected a tab");

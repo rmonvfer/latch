@@ -130,6 +130,10 @@ pub enum Attention {
     },
 }
 
+/// How long to wait for a first prompt before typing a startup command
+/// anyway.
+const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
+
 /// An agent must work at least this long before going quiet is news.
 const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
 
@@ -160,6 +164,8 @@ pub struct TerminalView {
     /// Set by libghostty when the program rings the bell.
     bell: Rc<Cell<bool>>,
     activity: Activity,
+    /// A command to type once the shell shows its first prompt.
+    pending_startup: Option<String>,
     /// When the foreground agent started its current stretch of work.
     working_since: Option<Instant>,
     command_started: Option<Instant>,
@@ -217,7 +223,9 @@ impl Focusable for TerminalView {
 
 impl TerminalView {
     /// Spawn a shell and create the view that displays it.
-    pub fn build(cwd: Option<&Path>, cx: &mut App) -> Result<Entity<Self>> {
+    /// Start a shell in `cwd`. `startup` is typed into it once it starts,
+    /// as if the user had entered it at the prompt.
+    pub fn build(cwd: Option<&Path>, startup: Option<&str>, cx: &mut App) -> Result<Entity<Self>> {
         let initial = PtyDimensions {
             cols: 80,
             rows: 24,
@@ -273,6 +281,14 @@ impl TerminalView {
                 }
                 let _ = this.update(cx, |_, cx| cx.emit(TerminalEvent::Exited));
             });
+            if startup.is_some() {
+                // Shells without prompt marks never announce a prompt.
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    cx.background_executor().timer(STARTUP_FALLBACK).await;
+                    let _ = this.update(cx, |view, cx| view.send_startup_command(cx));
+                })
+                .detach();
+            }
             let metadata_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 loop {
                     let refreshed = this.update(cx, |view, cx| view.refresh_metadata(cx));
@@ -313,6 +329,7 @@ impl TerminalView {
                 osc: OscScanner::default(),
                 bell,
                 activity: Activity::default(),
+                pending_startup: startup.map(str::to_string),
                 working_since: None,
                 command_started: None,
                 last_command: None,
@@ -364,6 +381,10 @@ impl TerminalView {
     /// Returns whether the command state changed.
     fn apply_osc_event(&mut self, event: OscEvent, cx: &mut Context<Self>) -> bool {
         match event {
+            OscEvent::PromptStarted => {
+                self.send_startup_command(cx);
+                false
+            }
             OscEvent::CommandStarted => {
                 self.command_started = Some(Instant::now());
                 true
@@ -392,6 +413,15 @@ impl TerminalView {
                 }));
                 false
             }
+        }
+    }
+
+    /// Type the startup command into the shell. This waits for the first
+    /// prompt because startup files that query the terminal consume any
+    /// input typed before they finish.
+    fn send_startup_command(&mut self, cx: &mut Context<Self>) {
+        if let Some(command) = self.pending_startup.take() {
+            self.write_input(format!("{command}\n").as_bytes(), cx);
         }
     }
 
