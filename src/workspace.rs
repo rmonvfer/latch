@@ -15,13 +15,15 @@ use crate::{
     components::{icon, icon_button, keybinding},
     confirm::confirm_close,
     notifications,
-    pane_group::{PaneGroup, PaneGroupEvent},
+    pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
+    pane_tree::PaneNode,
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
     sidebar::sidebar_child_index,
     status_bar::{StatusItem, format_duration},
-    tabs::{Entry, GroupId, Row, TabColor, TabIcon, TabId, TabLayout, TabStyle},
+    tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout, TabStyle},
+    terminal_view::TerminalView,
     terminal_view::{AgentState, Attention, TabMetadata},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Theme},
@@ -305,6 +307,16 @@ impl Workspace {
                     PaneGroupEvent::Attention(attention) => {
                         this.handle_attention(id, attention, window, cx)
                     }
+                    PaneGroupEvent::PaneDropped {
+                        dragged,
+                        target,
+                        edge,
+                    } => {
+                        this.move_pane_into(id, dragged.clone(), target.clone(), *edge, window, cx)
+                    }
+                    PaneGroupEvent::TabDropped { tab, target, edge } => {
+                        this.merge_tab_into(id, *tab, target.clone(), *edge, window, cx)
+                    }
                 },
             );
         self.open_tabs.insert(
@@ -484,6 +496,112 @@ impl Workspace {
             },
         };
         Some(display)
+    }
+
+    fn panes_of(&self, tab: TabId) -> Option<Entity<PaneGroup>> {
+        match &self.open_tabs.get(&tab)?.content {
+            TabContent::Terminal(panes) => Some(panes.clone()),
+            TabContent::Settings(_) => None,
+        }
+    }
+
+    fn tab_holding(&self, panes: &WeakEntity<PaneGroup>) -> Option<TabId> {
+        self.open_tabs
+            .iter()
+            .find_map(|(id, tab)| match &tab.content {
+                TabContent::Terminal(group) if group.entity_id() == panes.entity_id() => Some(*id),
+                _ => None,
+            })
+    }
+
+    /// Take a dragged pane out of its tab. Returns the pane's tab when the
+    /// pane was that tab's only one (the tab is left in place).
+    fn lift_pane(
+        &mut self,
+        dragged: &DraggedPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Result<(), TabId>> {
+        let source = dragged.source.upgrade()?;
+        let source_tab = self.tab_holding(&dragged.source)?;
+        let detached = source.update(cx, |group, cx| group.detach(&dragged.view, window, cx));
+        Some(match detached {
+            Detached::Removed => Ok(()),
+            Detached::WasLast => Err(source_tab),
+        })
+    }
+
+    /// Move a pane dragged from another tab next to `target` in `tab`.
+    fn move_pane_into(
+        &mut self,
+        tab: TabId,
+        dragged: DraggedPane,
+        target: Entity<TerminalView>,
+        edge: Edge,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(destination) = self.panes_of(tab) else {
+            return;
+        };
+        match self.lift_pane(&dragged, window, cx) {
+            None => return,
+            // The pane was its tab's only one: the tab goes away, its
+            // terminal lives on in the destination.
+            Some(Err(source_tab)) => self.close(source_tab, window, cx),
+            Some(Ok(())) => {}
+        }
+        destination.update(cx, |group, cx| {
+            group.adopt(PaneNode::Leaf(dragged.view), &target, edge, window, cx)
+        });
+        self.activate(tab, window, cx);
+    }
+
+    /// Merge every pane of `source_tab` into `tab`, next to `target`.
+    fn merge_tab_into(
+        &mut self,
+        tab: TabId,
+        source_tab: TabId,
+        target: Entity<TerminalView>,
+        edge: Edge,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab == source_tab {
+            return;
+        }
+        let (Some(destination), Some(source)) = (self.panes_of(tab), self.panes_of(source_tab))
+        else {
+            return;
+        };
+        let panes = source.read(cx).root();
+        self.close(source_tab, window, cx);
+        destination.update(cx, |group, cx| {
+            group.adopt(panes, &target, edge, window, cx)
+        });
+        self.activate(tab, window, cx);
+    }
+
+    /// Turn a dragged pane into a tab of its own at `destination` in the
+    /// sidebar.
+    pub(crate) fn pane_to_tab(
+        &mut self,
+        dragged: &DraggedPane,
+        destination: TabDestination,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match self.lift_pane(dragged, window, cx) {
+            None => return,
+            // Already a tab of its own: just move it.
+            Some(Err(source_tab)) => source_tab,
+            Some(Ok(())) => {
+                let panes = PaneGroup::from_view(dragged.view.clone(), window, cx);
+                self.add_terminal_tab(panes, None, TabStyle::default(), window, cx)
+            }
+        };
+        self.layout.move_tab(id, destination);
+        self.activate(id, window, cx);
     }
 
     /// Activate the tab whose element id is `element_id`, as carried by a

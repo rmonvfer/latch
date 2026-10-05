@@ -14,6 +14,7 @@ use crate::{
         DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
         menu_surface,
     },
+    pane_group::DraggedPane,
     settings::{Settings, SettingsStore},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
     terminal_view::AgentState,
@@ -96,8 +97,8 @@ const GROUP_INDENT: f32 = 14.;
 
 /// Payload while a tab is being dragged.
 #[derive(Clone)]
-struct DraggedTab {
-    id: TabId,
+pub(crate) struct DraggedTab {
+    pub id: TabId,
     label: SharedString,
     icon: &'static str,
 }
@@ -248,6 +249,12 @@ impl Workspace {
                                 this.layout.move_tab(dragged.id, TabDestination::End);
                                 this.layout_changed(cx);
                             }))
+                            .drag_over::<DraggedPane>(move |style, _, _, _| {
+                                style.border_color(accent)
+                            })
+                            .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
+                                this.pane_to_tab(dragged, TabDestination::End, window, cx);
+                            }))
                             .on_drop(cx.listener(|this, dragged: &DraggedGroup, _, cx| {
                                 this.layout.move_group(dragged.id, None);
                                 this.layout_changed(cx);
@@ -353,6 +360,10 @@ impl Workspace {
                 this.layout
                     .move_tab(dragged.id, TabDestination::IntoGroup(id));
                 this.layout_changed(cx);
+            }))
+            .drag_over::<DraggedPane>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
+            .on_drop(cx.listener(move |this, dragged: &DraggedPane, window, cx| {
+                this.pane_to_tab(dragged, TabDestination::IntoGroup(id), window, cx);
             }))
             .on_drop(cx.listener(move |this, dragged: &DraggedGroup, _, cx| {
                 this.layout.move_group(dragged.id, Some(Entry::Group(id)));
@@ -513,6 +524,10 @@ impl Workspace {
                 .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
                     this.layout.move_tab(dragged.id, TabDestination::Before(id));
                     this.layout_changed(cx);
+                }))
+                .drag_over::<DraggedPane>(move |style, _, _, _| style.border_color(accent))
+                .on_drop(cx.listener(move |this, dragged: &DraggedPane, window, cx| {
+                    this.pane_to_tab(dragged, TabDestination::Before(id), window, cx);
                 }))
                 .on_drop(cx.listener(move |this, dragged: &DraggedGroup, _, cx| {
                     // Groups only live at the top level: land before this

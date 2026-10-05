@@ -67,14 +67,23 @@ impl<T: Clone + PartialEq> PaneTree<T> {
         leaves
     }
 
-    /// Place `new` next to `target` along `axis`, sharing `target`'s space.
+    /// Place `new` after `target` along `axis`, sharing `target`'s space.
     pub fn split(&mut self, target: &T, new: T, axis: Axis) -> bool {
-        let id = self.next_split_id;
-        let inserted = split_node(&mut self.root, target, new, axis, id);
-        if inserted == Inserted::NewSplit {
-            self.next_split_id += 1;
+        self.insert(target, PaneNode::Leaf(new), axis, false)
+    }
+
+    /// Place `node` (a pane or a whole arrangement) beside `target` along
+    /// `axis`, before or after it, sharing `target`'s space.
+    pub fn insert(&mut self, target: &T, node: PaneNode<T>, axis: Axis, before: bool) -> bool {
+        let mut node = Some(node);
+        if !insert_node(&mut self.root, target, &mut node, axis, before) {
+            return false;
         }
-        inserted != Inserted::NotFound
+        collapse(&mut self.root);
+        let mut next = 0;
+        renumber(&mut self.root, &mut next);
+        self.next_split_id = next;
+        true
     }
 
     /// Remove a leaf. Its space goes to its neighbours, and a split left with
@@ -111,13 +120,6 @@ impl<T: Clone + PartialEq> PaneTree<T> {
     }
 }
 
-#[derive(PartialEq)]
-enum Inserted {
-    NotFound,
-    IntoExisting,
-    NewSplit,
-}
-
 fn renumber<T>(node: &mut PaneNode<T>, next: &mut usize) {
     if let PaneNode::Split(split) = node {
         split.id = *next;
@@ -139,47 +141,54 @@ fn collect_leaves<T: Clone>(node: &PaneNode<T>, leaves: &mut Vec<T>) {
     }
 }
 
-fn split_node<T: Clone + PartialEq>(
+fn insert_node<T: Clone + PartialEq>(
     node: &mut PaneNode<T>,
     target: &T,
-    new: T,
+    new: &mut Option<PaneNode<T>>,
     axis: Axis,
-    id: usize,
-) -> Inserted {
+    before: bool,
+) -> bool {
     match node {
         PaneNode::Leaf(leaf) if leaf == target => {
-            let existing = leaf.clone();
+            let existing = PaneNode::Leaf(leaf.clone());
+            let Some(new) = new.take() else {
+                return false;
+            };
+            let children = if before {
+                vec![new, existing]
+            } else {
+                vec![existing, new]
+            };
             *node = PaneNode::Split(Split {
-                id,
+                id: 0,
                 axis,
-                children: vec![PaneNode::Leaf(existing), PaneNode::Leaf(new)],
+                children,
                 ratios: vec![0.5, 0.5],
             });
-            Inserted::NewSplit
+            true
         }
-        PaneNode::Leaf(_) => Inserted::NotFound,
+        PaneNode::Leaf(_) => false,
         PaneNode::Split(split) => {
-            // Splitting along the parent's own axis adds a sibling instead
+            // Inserting along the parent's own axis adds a sibling instead
             // of nesting another split.
             if split.axis == axis
                 && let Some(index) = split
                     .children
                     .iter()
                     .position(|child| matches!(child, PaneNode::Leaf(leaf) if leaf == target))
+                && let Some(new) = new.take()
             {
                 let half = split.ratios[index] / 2.;
                 split.ratios[index] = half;
-                split.ratios.insert(index + 1, half);
-                split.children.insert(index + 1, PaneNode::Leaf(new));
-                return Inserted::IntoExisting;
+                let at = if before { index } else { index + 1 };
+                split.ratios.insert(at, half);
+                split.children.insert(at, new);
+                return true;
             }
-            for child in &mut split.children {
-                let result = split_node(child, target, new.clone(), axis, id);
-                if result != Inserted::NotFound {
-                    return result;
-                }
-            }
-            Inserted::NotFound
+            split
+                .children
+                .iter_mut()
+                .any(|child| insert_node(child, target, new, axis, before))
         }
     }
 }
@@ -287,6 +296,27 @@ mod tests {
         assert!(
             matches!(&root.children[2], PaneNode::Split(inner) if inner.axis == Axis::Vertical)
         );
+    }
+
+    #[test]
+    fn inserting_before_and_merging_subtrees() {
+        let mut tree = PaneTree::new(1);
+        tree.split(&1, 2, Axis::Horizontal);
+        assert!(tree.insert(&1, PaneNode::Leaf(0), Axis::Horizontal, true));
+        assert_eq!(tree.leaves(), vec![0, 1, 2]);
+
+        let mut other = PaneTree::new(7);
+        other.split(&7, 8, Axis::Horizontal);
+        // A horizontal arrangement dropped beside a pane of a horizontal
+        // split flattens into it.
+        assert!(tree.insert(&2, other.root().clone(), Axis::Horizontal, false));
+        assert_eq!(tree.leaves(), vec![0, 1, 2, 7, 8]);
+        let PaneNode::Split(root) = tree.root() else {
+            panic!("expected split");
+        };
+        assert_eq!(root.children.len(), 5);
+        let total: f32 = root.ratios.iter().sum();
+        assert!((total - 1.).abs() < 1e-5);
     }
 
     #[test]
