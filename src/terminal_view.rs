@@ -251,14 +251,13 @@ impl TerminalView {
             program_title
         };
 
-        let reported_pwd = self.terminal.pwd().unwrap_or_default().trim().to_string();
-        let directory = if reported_pwd.is_empty() {
-            self.pty
-                .shell_pid()
-                .and_then(process_info::working_directory)
-        } else {
-            Some(PathBuf::from(strip_file_url(&reported_pwd)))
-        };
+        // Ask the kernel rather than trusting OSC 7: any program writing to
+        // the terminal can emit that sequence and claim an arbitrary path,
+        // which new tabs, splits, and session restore would then open.
+        let directory = self
+            .pty
+            .shell_pid()
+            .and_then(process_info::working_directory);
         let branch = directory.as_deref().and_then(process_info::git_branch);
 
         TabMetadata {
@@ -807,13 +806,5 @@ fn to_mouse_button(button: MouseButton) -> Option<mouse::Button> {
         MouseButton::Right => Some(mouse::Button::Right),
         MouseButton::Middle => Some(mouse::Button::Middle),
         _ => None,
-    }
-}
-
-/// OSC 7 reports the directory as `file://host/path`; keep only the path.
-fn strip_file_url(pwd: &str) -> &str {
-    match pwd.strip_prefix("file://") {
-        Some(rest) => rest.find('/').map_or(rest, |slash| &rest[slash..]),
-        None => pwd,
     }
 }
