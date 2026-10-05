@@ -4,6 +4,8 @@
 //! Run it as `terminal mcp`; it forwards every tool call to the running
 //! app over the control socket.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
@@ -16,7 +18,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::control::{self, NewTab, PaneTarget, Request, SplitDirection};
+use crate::control::{ControlClient, NewTab, PaneTarget, Request, SplitDirection};
 
 const INSTRUCTIONS: &str = "Controls the terminal app the user is running. Tabs and panes \
 have numeric ids from list_tabs. Pane-targeted tools take either a pane id or a tab id \
@@ -111,12 +113,37 @@ struct NotifyArgs {
 #[derive(Clone)]
 struct TerminalServer {
     tool_router: ToolRouter<Self>,
+    /// One connection for the whole session, so approval given to a caller
+    /// outside any pane is asked for once rather than per tool call.
+    connection: Arc<Mutex<Option<ControlClient>>>,
 }
 
 /// Forward a request to the app off the async runtime, reporting failures
 /// to the agent as tool errors.
-async fn forward(request: Request) -> Result<CallToolResult, ErrorData> {
-    let outcome = tokio::task::spawn_blocking(move || control::call(request))
+/// Send a request over the shared connection (opening it if needed), off
+/// the async runtime.
+fn send(connection: &Mutex<Option<ControlClient>>, request: Request) -> Result<Value> {
+    let mut connection = connection
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the connection lock is poisoned"))?;
+    if connection.is_none() {
+        *connection = Some(ControlClient::connect()?);
+    }
+    let client = connection.as_mut().expect("connected above");
+    let outcome = client.request(request);
+    if outcome.is_err() {
+        // Reconnect on the next call in case the app restarted.
+        *connection = None;
+    }
+    outcome
+}
+
+async fn forward(
+    connection: &Arc<Mutex<Option<ControlClient>>>,
+    request: Request,
+) -> Result<CallToolResult, ErrorData> {
+    let connection = connection.clone();
+    let outcome = tokio::task::spawn_blocking(move || send(&connection, request))
         .await
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
     Ok(match outcome {
@@ -139,6 +166,7 @@ impl TerminalServer {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            connection: Arc::default(),
         }
     }
 
@@ -146,7 +174,7 @@ impl TerminalServer {
         description = "List open tabs with their ids, titles, groups, directories, git branches, coding-agent status, and panes."
     )]
     async fn list_tabs(&self) -> Result<CallToolResult, ErrorData> {
-        forward(Request::ListTabs).await
+        forward(&self.connection, Request::ListTabs).await
     }
 
     #[tool(
@@ -156,13 +184,16 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<OpenTabArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::NewTab(NewTab {
-            cwd: args.cwd.map(Into::into),
-            command: args.command,
-            agent: args.agent,
-            name: args.name,
-            group: args.group,
-        }))
+        forward(
+            &self.connection,
+            Request::NewTab(NewTab {
+                cwd: args.cwd.map(Into::into),
+                command: args.command,
+                agent: args.agent,
+                name: args.name,
+                group: args.group,
+            }),
+        )
         .await
     }
 
@@ -171,10 +202,13 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::SendInput {
-            target: args.target.into(),
-            text: args.text,
-        })
+        forward(
+            &self.connection,
+            Request::SendInput {
+                target: args.target.into(),
+                text: args.text,
+            },
+        )
         .await
     }
 
@@ -183,10 +217,13 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::ReadOutput {
-            target: args.target.into(),
-            lines: args.lines.unwrap_or(50),
-        })
+        forward(
+            &self.connection,
+            Request::ReadOutput {
+                target: args.target.into(),
+                lines: args.lines.unwrap_or(50),
+            },
+        )
         .await
     }
 
@@ -197,14 +234,17 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<SplitArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::Split {
-            target: args.target.into(),
-            direction: match args.direction {
-                Direction::Right => SplitDirection::Right,
-                Direction::Down => SplitDirection::Down,
+        forward(
+            &self.connection,
+            Request::Split {
+                target: args.target.into(),
+                direction: match args.direction {
+                    Direction::Right => SplitDirection::Right,
+                    Direction::Down => SplitDirection::Down,
+                },
+                command: args.command,
             },
-            command: args.command,
-        })
+        )
         .await
     }
 
@@ -213,7 +253,7 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<TabArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::FocusTab { tab: args.tab }).await
+        forward(&self.connection, Request::FocusTab { tab: args.tab }).await
     }
 
     #[tool(description = "Close a tab, ending the programs running in it.")]
@@ -221,7 +261,7 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<TabArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::CloseTab { tab: args.tab }).await
+        forward(&self.connection, Request::CloseTab { tab: args.tab }).await
     }
 
     #[tool(description = "Name a tab, or clear its name to show the program's title.")]
@@ -229,10 +269,13 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<RenameArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::RenameTab {
-            tab: args.tab,
-            name: args.name,
-        })
+        forward(
+            &self.connection,
+            Request::RenameTab {
+                tab: args.tab,
+                name: args.name,
+            },
+        )
         .await
     }
 
@@ -241,11 +284,14 @@ impl TerminalServer {
         &self,
         Parameters(args): Parameters<NotifyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        forward(Request::Notify {
-            target: args.target.into(),
-            title: args.title,
-            body: args.body.unwrap_or_default(),
-        })
+        forward(
+            &self.connection,
+            Request::Notify {
+                target: args.target.into(),
+                title: args.title,
+                body: args.body.unwrap_or_default(),
+            },
+        )
         .await
     }
 }

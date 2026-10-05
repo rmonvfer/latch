@@ -180,6 +180,8 @@ pub struct TerminalView {
     /// A command to type once the shell shows its first prompt.
     pending_startup: Option<String>,
     pane_id: u64,
+    /// Secret proving a control request comes from a program in this pane.
+    control_token: String,
     diff: Option<DiffStats>,
     /// When the foreground agent started its current stretch of work.
     working_since: Option<Instant>,
@@ -278,6 +280,8 @@ impl TerminalView {
             shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
         // Lets programs in the pane, such as the control CLI, address it.
         command.env(PANE_ID_VARIABLE, pane_id.to_string());
+        let control_token = control::new_token()?;
+        command.env(control::TOKEN_VARIABLE, &control_token);
         control::configure_command(&mut command, cx);
         let (pty, output) = Pty::spawn(command, initial, cwd)?;
         let initial_cwd = pty.initial_cwd().map(Path::to_path_buf);
@@ -435,6 +439,7 @@ impl TerminalView {
                 activity: Activity::default(),
                 pending_startup: startup.map(str::to_string),
                 pane_id,
+                control_token,
                 diff: None,
                 working_since: None,
                 command_started: None,
@@ -451,9 +456,17 @@ impl TerminalView {
     }
 
     /// Where the terminal was last laid out, in window coordinates.
-    /// The process id of the pane's shell.
-    pub fn shell_pid(&self) -> Option<i32> {
-        self.pty.shell_pid()
+    /// Whether `token` is this pane's control token, compared in constant
+    /// time.
+    pub fn has_control_token(&self, token: &str) -> bool {
+        let expected = self.control_token.as_bytes();
+        let given = token.as_bytes();
+        expected.len() == given.len()
+            && expected
+                .iter()
+                .zip(given)
+                .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                == 0
     }
 
     /// Identifies this pane to the control API for the app's lifetime.

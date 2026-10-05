@@ -4,9 +4,14 @@
 //! Requests and replies are single JSON lines. The socket is created
 //! owner-only and connections from other users are refused. Anything
 //! beyond listing tabs (reading output, typing, opening or closing tabs)
-//! needs the user's approval for the calling program, since a sandboxed
-//! process able to reach the socket could otherwise run commands in an
-//! unsandboxed shell or read other tabs.
+//! needs the user's approval, since a sandboxed process able to reach the
+//! socket could otherwise run commands in an unsandboxed shell or read
+//! other tabs.
+//!
+//! Callers are identified by a secret token each pane passes to its
+//! programs (`TERMINAL_CONTROL_TOKEN`), not by process names or ids, which
+//! a program can fake. Approval for a pane covers every program in it.
+//! Callers without a valid token are approved per connection only.
 
 use std::{
     collections::HashMap,
@@ -20,7 +25,10 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -125,6 +133,9 @@ pub enum Request {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: u64,
+    /// The calling pane's control token, if it runs inside one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     #[serde(flatten)]
     pub request: Request,
 }
@@ -136,6 +147,15 @@ pub struct Reply {
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// A random 128-bit secret, hex encoded.
+pub fn new_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut source| std::io::Read::read_exact(&mut source, &mut bytes))
+        .context("failed to read random bytes")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub fn socket_path() -> PathBuf {
@@ -163,7 +183,24 @@ pub fn configure_command(command: &mut CommandBuilder, cx: &App) {
     }
 }
 
-type Pending = (Request, Option<i32>, mpsc::Sender<Result<Value, String>>);
+/// Environment variable holding a pane's control token.
+pub const TOKEN_VARIABLE: &str = "TERMINAL_CONTROL_TOKEN";
+
+static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+
+/// Where a request came from.
+struct Caller {
+    connection: u64,
+    /// Reported by the OS for the dialog; never trusted for identity.
+    peer: Option<i32>,
+    token: Option<String>,
+}
+
+enum Message {
+    Request(Request, Caller, mpsc::Sender<Result<Value, String>>),
+    /// A connection closed; its per-connection approval is forgotten.
+    Closed(u64),
+}
 
 impl Request {
     /// Listing tabs reveals only titles and directories; everything else
@@ -173,9 +210,9 @@ impl Request {
     }
 }
 
-/// Who is calling: the program, and the tab it runs in if any.
+/// Who is calling, as far as the token proves.
 struct Client {
-    /// Approval is remembered under this key for the app's lifetime.
+    /// Approval is remembered under this key: a pane, or one connection.
     key: String,
     description: String,
 }
@@ -196,7 +233,7 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
         }
     };
 
-    let (requests_tx, requests_rx) = async_channel::unbounded::<Pending>();
+    let (requests_tx, requests_rx) = async_channel::unbounded::<Message>();
     if let Err(error) = thread::Builder::new()
         .name("control-accept".into())
         .spawn(move || accept_connections(listener, requests_tx))
@@ -207,11 +244,18 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
 
     cx.spawn(async move |cx: &mut AsyncApp| {
         let mut decisions: HashMap<String, bool> = HashMap::new();
-        while let Ok((request, peer, reply)) = requests_rx.recv().await {
+        while let Ok(message) = requests_rx.recv().await {
+            let (request, caller, reply) = match message {
+                Message::Request(request, caller, reply) => (request, caller, reply),
+                Message::Closed(connection) => {
+                    decisions.remove(&connection_key(connection));
+                    continue;
+                }
+            };
             if request.needs_approval() {
                 let client = cx
                     .update(|cx| {
-                        window.update(cx, |workspace, _, cx| workspace.identify_client(peer, cx))
+                        window.update(cx, |workspace, _, cx| workspace.identify_client(&caller, cx))
                     })
                     .ok();
                 let Some(client) = client else {
@@ -224,7 +268,7 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
                         let answer = cx.update(|cx| {
                             window.update(cx, |_, window, cx| {
                                 let detail = format!(
-                                    "{} wants to control your terminals: read their output, type into them, and open or close tabs.",
+                                    "{} to control your terminals: read their output, type into them, and open or close tabs.",
                                     client.description
                                 );
                                 window.prompt(
@@ -305,7 +349,7 @@ fn link_cli() -> Result<()> {
     Ok(())
 }
 
-fn accept_connections(listener: UnixListener, requests: async_channel::Sender<Pending>) {
+fn accept_connections(listener: UnixListener, requests: async_channel::Sender<Message>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
@@ -348,8 +392,23 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
     (result == 0 && pid > 0).then_some(pid)
 }
 
-fn serve_connection(stream: UnixStream, requests: async_channel::Sender<Pending>) {
+fn connection_key(connection: u64) -> String {
+    format!("connection:{connection}")
+}
+
+fn serve_connection(stream: UnixStream, requests: async_channel::Sender<Message>) {
+    let connection = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
     let peer = peer_pid(&stream);
+    serve_lines(stream, connection, peer, &requests);
+    let _ = requests.send_blocking(Message::Closed(connection));
+}
+
+fn serve_lines(
+    stream: UnixStream,
+    connection: u64,
+    peer: Option<i32>,
+    requests: &async_channel::Sender<Message>,
+) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
@@ -364,7 +423,15 @@ fn serve_connection(stream: UnixStream, requests: async_channel::Sender<Pending>
             Ok(envelope) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let outcome = requests
-                    .send_blocking((envelope.request, peer, reply_tx))
+                    .send_blocking(Message::Request(
+                        envelope.request,
+                        Caller {
+                            connection,
+                            peer,
+                            token: envelope.token,
+                        },
+                        reply_tx,
+                    ))
                     .map_err(|_| "the app is shutting down".to_string())
                     .and_then(|_| {
                         reply_rx
@@ -401,69 +468,99 @@ fn serve_connection(stream: UnixStream, requests: async_channel::Sender<Pending>
     }
 }
 
-/// Send one request to a running app and wait for its reply.
-pub fn call(request: Request) -> Result<Value> {
-    let path = std::env::var_os(SOCKET_VARIABLE)
-        .map(PathBuf::from)
-        .unwrap_or_else(socket_path);
-    let mut stream = UnixStream::connect(&path).with_context(|| {
-        format!(
-            "cannot reach the terminal app at {} — is it running?",
-            path.display()
-        )
-    })?;
-    let mut line = serde_json::to_string(&Envelope { id: 1, request })?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
-    let reply: Reply = serde_json::from_str(&response).context("invalid reply from the app")?;
-    match (reply.result, reply.error) {
-        (_, Some(error)) => bail!(error),
-        (Some(result), None) => Ok(result),
-        (None, None) => Ok(Value::Null),
+/// A connection to a running app. Approval given to a caller outside any
+/// pane lasts for the connection, so long-lived clients keep one open.
+pub struct ControlClient {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+    token: Option<String>,
+    next_id: u64,
+}
+
+impl ControlClient {
+    pub fn connect() -> Result<Self> {
+        let path = std::env::var_os(SOCKET_VARIABLE)
+            .map(PathBuf::from)
+            .unwrap_or_else(socket_path);
+        let writer = UnixStream::connect(&path).with_context(|| {
+            format!(
+                "cannot reach the terminal app at {} — is it running?",
+                path.display()
+            )
+        })?;
+        let reader = BufReader::new(writer.try_clone()?);
+        Ok(Self {
+            writer,
+            reader,
+            token: std::env::var(TOKEN_VARIABLE).ok(),
+            next_id: 1,
+        })
+    }
+
+    pub fn request(&mut self, request: Request) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut line = serde_json::to_string(&Envelope {
+            id,
+            token: self.token.clone(),
+            request,
+        })?;
+        line.push('\n');
+        self.writer.write_all(line.as_bytes())?;
+        let mut response = String::new();
+        if self.reader.read_line(&mut response)? == 0 {
+            bail!("the terminal app closed the connection");
+        }
+        let reply: Reply = serde_json::from_str(&response).context("invalid reply from the app")?;
+        match (reply.result, reply.error) {
+            (_, Some(error)) => bail!(error),
+            (Some(result), None) => Ok(result),
+            (None, None) => Ok(Value::Null),
+        }
     }
 }
 
+/// Send one request to a running app over a fresh connection.
+pub fn call(request: Request) -> Result<Value> {
+    ControlClient::connect()?.request(request)
+}
+
 impl Workspace {
-    /// Describe a calling process by name and the tab it runs in, found by
-    /// walking up its parents to a pane's shell.
-    fn identify_client(&self, pid: Option<i32>, cx: &App) -> Client {
-        let Some(pid) = pid else {
-            return Client {
-                key: "unknown".to_string(),
-                description: "An unidentified program".to_string(),
-            };
-        };
-        let name = process_info::process_name(pid).unwrap_or_else(|| format!("process {pid}"));
-        let executable = process_info::process_args(pid)
-            .and_then(|args| args.into_iter().next())
-            .unwrap_or_else(|| name.clone());
-        let ancestry = process_info::ancestry(pid);
-        let pane = self.layout.ordered_tabs().into_iter().find_map(|tab| {
-            let panes = self.panes_of(tab)?;
-            panes.read(cx).views().into_iter().find_map(|view| {
-                let shell = view.read(cx).shell_pid()?;
-                ancestry
-                    .contains(&shell)
-                    .then(|| (tab, view.read(cx).pane_id()))
+    /// Identify a caller by its pane token. Without a valid token the
+    /// caller is only this connection, described by the name the OS
+    /// reports (shown to the user, never trusted).
+    fn identify_client(&self, caller: &Caller, cx: &App) -> Client {
+        let pane = caller.token.as_deref().and_then(|token| {
+            self.layout.ordered_tabs().into_iter().find_map(|tab| {
+                let panes = self.panes_of(tab)?;
+                panes
+                    .read(cx)
+                    .views()
+                    .into_iter()
+                    .find(|view| view.read(cx).has_control_token(token))
+                    .map(|view| (tab, view.read(cx).pane_id()))
             })
         });
-        match pane {
-            Some((tab, pane_id)) => {
-                let title = self
-                    .display(tab, cx)
-                    .map(|display| display.title.to_string())
-                    .unwrap_or_default();
-                Client {
-                    key: format!("pane:{pane_id}:{executable}"),
-                    description: format!("“{name}” in the tab “{title}”"),
-                }
-            }
-            None => Client {
-                key: format!("process:{executable}"),
-                description: format!("“{name}”, running outside this app,"),
-            },
+        if let Some((tab, pane_id)) = pane {
+            let title = self
+                .display(tab, cx)
+                .map(|display| display.title.to_string())
+                .unwrap_or_default();
+            return Client {
+                key: format!("pane:{pane_id}"),
+                description: format!("Programs in the tab “{title}” want"),
+            };
+        }
+        let name = caller
+            .peer
+            .and_then(process_info::process_name)
+            .map(|name| {
+                format!("A program outside this app's tabs (calling itself “{name}”) wants")
+            })
+            .unwrap_or_else(|| "An unidentified program wants".to_string());
+        Client {
+            key: connection_key(caller.connection),
+            description: name,
         }
     }
 
@@ -688,6 +785,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tokens_are_random_and_carried_in_envelopes() {
+        let first = new_token().unwrap();
+        let second = new_token().unwrap();
+        assert_eq!(first.len(), 32);
+        assert_ne!(first, second);
+        let envelope: Envelope = serde_json::from_str(&format!(
+            r#"{{ "id": 1, "token": "{first}", "method": "list_tabs" }}"#
+        ))
+        .unwrap();
+        assert_eq!(envelope.token.as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
     fn only_listing_is_free() {
         assert!(!Request::ListTabs.needs_approval());
         assert!(
@@ -704,6 +814,7 @@ mod tests {
     fn requests_use_method_and_params() {
         let envelope = Envelope {
             id: 7,
+            token: None,
             request: Request::SendInput {
                 target: PaneTarget {
                     tab: None,
@@ -731,11 +842,14 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        let (requests_tx, requests_rx) = async_channel::unbounded::<Pending>();
+        let (requests_tx, requests_rx) = async_channel::unbounded::<Message>();
         thread::spawn(move || accept_connections(listener, requests_tx));
         thread::spawn(move || {
-            while let Ok((request, peer, reply)) = requests_rx.recv_blocking() {
-                assert_eq!(peer, Some(std::process::id() as i32));
+            while let Ok(message) = requests_rx.recv_blocking() {
+                let Message::Request(request, caller, reply) = message else {
+                    continue;
+                };
+                assert_eq!(caller.peer, Some(std::process::id() as i32));
                 let _ = reply.send(match request {
                     Request::ListTabs => Ok(json!({ "tabs": [] })),
                     _ => Err("unsupported".to_string()),
