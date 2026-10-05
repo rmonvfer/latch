@@ -1,70 +1,88 @@
-use std::{fs, sync::Arc};
+//! The settings page: the terminal's settings grouped into sections picked
+//! from a left column. Every change applies immediately and is saved to the
+//! settings file.
+
+use std::{fs, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
-    App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable, ScrollStrategy,
-    SharedString, Stateful, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
-    uniform_list,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, Div, Entity, FocusHandle,
+    Focusable, ScrollHandle, SharedString, Stateful, Subscription, Window, div, ease_in_out, point,
+    prelude::*, px, relative,
 };
 
 use crate::{
-    components::icon,
+    components::{button, icon},
     process_info::shorten_home,
+    session,
     settings::{
         FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, Settings, SettingsStore, TERMINAL_PADDING_RANGE,
     },
-    status_bar::{Side, StatusBarSettings, StatusItem},
+    sidebar::TabDensity,
+    status_bar::{Side, StatusItem},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Appearance, Theme, ThemeRegistry, ThemeSource},
 };
 
-const THEME_ROW_HEIGHT: f32 = 30.;
-const THEME_LIST_HEIGHT: f32 = 320.;
-const THEME_LIST_WIDTH: f32 = 290.;
+const NAV_WIDTH: f32 = 208.;
+const CONTENT_MAX_WIDTH: f32 = 720.;
+const CONTROL_HEIGHT: f32 = 28.;
+const THEME_PREVIEW_HEIGHT: f32 = 320.;
+/// Theme cards shown before "Show more"; Ghostty alone ships hundreds.
+const THEME_PAGE_SIZE: usize = 24;
 
-/// A numeric setting edited with − / + buttons.
-struct Stepper {
-    id: &'static str,
-    label: &'static str,
-    description: &'static str,
-    step: f32,
-    range: (f32, f32),
-    read: fn(&Settings) -> f32,
-    write: fn(&mut Settings, f32),
-    format: fn(f32) -> String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    General,
+    Appearance,
+    Terminal,
+    StatusBar,
+    Keyboard,
+    About,
 }
 
-const APPEARANCE: [Stepper; 3] = [
-    Stepper {
-        id: "font-size",
-        label: "Font Size",
-        description: "Size of terminal text.",
-        step: 0.5,
-        range: FONT_SIZE_RANGE,
-        read: |settings| settings.font_size,
-        write: |settings, value| settings.font_size = value,
-        format: |value| format!("{value} pt"),
-    },
-    Stepper {
-        id: "line-height",
-        label: "Line Height",
-        description: "Spacing between rows, as a multiple of the font size.",
-        step: 0.05,
-        range: LINE_HEIGHT_RANGE,
-        read: |settings| settings.line_height,
-        write: |settings, value| settings.line_height = value,
-        format: |value| format!("{value:.2}×"),
-    },
-    Stepper {
-        id: "terminal-padding",
-        label: "Terminal Padding",
-        description: "Space between the terminal text and the edges of its area.",
-        step: 2.,
-        range: TERMINAL_PADDING_RANGE,
-        read: |settings| settings.terminal_padding,
-        write: |settings, value| settings.terminal_padding = value,
-        format: |value| format!("{value} px"),
-    },
-];
+impl Section {
+    const ALL: [Section; 6] = [
+        Section::General,
+        Section::Appearance,
+        Section::Terminal,
+        Section::StatusBar,
+        Section::Keyboard,
+        Section::About,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Section::General => "General",
+            Section::Appearance => "Appearance",
+            Section::Terminal => "Terminal",
+            Section::StatusBar => "Status Bar",
+            Section::Keyboard => "Keyboard",
+            Section::About => "About",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Section::General => "settings",
+            Section::Appearance => "palette",
+            Section::Terminal => "terminal",
+            Section::StatusBar => "panel-bottom",
+            Section::Keyboard => "keyboard",
+            Section::About => "rocket",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Section::General => "Closing, notifications, agents, and outside control.",
+            Section::Appearance => "Theme and how the tab sidebar is laid out.",
+            Section::Terminal => "Text, shell integration, and command blocks.",
+            Section::StatusBar => "The bar along the bottom of the window and what it shows.",
+            Section::Keyboard => "Shortcuts available throughout the app.",
+            Section::About => "Version and the files settings live in.",
+        }
+    }
+}
 
 /// Which themes the picker lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,20 +93,6 @@ enum AppearanceFilter {
 }
 
 impl AppearanceFilter {
-    const ALL: [AppearanceFilter; 3] = [
-        AppearanceFilter::All,
-        AppearanceFilter::Dark,
-        AppearanceFilter::Light,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            AppearanceFilter::All => "All",
-            AppearanceFilter::Dark => "Dark",
-            AppearanceFilter::Light => "Light",
-        }
-    }
-
     fn matches(self, theme: &Theme) -> bool {
         match self {
             AppearanceFilter::All => true,
@@ -98,16 +102,21 @@ impl AppearanceFilter {
     }
 }
 
-/// The settings page, shown as a tab. Every change applies immediately and
-/// is saved to the settings file.
+type Change<T> = Rc<dyn Fn(T, &mut SettingsPage, &mut Context<SettingsPage>)>;
+
+/// The settings page, shown as a tab.
 pub struct SettingsPage {
     focus_handle: FocusHandle,
+    section: Section,
+    scroll: ScrollHandle,
+    theme_filter: AppearanceFilter,
     theme_search: Entity<TextInput>,
-    theme_list: UniformListScrollHandle,
-    filter: AppearanceFilter,
-    matches: Vec<Arc<Theme>>,
+    theme_limit: usize,
     /// The theme under the pointer, shown in the preview until it leaves.
     hovered: Option<Arc<Theme>>,
+    /// The switch flipped last, which animates its knob.
+    toggled: Option<&'static str>,
+    reset_armed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -123,130 +132,859 @@ impl SettingsPage {
         let subscriptions = vec![
             cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
             cx.observe_global::<ActiveTheme>(|_, cx| cx.notify()),
-            cx.observe_global::<ThemeRegistry>(|page, cx| page.refresh_matches(cx)),
+            cx.observe_global::<ThemeRegistry>(|_, cx| cx.notify()),
             cx.subscribe(&theme_search, |page, _, event: &TextInputEvent, cx| {
                 if let TextInputEvent::Changed = event {
-                    page.refresh_matches(cx);
+                    page.theme_limit = THEME_PAGE_SIZE;
+                    cx.notify();
                 }
             }),
         ];
-        let mut page = Self {
+        Self {
             focus_handle: cx.focus_handle(),
+            section: Section::General,
+            scroll: ScrollHandle::new(),
+            theme_filter: AppearanceFilter::All,
             theme_search,
-            theme_list: UniformListScrollHandle::new(),
-            filter: AppearanceFilter::All,
-            matches: Vec::new(),
+            theme_limit: THEME_PAGE_SIZE,
             hovered: None,
+            toggled: None,
+            reset_armed: false,
             _subscriptions: subscriptions,
-        };
-        page.refresh_matches(cx);
-        page.reveal_active_theme(cx);
-        page
-    }
-
-    fn refresh_matches(&mut self, cx: &mut Context<Self>) {
-        let query = self.theme_search.read(cx).text().trim().to_lowercase();
-        let filter = self.filter;
-        self.matches = ThemeRegistry::themes(cx)
-            .iter()
-            .filter(|theme| filter.matches(theme))
-            .filter(|theme| query.is_empty() || theme.name.to_lowercase().contains(&query))
-            .cloned()
-            .collect();
-        cx.notify();
-    }
-
-    fn set_filter(&mut self, filter: AppearanceFilter, cx: &mut Context<Self>) {
-        self.filter = filter;
-        self.refresh_matches(cx);
-        self.reveal_active_theme(cx);
-    }
-
-    fn reveal_active_theme(&self, cx: &App) {
-        let active = &cx.theme().name;
-        if let Some(index) = self.matches.iter().position(|theme| &theme.name == active) {
-            self.theme_list
-                .scroll_to_item(index, ScrollStrategy::Center);
         }
     }
 
-    fn render_section_title(&self, title: &'static str, theme: &Theme) -> impl IntoElement {
-        div()
-            .pt(px(24.))
-            .pb(px(8.))
-            .text_size(theme::TEXT_SMALL)
-            .text_color(theme.text_muted)
-            .child(title)
+    fn select_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        if self.section == section {
+            return;
+        }
+        self.section = section;
+        self.hovered = None;
+        self.reset_armed = false;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
     }
 
-    fn render_theme_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.matches.len();
-        let border = theme.border;
-        let previewed = self.hovered.clone().unwrap_or_else(|| cx.theme().clone());
+    fn render_nav(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let hover = theme.ghost_hover;
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(NAV_WIDTH))
+            .h_full()
+            .gap(px(2.))
+            .px(px(8.))
+            .pt(px(24.))
+            .bg(theme.title_bar)
+            .border_r_1()
+            .border_color(theme.border_variant)
+            .child(
+                div()
+                    .px(px(10.))
+                    .pb(px(12.))
+                    .text_size(theme::TEXT_DEFAULT)
+                    .text_color(theme.text)
+                    .child("Settings"),
+            )
+            .children(Section::ALL.into_iter().map(|section| {
+                let selected = section == self.section;
+                div()
+                    .id(("settings-nav", section as usize))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .h(px(30.))
+                    .px(px(10.))
+                    .rounded(theme::RADIUS_SM)
+                    .cursor_pointer()
+                    .text_size(theme::TEXT_SMALL)
+                    .map(|item| {
+                        if selected {
+                            item.bg(theme.ghost_selected).text_color(theme.text)
+                        } else {
+                            item.text_color(theme.text_muted)
+                                .hover(move |style| style.bg(hover))
+                        }
+                    })
+                    .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
+                        page.select_section(section, cx);
+                    }))
+                    .child(icon(
+                        section.icon(),
+                        theme::ICON_SMALL,
+                        if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        },
+                    ))
+                    .child(section.label())
+            }))
+    }
+
+    fn render_general(
+        &self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let settings_path = SettingsStore::path(cx);
+        let profiles = match settings.agent_profiles.len() {
+            1 => "1 agent".to_string(),
+            count => format!("{count} agents"),
+        };
+
+        vec![
+            group(
+                "Alerts",
+                vec![
+                    row(
+                        "Confirm close",
+                        "Ask before closing a pane, tab, or window with a program still running.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "confirm-close",
+                        settings.confirm_close,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.confirm_close = on),
+                    ))
+                    .into_any_element(),
+                    row(
+                        "Notifications",
+                        "Notify when a background tab's program asks to, or a long command finishes, while the window is inactive.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "notifications",
+                        settings.notifications,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.notifications = on),
+                    ))
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+            group(
+                "Agents",
+                vec![
+                    row(
+                        "Agent worktrees",
+                        "Start each agent from the sidebar's + menu in a new git worktree of the current repository.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "agent-worktrees",
+                        settings.agent_worktrees,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.agent_worktrees = on),
+                    ))
+                    .into_any_element(),
+                    row(
+                        "Agent profiles",
+                        format!(
+                            "{profiles} in the sidebar's + menu. Add or change them in the settings file."
+                        ),
+                        theme,
+                    )
+                    .child(
+                        button("edit-agent-profiles", Some("file-pen-line"), "Open in Editor", theme)
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                cx.open_with_system(&settings_path)
+                            }),
+                    )
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+            group(
+                "Automation",
+                vec![
+                    row(
+                        "Control API",
+                        "Serve the control socket used by the terminal command and the MCP server. Applies at launch.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "control-api",
+                        settings.control_api,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.control_api = on),
+                    ))
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+        ]
+    }
+
+    fn render_appearance(
+        &self,
+        settings: &Settings,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let sidebar = &settings.sidebar;
+        let expanded = sidebar.density == TabDensity::Expanded;
+
+        vec![
+            self.render_theme_group(theme, window, cx)
+                .into_any_element(),
+            group(
+                "Sidebar",
+                vec![
+                    row("Tab density", "How much each tab row shows.", theme)
+                        .child(self.segmented(
+                            "tab-density",
+                            &[
+                                (TabDensity::Compact, "Compact"),
+                                (TabDensity::Expanded, "Expanded"),
+                            ],
+                            sidebar.density,
+                            theme,
+                            cx,
+                            |density, _, cx| {
+                                SettingsStore::update(cx, |settings| {
+                                    settings.sidebar.density = density
+                                })
+                            },
+                        ))
+                        .into_any_element(),
+                    row(
+                        "Working directory",
+                        "Expanded tab rows show the shell's current directory.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "sidebar-directory",
+                        sidebar.show_directory,
+                        expanded,
+                        theme,
+                        cx,
+                        |on, _, cx| {
+                            SettingsStore::update(cx, |settings| {
+                                settings.sidebar.show_directory = on
+                            })
+                        },
+                    ))
+                    .into_any_element(),
+                    row(
+                        "Git branch",
+                        "Expanded tab rows show the repository's branch and changed files.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "sidebar-branch",
+                        sidebar.show_branch,
+                        expanded,
+                        theme,
+                        cx,
+                        |on, _, cx| {
+                            SettingsStore::update(cx, |settings| settings.sidebar.show_branch = on)
+                        },
+                    ))
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+        ]
+    }
+
+    fn render_theme_group(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let query = self.theme_search.read(cx).text().trim().to_lowercase();
+        let filter = self.theme_filter;
+        let matches: Vec<Arc<Theme>> = ThemeRegistry::themes(cx)
+            .iter()
+            .filter(|candidate| filter.matches(candidate))
+            .filter(|candidate| query.is_empty() || candidate.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let total = matches.len();
+        let hidden = total.saturating_sub(self.theme_limit);
+        let active = cx.theme().clone();
+        let previewed = self.hovered.clone().unwrap_or_else(|| active.clone());
+        let search_focused = self.theme_search.focus_handle(cx).is_focused(window);
 
         div()
             .flex()
             .flex_col()
-            .rounded(theme::RADIUS_LG)
-            .border_1()
-            .border_color(border)
-            .bg(theme.surface)
-            .overflow_hidden()
+            .child(group_caption("Theme", theme))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .h(px(38.))
-                    .pl(px(12.))
-                    .pr(px(6.))
-                    .border_b_1()
-                    .border_color(border)
-                    .child(icon("search", theme::ICON_SMALL, theme.text_muted))
-                    .child(div().flex_1().min_w_0().child(self.theme_search.clone()))
+                card(theme)
+                    .p(px(16.))
+                    .gap(px(16.))
                     .child(
                         div()
-                            .flex_none()
-                            .text_size(theme::TEXT_SMALL)
-                            .text_color(theme.text_placeholder)
-                            .child(SharedString::from(format!("{count}"))),
-                    )
-                    .child(self.render_filter(theme, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .h(px(THEME_LIST_HEIGHT))
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(THEME_LIST_WIDTH))
-                            .h_full()
-                            .border_r_1()
-                            .border_color(border)
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
                             .child(
-                                uniform_list(
-                                    "theme-list",
-                                    count,
-                                    cx.processor(|page, range: std::ops::Range<usize>, _, cx| {
-                                        let active = cx.theme().clone();
-                                        range
-                                            .filter_map(|index| page.matches.get(index).cloned())
-                                            .map(|candidate| {
-                                                page.render_theme_row(candidate, &active, cx)
-                                            })
-                                            .collect::<Vec<_>>()
-                                    }),
-                                )
-                                .track_scroll(&self.theme_list)
-                                .size_full(),
-                            ),
+                                field_frame(search_focused, theme)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap(px(8.))
+                                    .child(icon("search", theme::ICON_SMALL, theme.text_muted))
+                                    .child(
+                                        div().flex_1().min_w_0().child(self.theme_search.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(theme::TEXT_SMALL)
+                                            .text_color(theme.text_placeholder)
+                                            .child(SharedString::from(total.to_string())),
+                                    ),
+                            )
+                            .child(self.segmented(
+                                "theme-filter",
+                                &[
+                                    (AppearanceFilter::All, "All"),
+                                    (AppearanceFilter::Dark, "Dark"),
+                                    (AppearanceFilter::Light, "Light"),
+                                ],
+                                self.theme_filter,
+                                theme,
+                                cx,
+                                |filter, page, cx| {
+                                    page.theme_filter = filter;
+                                    page.theme_limit = THEME_PAGE_SIZE;
+                                    cx.notify();
+                                },
+                            )),
                     )
-                    .child(render_theme_preview(&previewed, theme)),
+                    .child(
+                        div()
+                            .flex()
+                            .h(px(THEME_PREVIEW_HEIGHT))
+                            .rounded(theme::RADIUS_LG)
+                            .border_1()
+                            .border_color(theme.border_variant)
+                            .overflow_hidden()
+                            .child(render_theme_preview(&previewed, theme)),
+                    )
+                    .child(if matches.is_empty() {
+                        div()
+                            .py(px(24.))
+                            .flex()
+                            .justify_center()
+                            .text_size(theme::TEXT_SMALL)
+                            .text_color(theme.text_muted)
+                            .child("No themes match.")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .grid()
+                            .grid_cols(3)
+                            .gap(px(12.))
+                            .children(matches.into_iter().take(self.theme_limit).map(|candidate| {
+                                let selected = candidate.name == active.name;
+                                let hovered = candidate.clone();
+                                theme_card(candidate, selected, theme).on_hover(cx.listener(
+                                    move |page, hovering: &bool, _, cx| {
+                                        if *hovering {
+                                            page.hovered = Some(hovered.clone());
+                                        } else if page
+                                            .hovered
+                                            .as_ref()
+                                            .is_some_and(|current| current.name == hovered.name)
+                                        {
+                                            page.hovered = None;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                            }))
+                            .into_any_element()
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .when(hidden > 0, |footer| {
+                                footer.child(
+                                    button(
+                                        "more-themes",
+                                        Some("chevron-down"),
+                                        format!("Show more ({hidden})"),
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |page, _: &ClickEvent, _, cx| {
+                                            page.theme_limit += THEME_PAGE_SIZE;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(theme::TEXT_SMALL)
+                                    .text_color(theme.text_placeholder)
+                                    .child(
+                                        "Zed .json themes and Ghostty theme files are supported.",
+                                    ),
+                            )
+                            .child(
+                                button(
+                                    "open-themes-folder",
+                                    Some("folder"),
+                                    "Themes Folder",
+                                    theme,
+                                )
+                                .on_click(
+                                    |_: &ClickEvent, _, cx| {
+                                        let directory = theme::user_theme_dir();
+                                        if let Err(error) = fs::create_dir_all(&directory) {
+                                            log::warn!(
+                                                "failed to create {}: {error}",
+                                                directory.display()
+                                            );
+                                        }
+                                        cx.open_with_system(&directory);
+                                    },
+                                ),
+                            )
+                            .child(
+                                button("reload-themes", Some("refresh-cw"), "Reload", theme)
+                                    .on_click(|_: &ClickEvent, _, cx| theme::reload_themes(cx)),
+                            ),
+                    ),
             )
     }
 
-    fn render_filter(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_terminal(
+        &self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        vec![
+            group(
+                "Text",
+                vec![
+                    row("Font size", "Size of terminal text.", theme)
+                        .child(self.stepper(
+                            "font-size",
+                            settings.font_size,
+                            FONT_SIZE_RANGE,
+                            0.5,
+                            format!("{} pt", settings.font_size),
+                            theme,
+                            cx,
+                            |size, _, cx| SettingsStore::update(cx, |settings| settings.font_size = size),
+                        ))
+                        .into_any_element(),
+                    row(
+                        "Line height",
+                        "Spacing between rows, as a multiple of the font size.",
+                        theme,
+                    )
+                    .child(self.stepper(
+                        "line-height",
+                        settings.line_height,
+                        LINE_HEIGHT_RANGE,
+                        0.05,
+                        format!("{:.2}×", settings.line_height),
+                        theme,
+                        cx,
+                        |height, _, cx| SettingsStore::update(cx, |settings| settings.line_height = height),
+                    ))
+                    .into_any_element(),
+                    row(
+                        "Padding",
+                        "Space between the terminal text and the edges of its area.",
+                        theme,
+                    )
+                    .child(self.stepper(
+                        "terminal-padding",
+                        settings.terminal_padding,
+                        TERMINAL_PADDING_RANGE,
+                        2.,
+                        format!("{} px", settings.terminal_padding),
+                        theme,
+                        cx,
+                        |padding, _, cx| {
+                            SettingsStore::update(cx, |settings| settings.terminal_padding = padding)
+                        },
+                    ))
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+            group(
+                "Shell",
+                vec![
+                    row(
+                        "Shell integration",
+                        "Prompt marks for ⌘↑/⌘↓ navigation and command status in zsh and bash. Applies to new terminals.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "shell-integration",
+                        settings.shell_integration,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.shell_integration = on),
+                    ))
+                    .into_any_element(),
+                    row(
+                        "Command blocks",
+                        "Show each command and its output as a block, with an input editor, in shells with integration. Applies to new terminals.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "command-blocks",
+                        settings.command_blocks,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.command_blocks = on),
+                    ))
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+        ]
+    }
+
+    fn render_status_bar(
+        &self,
+        settings: &Settings,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let config = &settings.status_bar;
+        let items = StatusItem::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let side = config.side_of(item);
+                let list = match side {
+                    Some(Side::Left) => config.left.as_slice(),
+                    Some(Side::Right) => config.right.as_slice(),
+                    None => &[],
+                };
+                let position = list.iter().position(|existing| *existing == item);
+                let can_move_up = position.is_some_and(|position| position > 0);
+                let can_move_down = position.is_some_and(|position| position + 1 < list.len());
+
+                row(item.label(), item.description(), theme)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(self.segmented(
+                                item.label(),
+                                &[
+                                    (Some(Side::Left), "Left"),
+                                    (Some(Side::Right), "Right"),
+                                    (None, "Off"),
+                                ],
+                                side,
+                                theme,
+                                cx,
+                                move |side, _, cx| {
+                                    SettingsStore::update(cx, |settings| {
+                                        settings.status_bar.place(item, side)
+                                    })
+                                },
+                            ))
+                            .child(move_button(
+                                ("status-up", index),
+                                "arrow-up",
+                                !can_move_up,
+                                theme,
+                                move |settings| settings.status_bar.shift(item, -1),
+                            ))
+                            .child(move_button(
+                                ("status-down", index),
+                                "arrow-down",
+                                !can_move_down,
+                                theme,
+                                move |settings| settings.status_bar.shift(item, 1),
+                            )),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        vec![
+            group(
+                "Bar",
+                vec![
+                    row(
+                        "Show status bar",
+                        "The bar along the bottom of the window.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "status-bar-visible",
+                        config.visible,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| {
+                            SettingsStore::update(cx, |settings| settings.status_bar.visible = on)
+                        },
+                    ))
+                    .into_any_element(),
+                    row("Dividers", "Thin rules between status bar items.", theme)
+                        .child(self.toggle(
+                            "status-bar-dividers",
+                            config.dividers,
+                            true,
+                            theme,
+                            cx,
+                            |on, _, cx| {
+                                SettingsStore::update(cx, |settings| {
+                                    settings.status_bar.dividers = on
+                                })
+                            },
+                        ))
+                        .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+            group("Items", items, theme).into_any_element(),
+        ]
+    }
+
+    fn render_about(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let settings_path = SettingsStore::path(cx);
+        let armed = self.reset_armed;
+
+        vec![
+            card(theme)
+                .flex_row()
+                .items_center()
+                .gap(px(16.))
+                .p(px(16.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(px(48.))
+                        .rounded(theme::RADIUS_LG)
+                        .bg(theme.element_background)
+                        .child(icon("terminal", px(24.), theme.text_muted)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .text_color(theme.text)
+                                .child("Terminal"),
+                        )
+                        .child(
+                            div()
+                                .text_size(theme::TEXT_SMALL)
+                                .text_color(theme.text_muted)
+                                .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                        ),
+                )
+                .into_any_element(),
+            group(
+                "Files",
+                vec![
+                    row("Settings file", shorten_home(&settings_path), theme)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .gap(px(8.))
+                                .child({
+                                    let path = settings_path.clone();
+                                    button("reveal-settings", Some("folder"), "Reveal", theme)
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            cx.reveal_path(&path)
+                                        })
+                                })
+                                .child({
+                                    let path = settings_path.clone();
+                                    button(
+                                        "open-settings",
+                                        Some("file-pen-line"),
+                                        "Open in Editor",
+                                        theme,
+                                    )
+                                    .on_click(
+                                        move |_: &ClickEvent, _, cx| cx.open_with_system(&path),
+                                    )
+                                }),
+                        )
+                        .into_any_element(),
+                    row(
+                        "Reset settings",
+                        "Put every setting back to its default, including agent profiles.",
+                        theme,
+                    )
+                    .child(
+                        button(
+                            "reset-settings",
+                            Some(if armed { "circle-alert" } else { "refresh-cw" }),
+                            if armed {
+                                "Click to Confirm"
+                            } else {
+                                "Reset…"
+                            },
+                            theme,
+                        )
+                        .when(armed, |button| {
+                            button.text_color(theme::to_hsla(theme.terminal.ansi[1]))
+                        })
+                        .on_click(cx.listener(
+                            |page, _: &ClickEvent, _, cx| {
+                                if page.reset_armed {
+                                    page.reset_armed = false;
+                                    SettingsStore::update(cx, |settings| {
+                                        *settings = Settings::default()
+                                    });
+                                } else {
+                                    page.reset_armed = true;
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(file_row(
+                    "Session",
+                    "reveal-session",
+                    session::session_path(),
+                    theme,
+                ))
+                .child(file_row(
+                    "Themes folder",
+                    "reveal-themes",
+                    theme::user_theme_dir(),
+                    theme,
+                ))
+                .into_any_element(),
+        ]
+    }
+
+    /// An on/off switch. `change` receives the new state.
+    fn toggle(
+        &self,
+        id: &'static str,
+        on: bool,
+        enabled: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        change: impl Fn(bool, &mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        const TRAVEL: f32 = 14.;
+        const INSET: f32 = 2.;
+        let knob = div()
+            .absolute()
+            .top(px(INSET))
+            .size(px(14.))
+            .rounded_full()
+            .bg(if on { gpui::white() } else { theme.text_muted })
+            .shadow_sm();
+        let knob: AnyElement = if self.toggled == Some(id) {
+            knob.with_animation(
+                (id, on as usize),
+                Animation::new(Duration::from_millis(160)).with_easing(ease_in_out),
+                move |knob, delta| {
+                    let progress = if on { delta } else { 1. - delta };
+                    knob.left(px(INSET + TRAVEL * progress))
+                },
+            )
+            .into_any_element()
+        } else {
+            knob.left(px(INSET + if on { TRAVEL } else { 0. }))
+                .into_any_element()
+        };
+        let accent = theme.text_accent;
+        let border = theme.border;
+
+        div()
+            .id(id)
+            .relative()
+            .flex_none()
+            .w(px(34.))
+            .h(px(20.))
+            .rounded_full()
+            .border_1()
+            .map(|track| {
+                if on {
+                    track.bg(accent).border_color(accent)
+                } else {
+                    track.bg(theme.element_background).border_color(border)
+                }
+            })
+            .map(|track| {
+                if enabled {
+                    track
+                        .cursor_pointer()
+                        .hover(move |style| style.border_color(accent))
+                        .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
+                            page.toggled = Some(id);
+                            change(!on, page, cx);
+                            cx.notify();
+                        }))
+                } else {
+                    track.opacity(0.4)
+                }
+            })
+            .child(knob)
+    }
+
+    /// A row of mutually exclusive choices.
+    fn segmented<T: Copy + PartialEq + 'static>(
+        &self,
+        id: &'static str,
+        options: &[(T, &'static str)],
+        selected: T,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        change: impl Fn(T, &mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let change: Change<T> = Rc::new(change);
         let hover = theme.ghost_hover;
         div()
             .flex()
@@ -258,231 +996,672 @@ impl SettingsPage {
             .bg(theme.element_background)
             .border_1()
             .border_color(theme.border_variant)
-            .children(
-                AppearanceFilter::ALL
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, filter)| {
-                        let selected = filter == self.filter;
-                        div()
-                            .id(("theme-filter", index))
-                            .flex()
-                            .items_center()
-                            .h(px(20.))
-                            .px(px(8.))
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .text_size(theme::TEXT_SMALL)
-                            .map(|segment| {
-                                if selected {
-                                    segment.bg(theme.ghost_selected).text_color(theme.text)
-                                } else {
-                                    segment
-                                        .text_color(theme.text_muted)
-                                        .hover(move |style| style.bg(hover))
-                                }
-                            })
-                            .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
-                                page.set_filter(filter, cx);
-                            }))
-                            .child(filter.label())
-                    }),
-            )
-    }
-
-    fn render_theme_row(
-        &self,
-        candidate: Arc<Theme>,
-        active: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let selected = candidate.name == active.name;
-        let hover = active.ghost_hover;
-        let name = candidate.name.clone();
-        let source = match candidate.source {
-            ThemeSource::Bundled => "",
-            ThemeSource::User => "Custom",
-            ThemeSource::Ghostty => "Ghostty",
-        };
-        let hovered = candidate.clone();
-
-        div()
-            .id(SharedString::from(format!("theme-{}", candidate.name)))
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .h(px(THEME_ROW_HEIGHT))
-            .pl(px(10.))
-            .pr(px(10.))
-            .cursor_pointer()
-            .when(selected, |row| row.bg(active.ghost_selected))
-            .when(!selected, |row| row.hover(move |style| style.bg(hover)))
-            .on_hover(cx.listener(move |page, hovering: &bool, _, cx| {
-                if *hovering {
-                    page.hovered = Some(hovered.clone());
-                } else if page
-                    .hovered
-                    .as_ref()
-                    .is_some_and(|current| current.name == hovered.name)
-                {
-                    page.hovered = None;
-                }
-                cx.notify();
-            }))
-            .on_click(move |_: &ClickEvent, _window, cx| {
-                let name = name.to_string();
-                SettingsStore::update(cx, |settings| settings.theme = name);
-            })
-            .child(theme_chip(&candidate))
-            .child(
+            .children(options.iter().enumerate().map(|(index, (value, label))| {
+                let value = *value;
+                let is_selected = value == selected;
+                let change = change.clone();
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(theme::TEXT_SMALL)
-                    .text_color(if selected {
-                        active.text
-                    } else {
-                        active.text_muted
-                    })
-                    .child(candidate.name.clone()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(48.))
+                    .id((id, index))
                     .flex()
-                    .justify_end()
-                    .text_size(px(11.))
-                    .text_color(active.text_placeholder)
-                    .child(source),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .size(theme::ICON_SMALL)
-                    .when(selected, |slot| {
-                        slot.child(icon("check", theme::ICON_SMALL, active.text_accent))
-                    }),
-            )
-    }
-
-    fn render_stepper(
-        &self,
-        stepper: &'static Stepper,
-        settings: &Settings,
-        theme: &Theme,
-    ) -> impl IntoElement {
-        let value = (stepper.read)(settings);
-        let at_min = value <= stepper.range.0;
-        let at_max = value >= stepper.range.1;
-
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.))
-            .py(px(10.))
-            .border_b_1()
-            .border_color(theme.border_variant)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_size(theme::TEXT_DEFAULT)
-                            .text_color(theme.text)
-                            .child(stepper.label),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::TEXT_SMALL)
-                            .text_color(theme.text_muted)
-                            .child(stepper.description),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
                     .items_center()
-                    .gap(px(2.))
-                    .p(px(1.))
-                    .rounded(theme::RADIUS_SM)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.element_background)
-                    .child(step_button(
-                        (stepper.id, 0),
-                        "minus",
-                        at_min,
-                        theme,
-                        move |settings| {
-                            let next = round_to_step(
-                                (stepper.read)(settings) - stepper.step,
-                                stepper.step,
-                            );
-                            (stepper.write)(settings, next);
-                        },
-                    ))
-                    .child(
-                        div()
-                            .w(px(60.))
-                            .flex()
-                            .justify_center()
-                            .text_size(theme::TEXT_SMALL)
-                            .font_family(theme::FONT_FAMILY)
-                            .text_color(theme.text)
-                            .child(SharedString::from((stepper.format)(value))),
-                    )
-                    .child(step_button(
-                        (stepper.id, 1),
-                        "plus",
-                        at_max,
-                        theme,
-                        move |settings| {
-                            let next = round_to_step(
-                                (stepper.read)(settings) + stepper.step,
-                                stepper.step,
-                            );
-                            (stepper.write)(settings, next);
-                        },
-                    )),
+                    .h(px(CONTROL_HEIGHT - 6.))
+                    .px(px(10.))
+                    .rounded(px(3.))
+                    .text_size(theme::TEXT_SMALL)
+                    .map(|segment| {
+                        if is_selected {
+                            segment
+                                .bg(theme.ghost_selected)
+                                .text_color(theme.text)
+                                .shadow_sm()
+                        } else {
+                            segment
+                                .cursor_pointer()
+                                .text_color(theme.text_muted)
+                                .hover(move |style| style.bg(hover))
+                                .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
+                                    change(value, page, cx);
+                                    cx.notify();
+                                }))
+                        }
+                    })
+                    .child(*label)
+            }))
+    }
+
+    /// − value + buttons for a number, kept inside `range` on the `step` grid.
+    #[allow(clippy::too_many_arguments)]
+    fn stepper(
+        &self,
+        id: &'static str,
+        value: f32,
+        range: (f32, f32),
+        step: f32,
+        label: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        change: impl Fn(f32, &mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let change: Change<f32> = Rc::new(change);
+        let step_button = |index: usize, icon_name: &'static str, direction: f32| {
+            let next = step_value(value, step, range, direction);
+            let disabled = next == value;
+            let change = change.clone();
+            let hover = theme.ghost_hover;
+            let active = theme.ghost_selected;
+            div()
+                .id((id, index))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(CONTROL_HEIGHT - 6.))
+                .rounded(px(3.))
+                .map(|button| {
+                    if disabled {
+                        button.child(icon(icon_name, theme::ICON_XSMALL, theme.text_disabled()))
+                    } else {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .active(move |style| style.bg(active))
+                            .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
+                                change(next, page, cx);
+                                cx.notify();
+                            }))
+                            .child(icon(icon_name, theme::ICON_XSMALL, theme.text_muted))
+                    }
+                })
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(theme::RADIUS_SM)
+            .border_1()
+            .border_color(theme.border_variant)
+            .bg(theme.element_background)
+            .child(step_button(0, "minus", -1.))
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex()
+                    .justify_center()
+                    .text_size(theme::TEXT_SMALL)
+                    .font_family(theme::FONT_FAMILY)
+                    .text_color(theme.text)
+                    .child(SharedString::from(label)),
             )
+            .child(step_button(1, "plus", 1.))
     }
 }
 
-/// A miniature of a theme: its background with three accent bars.
-fn theme_chip(candidate: &Theme) -> impl IntoElement {
-    let terminal = &candidate.terminal;
+/// One shortcut on the Keyboard page: the key combinations that trigger it
+/// and what it does.
+struct Shortcut {
+    keys: &'static [&'static [&'static str]],
+    action: &'static str,
+}
+
+const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 5] = [
+    (
+        "Tabs",
+        &[
+            Shortcut {
+                keys: &[&["⌘", "T"]],
+                action: "New tab",
+            },
+            Shortcut {
+                keys: &[&["⌘", "W"]],
+                action: "Close pane, or the tab when it has one pane",
+            },
+            Shortcut {
+                keys: &[&["⌥", "⌘", "W"]],
+                action: "Close tab",
+            },
+            Shortcut {
+                keys: &[&["⌘", "}"], &["⌃", "Tab"]],
+                action: "Next tab",
+            },
+            Shortcut {
+                keys: &[&["⌘", "{"], &["⌃", "⇧", "Tab"]],
+                action: "Previous tab",
+            },
+            Shortcut {
+                keys: &[&["⌘", "1–8"]],
+                action: "Go to tab 1 to 8",
+            },
+            Shortcut {
+                keys: &[&["⌘", "9"]],
+                action: "Go to last tab",
+            },
+            Shortcut {
+                keys: &[&["F2"]],
+                action: "Rename tab",
+            },
+        ],
+    ),
+    (
+        "Panes",
+        &[
+            Shortcut {
+                keys: &[&["⌘", "D"]],
+                action: "Split right",
+            },
+            Shortcut {
+                keys: &[&["⇧", "⌘", "D"]],
+                action: "Split down",
+            },
+            Shortcut {
+                keys: &[&["⌥", "⌘", "←↑↓→"]],
+                action: "Focus the pane in that direction",
+            },
+            Shortcut {
+                keys: &[&["⇧", "⌘", "Enter"]],
+                action: "Zoom the focused pane",
+            },
+            Shortcut {
+                keys: &[&["⌃", "⌘", "="]],
+                action: "Make panes equal size",
+            },
+        ],
+    ),
+    (
+        "Terminal",
+        &[
+            Shortcut {
+                keys: &[&["⌘", "F"]],
+                action: "Find",
+            },
+            Shortcut {
+                keys: &[&["⌘", "G"]],
+                action: "Next match",
+            },
+            Shortcut {
+                keys: &[&["⇧", "⌘", "G"], &["⇧", "Enter"]],
+                action: "Previous match",
+            },
+            Shortcut {
+                keys: &[&["⌘", "↑"]],
+                action: "Previous prompt",
+            },
+            Shortcut {
+                keys: &[&["⌘", "↓"]],
+                action: "Next prompt",
+            },
+            Shortcut {
+                keys: &[&["⌘", "C"]],
+                action: "Copy",
+            },
+            Shortcut {
+                keys: &[&["⌘", "V"]],
+                action: "Paste",
+            },
+            Shortcut {
+                keys: &[&["⌘", "A"]],
+                action: "Select all",
+            },
+            Shortcut {
+                keys: &[&["⌘", "K"]],
+                action: "Clear scrollback",
+            },
+        ],
+    ),
+    (
+        "Command Editor",
+        &[
+            Shortcut {
+                keys: &[&["Enter"]],
+                action: "Run command",
+            },
+            Shortcut {
+                keys: &[&["⇧", "Enter"], &["⌥", "Enter"]],
+                action: "New line",
+            },
+            Shortcut {
+                keys: &[&["↑"], &["⌃", "P"]],
+                action: "Previous command from history",
+            },
+            Shortcut {
+                keys: &[&["↓"], &["⌃", "N"]],
+                action: "Next command from history",
+            },
+            Shortcut {
+                keys: &[&["⌃", "R"]],
+                action: "Search history",
+            },
+            Shortcut {
+                keys: &[&["⌃", "C"]],
+                action: "Clear the command",
+            },
+            Shortcut {
+                keys: &[&["⌃", "D"]],
+                action: "Send end-of-file when empty",
+            },
+        ],
+    ),
+    (
+        "Window",
+        &[
+            Shortcut {
+                keys: &[&["⌘", "B"]],
+                action: "Toggle sidebar",
+            },
+            Shortcut {
+                keys: &[&["⌘", ","]],
+                action: "Settings",
+            },
+            Shortcut {
+                keys: &[&["⌘", "="]],
+                action: "Increase font size",
+            },
+            Shortcut {
+                keys: &[&["⌘", "-"]],
+                action: "Decrease font size",
+            },
+            Shortcut {
+                keys: &[&["⌘", "0"]],
+                action: "Reset font size",
+            },
+            Shortcut {
+                keys: &[&["⇧", "⌘", "W"]],
+                action: "Close window",
+            },
+            Shortcut {
+                keys: &[&["⌘", "M"]],
+                action: "Minimize",
+            },
+            Shortcut {
+                keys: &[&["⌘", "H"]],
+                action: "Hide",
+            },
+            Shortcut {
+                keys: &[&["⌥", "⌘", "H"]],
+                action: "Hide others",
+            },
+            Shortcut {
+                keys: &[&["⌘", "Q"]],
+                action: "Quit",
+            },
+        ],
+    ),
+];
+
+fn render_keyboard(theme: &Theme) -> Vec<AnyElement> {
+    SHORTCUT_GROUPS
+        .iter()
+        .map(|(title, shortcuts)| {
+            group(
+                title,
+                shortcuts
+                    .iter()
+                    .map(|shortcut| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(16.))
+                            .px(px(16.))
+                            .h(px(40.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(theme::TEXT_DEFAULT)
+                                    .text_color(theme.text)
+                                    .child(shortcut.action),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .children(shortcut.keys.iter().enumerate().map(
+                                        |(index, keys)| {
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.))
+                                                .when(index > 0, |combo| {
+                                                    combo.child(
+                                                        div()
+                                                            .text_size(theme::TEXT_SMALL)
+                                                            .text_color(theme.text_placeholder)
+                                                            .child("or"),
+                                                    )
+                                                })
+                                                .child(div().flex().gap(px(4.)).children(
+                                                    keys.iter().map(|key| keycap(key, theme)),
+                                                ))
+                                        },
+                                    )),
+                            )
+                            .into_any_element()
+                    })
+                    .collect(),
+                theme,
+            )
+            .into_any_element()
+        })
+        .collect()
+}
+
+fn keycap(key: &'static str, theme: &Theme) -> impl IntoElement {
     div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .min_w(px(22.))
+        .h(px(22.))
+        .px(px(6.))
+        .rounded(theme::RADIUS_SM)
+        .border_1()
+        .border_color(theme.border)
+        .border_b_2()
+        .bg(theme.element_background)
+        .text_size(theme::TEXT_SMALL)
+        .text_color(theme.text_muted)
+        .child(key)
+}
+
+/// The value one step from `value` in `direction` (±1), snapped to the step
+/// grid so repeated presses never accumulate float error, and clamped.
+fn step_value(value: f32, step: f32, range: (f32, f32), direction: f32) -> f32 {
+    let next = ((value + step * direction) / step).round() * step;
+    next.clamp(range.0, range.1)
+}
+
+/// A small arrow button that moves a status bar item within its side.
+fn move_button(
+    id: (&'static str, usize),
+    icon_name: &'static str,
+    disabled: bool,
+    theme: &Theme,
+    change: impl Fn(&mut Settings) + 'static,
+) -> impl IntoElement {
+    let hover = theme.ghost_hover;
+    let active = theme.ghost_selected;
+    let button = div()
+        .id(id)
         .flex()
         .flex_none()
         .items_center()
-        .gap(px(2.))
-        .h(px(18.))
+        .justify_center()
+        .size(px(CONTROL_HEIGHT - 6.))
+        .rounded(px(3.));
+    if disabled {
+        button.child(icon(icon_name, theme::ICON_XSMALL, theme.text_disabled()))
+    } else {
+        button
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .active(move |style| style.bg(active))
+            .on_click(move |_: &ClickEvent, _, cx| SettingsStore::update(cx, &change))
+            .child(icon(icon_name, theme::ICON_XSMALL, theme.text_muted))
+    }
+}
+
+fn group_caption(title: &'static str, theme: &Theme) -> impl IntoElement {
+    div()
         .px(px(4.))
-        .rounded(px(4.))
+        .pb(px(8.))
+        .text_size(theme::TEXT_SMALL)
+        .text_color(theme.text_muted)
+        .child(title)
+}
+
+fn card(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(theme::RADIUS_LG)
         .border_1()
-        .border_color(candidate.border)
-        .bg(theme::to_hsla(terminal.background))
-        .children(
-            [
-                terminal.ansi[1],
-                terminal.ansi[2],
-                terminal.ansi[4],
-                terminal.foreground,
-            ]
-            .map(|color| {
-                div()
-                    .w(px(4.))
-                    .h(px(8.))
-                    .rounded(px(1.))
-                    .bg(theme::to_hsla(color))
-            }),
+        .border_color(theme.border_variant)
+        .bg(theme.elevated_surface)
+}
+
+/// A card whose rows are separated by hairlines.
+fn rows_card(rows: Vec<AnyElement>, theme: &Theme) -> Div {
+    let separator = theme.border_variant;
+    card(theme).children(rows.into_iter().enumerate().map(move |(index, row)| {
+        div()
+            .when(index > 0, |wrapper| {
+                wrapper.border_t_1().border_color(separator)
+            })
+            .child(row)
+    }))
+}
+
+/// A titled card of rows.
+fn group(title: &'static str, rows: Vec<AnyElement>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .child(group_caption(title, theme))
+        .child(rows_card(rows, theme))
+}
+
+/// A setting's label and description; the caller adds the control.
+fn row(label: &'static str, description: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(24.))
+        .px(px(16.))
+        .py(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(theme::TEXT_DEFAULT)
+                        .text_color(theme.text)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(theme::TEXT_SMALL)
+                        .text_color(theme.text_muted)
+                        .child(description.into()),
+                ),
+        )
+}
+
+/// The bordered box around a text input, highlighted while focused.
+fn field_frame(focused: bool, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .h(px(CONTROL_HEIGHT))
+        .px(px(8.))
+        .rounded(theme::RADIUS_SM)
+        .border_1()
+        .border_color(if focused {
+            theme.text_accent
+        } else {
+            theme.border
+        })
+        .bg(theme.element_background)
+}
+
+/// A file's location with a button that shows it in Finder.
+fn file_row(
+    label: &'static str,
+    id: &'static str,
+    path: PathBuf,
+    theme: &Theme,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.))
+        .px(px(4.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(theme::TEXT_SMALL)
+                        .text_color(theme.text_muted)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(theme::TEXT_SMALL)
+                        .font_family(theme::FONT_FAMILY)
+                        .text_color(theme.text_placeholder)
+                        .child(SharedString::from(shorten_home(&path))),
+                ),
+        )
+        .child(
+            button(id, Some("folder"), "Reveal", theme)
+                .on_click(move |_: &ClickEvent, _, cx| cx.reveal_path(&path)),
+        )
+}
+
+/// A clickable miniature of a theme: its chrome, text, accent, and
+/// terminal colors.
+fn theme_card(candidate: Arc<Theme>, selected: bool, chrome: &Theme) -> Stateful<Div> {
+    let terminal = &candidate.terminal;
+    let swatch = |index: usize| {
+        div()
+            .size(px(8.))
+            .rounded(px(2.))
+            .bg(theme::to_hsla(terminal.ansi[index]))
+    };
+    let bar = |width: f32, color: gpui::Hsla| {
+        div().h(px(4.)).w(relative(width)).rounded(px(2.)).bg(color)
+    };
+    let source = match candidate.source {
+        ThemeSource::Bundled => None,
+        ThemeSource::User => Some("Custom"),
+        ThemeSource::Ghostty => Some("Ghostty"),
+    };
+    let ring = if selected {
+        chrome.text_accent
+    } else {
+        gpui::transparent_black()
+    };
+    let hover_ring = chrome.border;
+    let name = candidate.name.to_string();
+
+    div()
+        .id(SharedString::from(format!("theme-card-{}", candidate.name)))
+        .p(px(2.))
+        .rounded(px(11.))
+        .border_2()
+        .border_color(ring)
+        .cursor_pointer()
+        .when(!selected, |card| {
+            card.hover(move |style| style.border_color(hover_ring))
+        })
+        .on_click(move |_: &ClickEvent, _, cx| {
+            let name = name.clone();
+            SettingsStore::update(cx, |settings| settings.theme = name);
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .rounded(theme::RADIUS_LG)
+                .border_1()
+                .border_color(chrome.border_variant)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex()
+                        .h(px(76.))
+                        .bg(candidate.surface)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_none()
+                                .gap(px(5.))
+                                .w(px(34.))
+                                .h_full()
+                                .p(px(6.))
+                                .bg(candidate.title_bar)
+                                .border_r_1()
+                                .border_color(candidate.border_variant)
+                                .child(bar(0.9, candidate.text_muted.opacity(0.6)))
+                                .child(bar(0.6, candidate.text_muted.opacity(0.6)))
+                                .child(bar(0.75, candidate.text_accent)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .gap(px(5.))
+                                .p(px(8.))
+                                .child(bar(0.75, candidate.text))
+                                .child(bar(0.5, candidate.text_muted))
+                                .child(
+                                    div()
+                                        .w(px(26.))
+                                        .h(px(8.))
+                                        .rounded(px(4.))
+                                        .bg(candidate.text_accent),
+                                )
+                                .child(
+                                    div()
+                                        .mt_auto()
+                                        .flex()
+                                        .gap(px(3.))
+                                        .p(px(4.))
+                                        .rounded(px(3.))
+                                        .bg(theme::to_hsla(terminal.background))
+                                        .children([1, 2, 3, 4, 5, 6].map(swatch)),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(30.))
+                        .px(px(8.))
+                        .bg(chrome.elevated_surface)
+                        .border_t_1()
+                        .border_color(chrome.border_variant)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(theme::TEXT_SMALL)
+                                .text_color(if selected {
+                                    chrome.text
+                                } else {
+                                    chrome.text_muted
+                                })
+                                .child(candidate.name.clone()),
+                        )
+                        .children(source.map(|source| {
+                            div()
+                                .flex_none()
+                                .text_size(px(10.))
+                                .text_color(chrome.text_placeholder)
+                                .child(source)
+                        }))
+                        .when(selected, |footer| {
+                            footer.child(icon("check", theme::ICON_XSMALL, chrome.text))
+                        }),
+                ),
         )
 }
 
@@ -616,395 +1795,86 @@ fn render_theme_preview(previewed: &Theme, chrome: &Theme) -> impl IntoElement {
         )
 }
 
-/// Snap to the step grid so repeated presses never accumulate float error.
-fn round_to_step(value: f32, step: f32) -> f32 {
-    (value / step).round() * step
-}
+impl Render for SettingsPage {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let settings = SettingsStore::get(cx).clone();
+        let section = self.section;
+        let body = match section {
+            Section::General => self.render_general(&settings, &theme, cx),
+            Section::Appearance => self.render_appearance(&settings, &theme, window, cx),
+            Section::Terminal => self.render_terminal(&settings, &theme, cx),
+            Section::StatusBar => self.render_status_bar(&settings, &theme, cx),
+            Section::Keyboard => render_keyboard(&theme),
+            Section::About => self.render_about(&theme, cx),
+        };
 
-fn step_button(
-    id: (&'static str, usize),
-    icon_name: &'static str,
-    disabled: bool,
-    theme: &Theme,
-    change: impl Fn(&mut Settings) + 'static,
-) -> impl IntoElement {
-    let hover = theme.ghost_hover;
-    let active = theme.ghost_selected;
-    let button = div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(20.))
-        .rounded(px(3.));
-    if disabled {
-        button.child(icon(icon_name, theme::ICON_XSMALL, theme.text_disabled()))
-    } else {
-        button
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover))
-            .active(move |style| style.bg(active))
-            .on_click(move |_: &ClickEvent, _window, cx| {
-                SettingsStore::update(cx, &change);
-            })
-            .child(icon(icon_name, theme::ICON_XSMALL, theme.text_muted))
+        div()
+            .key_context("SettingsPage")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .flex()
+            .bg(theme.surface)
+            .font_family(theme::UI_FONT_FAMILY)
+            .text_color(theme.text)
+            .child(self.render_nav(&theme, cx))
+            .child(
+                div()
+                    .id("settings-content")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(
+                        div()
+                            .mx_auto()
+                            .w_full()
+                            .max_w(px(CONTENT_MAX_WIDTH))
+                            .px(px(32.))
+                            .pt(px(32.))
+                            .pb(px(48.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(24.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .text_size(px(20.))
+                                            .text_color(theme.text)
+                                            .child(section.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(theme::TEXT_SMALL)
+                                            .text_color(theme.text_muted)
+                                            .child(section.description()),
+                                    ),
+                            )
+                            .children(body),
+                    ),
+            )
     }
 }
 
-fn setting_row(label: &'static str, description: &'static str, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(16.))
-        .py(px(10.))
-        .border_b_1()
-        .border_color(theme.border_variant)
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .min_w_0()
-                .child(
-                    div()
-                        .text_size(theme::TEXT_DEFAULT)
-                        .text_color(theme.text)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(theme::TEXT_SMALL)
-                        .text_color(theme.text_muted)
-                        .child(description),
-                ),
-        )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// An on/off switch bound to a boolean setting.
-fn switch(
-    id: impl Into<ElementId>,
-    on: bool,
-    theme: &Theme,
-    toggle: impl Fn(&mut Settings) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .w(px(30.))
-        .h(px(18.))
-        .p(px(2.))
-        .rounded_full()
-        .cursor_pointer()
-        .bg(if on {
-            theme.text_accent
-        } else {
-            theme.element_background
-        })
-        .border_1()
-        .border_color(if on { theme.text_accent } else { theme.border })
-        .when(on, |track| track.justify_end())
-        .on_click(move |_: &ClickEvent, _window, cx| SettingsStore::update(cx, &toggle))
-        .child(div().size(px(12.)).rounded_full().bg(if on {
-            theme.elevated_surface
-        } else {
-            theme.text_muted
-        }))
-}
-
-fn render_status_bar_settings(config: &StatusBarSettings, theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            setting_row(
-                "Show Status Bar",
-                "The bar along the bottom of the window.",
-                theme,
-            )
-            .child(switch(
-                "status-bar-visible",
-                config.visible,
-                theme,
-                |settings| {
-                    settings.status_bar.visible = !settings.status_bar.visible;
-                },
-            )),
-        )
-        .child(
-            setting_row("Dividers", "Thin rules between status bar items.", theme).child(switch(
-                "status-bar-dividers",
-                config.dividers,
-                theme,
-                |settings| settings.status_bar.dividers = !settings.status_bar.dividers,
-            )),
-        )
-        .children(
-            StatusItem::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| render_status_item_row(index, item, config, theme)),
-        )
-}
-
-fn render_status_item_row(
-    index: usize,
-    item: StatusItem,
-    config: &StatusBarSettings,
-    theme: &Theme,
-) -> impl IntoElement {
-    let side = config.side_of(item);
-    let list = match side {
-        Some(Side::Left) => config.left.as_slice(),
-        Some(Side::Right) => config.right.as_slice(),
-        None => &[],
-    };
-    let position = list.iter().position(|existing| *existing == item);
-    let can_move_up = position.is_some_and(|position| position > 0);
-    let can_move_down = position.is_some_and(|position| position + 1 < list.len());
-    let options = [
-        (Some(Side::Left), "Left"),
-        (Some(Side::Right), "Right"),
-        (None, "Off"),
-    ];
-
-    setting_row(item.label(), item.description(), theme).child(
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(6.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .p(px(1.))
-                    .rounded(theme::RADIUS_SM)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.element_background)
-                    .children(options.into_iter().enumerate().map(
-                        |(option_index, (option, label))| {
-                            let selected = option == side;
-                            let hover = theme.ghost_hover;
-                            div()
-                                .id(("status-side", index * 3 + option_index))
-                                .flex()
-                                .items_center()
-                                .h(px(20.))
-                                .px(px(8.))
-                                .rounded(px(3.))
-                                .cursor_pointer()
-                                .text_size(theme::TEXT_SMALL)
-                                .map(|segment| {
-                                    if selected {
-                                        segment.bg(theme.ghost_selected).text_color(theme.text)
-                                    } else {
-                                        segment
-                                            .text_color(theme.text_muted)
-                                            .hover(move |style| style.bg(hover))
-                                    }
-                                })
-                                .on_click(move |_: &ClickEvent, _window, cx| {
-                                    SettingsStore::update(cx, |settings| {
-                                        settings.status_bar.place(item, option);
-                                    });
-                                })
-                                .child(label)
-                        },
-                    )),
-            )
-            .child(step_button(
-                ("status-up", index),
-                "arrow-up",
-                !can_move_up,
-                theme,
-                move |settings| {
-                    settings.status_bar.shift(item, -1);
-                },
-            ))
-            .child(step_button(
-                ("status-down", index),
-                "arrow-down",
-                !can_move_down,
-                theme,
-                move |settings| {
-                    settings.status_bar.shift(item, 1);
-                },
-            )),
-    )
-}
-
-fn text_button(id: &'static str, label: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
-    let hover = theme.ghost_hover;
-    let active = theme.ghost_selected;
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(24.))
-        .px(px(8.))
-        .rounded(theme::RADIUS_SM)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.element_background)
-        .cursor_pointer()
-        .text_size(theme::TEXT_SMALL)
-        .text_color(theme.text)
-        .hover(move |style| style.bg(hover))
-        .active(move |style| style.bg(active))
-        .child(label)
-}
-
-impl Render for SettingsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let settings = SettingsStore::get(cx).clone();
-        let settings_path = SettingsStore::path(cx);
-        let themes_dir = theme::user_theme_dir();
-        let display_path = SharedString::from(shorten_home(&settings_path));
-
-        div()
-            .id("settings-page")
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .overflow_y_scroll()
-            .bg(theme.terminal_background())
-            .font_family(theme::UI_FONT_FAMILY)
-            .child(
-                div()
-                    .mx_auto()
-                    .w_full()
-                    .max_w(px(680.))
-                    .px(px(32.))
-                    .py(px(28.))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(20.))
-                            .text_color(theme.text)
-                            .child("Settings"),
-                    )
-                    .child(self.render_section_title("Theme", &theme))
-                    .child(self.render_theme_picker(&theme, cx))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .pt(px(8.))
-                            .child(
-                                text_button("open-themes-folder", "Open Themes Folder", &theme)
-                                    .on_click(move |_: &ClickEvent, _window, cx| {
-                                        if let Err(error) = fs::create_dir_all(&themes_dir) {
-                                            log::warn!(
-                                                "failed to create {}: {error}",
-                                                themes_dir.display()
-                                            );
-                                        }
-                                        cx.open_with_system(&themes_dir);
-                                    }),
-                            )
-                            .child(
-                                text_button("reload-theme-files", "Reload Themes", &theme)
-                                    .on_click(|_: &ClickEvent, _window, cx| {
-                                        theme::reload_themes(cx)
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::TEXT_SMALL)
-                                    .text_color(theme.text_placeholder)
-                                    .child(
-                                        "Zed .json themes and Ghostty theme files are supported.",
-                                    ),
-                            ),
-                    )
-                    .child(self.render_section_title("Appearance", &theme))
-                    .children(
-                        APPEARANCE
-                            .iter()
-                            .map(|stepper| self.render_stepper(stepper, &settings, &theme)),
-                    )
-                    .child(self.render_section_title("Terminal", &theme))
-                    .child(
-                        setting_row(
-                            "Shell Integration",
-                            "Prompt marks for ⌘↑/⌘↓ navigation and command status in zsh and bash. Applies to new terminals.",
-                            &theme,
-                        )
-                        .child(switch(
-                            "shell-integration",
-                            settings.shell_integration,
-                            &theme,
-                            |settings| settings.shell_integration = !settings.shell_integration,
-                        )),
-                    )
-                    .child(
-                        setting_row(
-                            "Notifications",
-                            "Notify when a background tab's program asks to, or a long command finishes, while the window is inactive.",
-                            &theme,
-                        )
-                        .child(switch(
-                            "notifications",
-                            settings.notifications,
-                            &theme,
-                            |settings| settings.notifications = !settings.notifications,
-                        )),
-                    )
-                    .child(
-                        setting_row(
-                            "Confirm Close",
-                            "Ask before closing a pane, tab, or window with a program still running.",
-                            &theme,
-                        )
-                        .child(switch(
-                            "confirm-close",
-                            settings.confirm_close,
-                            &theme,
-                            |settings| settings.confirm_close = !settings.confirm_close,
-                        )),
-                    )
-                    .child(self.render_section_title("Status Bar", &theme))
-                    .child(render_status_bar_settings(&settings.status_bar, &theme))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.))
-                            .pt(px(24.))
-                            .child(
-                                div()
-                                    .id("open-settings-file")
-                                    .min_w_0()
-                                    .truncate()
-                                    .cursor_pointer()
-                                    .text_size(theme::TEXT_SMALL)
-                                    .text_color(theme.text_muted)
-                                    .hover({
-                                        let accent = theme.text_accent;
-                                        move |style| style.text_color(accent)
-                                    })
-                                    .on_click(move |_: &ClickEvent, _window, cx| {
-                                        cx.open_with_system(&settings_path);
-                                    })
-                                    .child(display_path),
-                            )
-                            .child(
-                                text_button("reset-settings", "Reset to Defaults", &theme)
-                                    .on_click(|_: &ClickEvent, _window, cx| {
-                                        SettingsStore::update(cx, |settings| {
-                                            *settings = Settings::default()
-                                        });
-                                    }),
-                            ),
-                    ),
-            )
+    #[test]
+    fn steps_snap_to_the_grid_and_stay_in_range() {
+        assert_eq!(step_value(13.5, 0.5, FONT_SIZE_RANGE, 1.), 14.);
+        assert_eq!(step_value(13.3, 0.5, FONT_SIZE_RANGE, -1.), 13.);
+        assert_eq!(step_value(32., 0.5, FONT_SIZE_RANGE, 1.), 32.);
+        assert_eq!(step_value(0., 2., TERMINAL_PADDING_RANGE, -1.), 0.);
+        let mut height = 1.;
+        for _ in 0..7 {
+            height = step_value(height, 0.05, LINE_HEIGHT_RANGE, 1.);
+        }
+        assert!((height - 1.35).abs() < 1e-5);
     }
 }
