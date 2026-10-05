@@ -519,6 +519,15 @@ impl Workspace {
                                 .child(display.title)
                                 .into_any_element(),
                         })
+                        .when(display.failed, |line| {
+                            line.child(
+                                div()
+                                    .flex_none()
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(theme::to_hsla(theme.terminal.ansi[1])),
+                            )
+                        })
                         .child(if display.pinned {
                             div()
                                 .flex()

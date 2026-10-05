@@ -17,6 +17,7 @@ use libghostty_vt::{
     Terminal,
     fmt::Format,
     key, mouse, paste,
+    screen::RowSemanticPrompt,
     selection::{
         FormatOptions, Selection,
         gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
@@ -37,6 +38,7 @@ use crate::{
     pty::{Pty, PtyDimensions},
     search::{self, SearchMatch},
     settings::SettingsStore,
+    shell_integration::{self, CommandMark, MarkScanner, ShellIntegration},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, TerminalColors},
 };
@@ -50,7 +52,9 @@ actions!(
         ClearScrollback,
         Find,
         SearchNext,
-        SearchPrevious
+        SearchPrevious,
+        PreviousPrompt,
+        NextPrompt
     ]
 );
 
@@ -73,6 +77,22 @@ pub struct TabMetadata {
     pub process: Option<SharedString>,
     /// Whether a program other than the shell is in the foreground.
     pub running: bool,
+    /// When the current command started, per shell integration.
+    pub command_started: Option<Instant>,
+    /// How the most recent command ended, per shell integration.
+    pub last_command: Option<CommandOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CommandOutcome {
+    pub exit_code: Option<i32>,
+    pub duration: Duration,
+}
+
+impl CommandOutcome {
+    pub fn failed(&self) -> bool {
+        self.exit_code.is_some_and(|code| code != 0)
+    }
 }
 
 pub enum TerminalEvent {
@@ -99,6 +119,9 @@ pub struct TerminalView {
     _settings_subscription: Subscription,
     _theme_subscription: Subscription,
     search: Option<SearchBar>,
+    marks: MarkScanner,
+    command_started: Option<Instant>,
+    last_command: Option<CommandOutcome>,
 }
 
 /// The find bar and its results.
@@ -147,7 +170,8 @@ impl TerminalView {
             cell_width: 8,
             cell_height: 18,
         };
-        let (pty, output) = Pty::spawn(initial, cwd)?;
+        let command = shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
+        let (pty, output) = Pty::spawn(command, initial, cwd)?;
         let dimensions = Rc::new(Cell::new(initial));
 
         let mut terminal = Terminal::new(Options {
@@ -229,6 +253,9 @@ impl TerminalView {
                     cx.notify();
                 }),
                 search: None,
+                marks: MarkScanner::default(),
+                command_started: None,
+                last_command: None,
                 _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
                     let colors = cx.theme().terminal.clone();
                     if let Err(error) = configure_colors(&mut view.terminal, &colors) {
@@ -256,10 +283,77 @@ impl TerminalView {
     }
 
     fn process_output(&mut self, chunks: &[Vec<u8>], cx: &mut Context<Self>) {
+        let mut command_changed = false;
         for chunk in chunks {
+            for mark in self.marks.scan(chunk) {
+                self.apply_mark(mark);
+                command_changed = true;
+            }
             self.terminal.vt_write(chunk);
         }
+        if command_changed {
+            self.refresh_metadata(cx);
+        }
         cx.notify();
+    }
+
+    fn apply_mark(&mut self, mark: CommandMark) {
+        match mark {
+            CommandMark::Started => self.command_started = Some(Instant::now()),
+            CommandMark::Finished(exit_code) => {
+                // A finish without a start (e.g. the first prompt) has no
+                // command to report.
+                if let Some(started) = self.command_started.take() {
+                    self.last_command = Some(CommandOutcome {
+                        exit_code,
+                        duration: started.elapsed(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Screen rows where a shell prompt begins, oldest first.
+    fn prompt_rows(&self) -> Vec<u32> {
+        let total = self.terminal.total_rows().unwrap_or(0) as u32;
+        (0..total)
+            .filter(|row| {
+                self.terminal
+                    .grid_ref(Point::Screen(PointCoordinate { x: 0, y: *row }))
+                    .and_then(|grid_ref| grid_ref.row())
+                    .and_then(|row| row.semantic_prompt())
+                    .is_ok_and(|prompt| prompt == RowSemanticPrompt::Prompt)
+            })
+            .collect()
+    }
+
+    fn jump_to_prompt(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Ok(scrollbar) = self.terminal.scrollbar() else {
+            return;
+        };
+        let top = scrollbar.offset as u32;
+        let prompts = self.prompt_rows();
+        let target = if forward {
+            prompts.into_iter().find(|row| *row > top)
+        } else {
+            prompts.into_iter().rev().find(|row| *row < top)
+        };
+        match target {
+            Some(row) => self
+                .terminal
+                .scroll_viewport(ScrollViewport::Row(row as usize)),
+            None if forward => self.terminal.scroll_viewport(ScrollViewport::Bottom),
+            None => return,
+        }
+        cx.notify();
+    }
+
+    fn previous_prompt(&mut self, _: &PreviousPrompt, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_prompt(false, cx);
+    }
+
+    fn next_prompt(&mut self, _: &NextPrompt, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_prompt(true, cx);
     }
 
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
@@ -301,6 +395,8 @@ impl TerminalView {
             branch: branch.map(Into::into),
             process: process.map(Into::into),
             running,
+            command_started: self.command_started,
+            last_command: self.last_command,
         }
     }
 
@@ -912,6 +1008,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_scrollback))
             .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::previous_prompt))
+            .on_action(cx.listener(Self::next_prompt))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -943,6 +1041,8 @@ impl Render for TerminalView {
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-f", Find, Some("Terminal")),
+        KeyBinding::new("cmd-up", PreviousPrompt, Some("Terminal")),
+        KeyBinding::new("cmd-down", NextPrompt, Some("Terminal")),
         KeyBinding::new("cmd-g", SearchNext, Some("Terminal")),
         KeyBinding::new("cmd-shift-g", SearchPrevious, Some("Terminal")),
         KeyBinding::new("shift-enter", SearchPrevious, Some(SEARCH_CONTEXT)),

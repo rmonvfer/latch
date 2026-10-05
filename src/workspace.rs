@@ -99,6 +99,8 @@ pub(crate) struct TabDisplay {
     pub pinned: bool,
     pub directory: Option<SharedString>,
     pub branch: Option<SharedString>,
+    /// The last command in the focused pane exited with an error.
+    pub failed: bool,
 }
 
 /// The window contents: a titlebar, a collapsible sidebar of tabs and tab
@@ -412,6 +414,10 @@ impl Workspace {
                     pinned: style.pinned,
                     directory: metadata.directory.clone(),
                     branch: metadata.branch.clone(),
+                    failed: metadata.command_started.is_none()
+                        && metadata
+                            .last_command
+                            .is_some_and(|outcome| outcome.failed()),
                 }
             }
             TabContent::Settings(_) => TabDisplay {
@@ -421,6 +427,7 @@ impl Workspace {
                 pinned: style.pinned,
                 directory: None,
                 branch: None,
+                failed: false,
             },
         };
         Some(display)

@@ -930,6 +930,20 @@ impl Render for SettingsPage {
                             .iter()
                             .map(|stepper| self.render_stepper(stepper, &settings, &theme)),
                     )
+                    .child(self.render_section_title("Terminal", &theme))
+                    .child(
+                        setting_row(
+                            "Shell Integration",
+                            "Prompt marks for ⌘↑/⌘↓ navigation and command status in zsh and bash. Applies to new terminals.",
+                            &theme,
+                        )
+                        .child(switch(
+                            "shell-integration",
+                            settings.shell_integration,
+                            &theme,
+                            |settings| settings.shell_integration = !settings.shell_integration,
+                        )),
+                    )
                     .child(self.render_section_title("Status Bar", &theme))
                     .child(render_status_bar_settings(&settings.status_bar, &theme))
                     .child(

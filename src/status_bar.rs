@@ -16,6 +16,7 @@ use crate::{
 pub enum StatusItem {
     SidebarToggle,
     Process,
+    LastCommand,
     Directory,
     GitBranch,
     TabCount,
@@ -26,9 +27,10 @@ pub enum StatusItem {
 }
 
 impl StatusItem {
-    pub const ALL: [StatusItem; 9] = [
+    pub const ALL: [StatusItem; 10] = [
         StatusItem::SidebarToggle,
         StatusItem::Process,
+        StatusItem::LastCommand,
         StatusItem::Directory,
         StatusItem::GitBranch,
         StatusItem::TabCount,
@@ -42,6 +44,7 @@ impl StatusItem {
         match self {
             StatusItem::SidebarToggle => "Sidebar Toggle",
             StatusItem::Process => "Running Program",
+            StatusItem::LastCommand => "Last Command",
             StatusItem::Directory => "Working Directory",
             StatusItem::GitBranch => "Git Branch",
             StatusItem::TabCount => "Tab Count",
@@ -56,6 +59,9 @@ impl StatusItem {
         match self {
             StatusItem::SidebarToggle => "Shows or hides the tab sidebar.",
             StatusItem::Process => "Foreground program, highlighted while one is running.",
+            StatusItem::LastCommand => {
+                "Exit status and duration of the last command (needs shell integration)."
+            }
             StatusItem::Directory => "The shell's current directory.",
             StatusItem::GitBranch => "Branch of the repository the shell is in.",
             StatusItem::TabCount => "Number of open tabs.",
@@ -88,7 +94,7 @@ impl Default for StatusBarSettings {
         Self {
             visible: true,
             dividers: true,
-            left: vec![StatusItem::Process],
+            left: vec![StatusItem::Process, StatusItem::LastCommand],
             right: vec![
                 StatusItem::GitBranch,
                 StatusItem::Theme,
@@ -285,6 +291,36 @@ impl Workspace {
                     })
                     .into_any_element()
             }
+            StatusItem::LastCommand => {
+                let metadata = metadata?;
+                let (glyph, color, text) = match (metadata.command_started, metadata.last_command) {
+                    (Some(started), _) => (
+                        "●",
+                        theme.text_accent,
+                        format!("running {}", format_duration(started.elapsed())),
+                    ),
+                    (None, Some(outcome)) if outcome.failed() => (
+                        "✗",
+                        theme::to_hsla(theme.terminal.ansi[1]),
+                        format!(
+                            "exit {} · {}",
+                            outcome.exit_code.unwrap_or_default(),
+                            format_duration(outcome.duration)
+                        ),
+                    ),
+                    (None, Some(outcome)) => (
+                        "✓",
+                        theme::to_hsla(theme.terminal.ansi[2]),
+                        format_duration(outcome.duration),
+                    ),
+                    (None, None) => return None,
+                };
+                status_label()
+                    .text_color(theme.text_muted)
+                    .child(div().text_color(color).child(glyph))
+                    .child(SharedString::from(text))
+                    .into_any_element()
+            }
             StatusItem::Directory => {
                 let directory = metadata?.directory?;
                 status_label()
@@ -374,6 +410,22 @@ impl Workspace {
     }
 }
 
+/// A compact duration: "0.4s", "12s", "3m 05s", "1h 02m".
+pub fn format_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs_f32();
+    if seconds < 10. {
+        format!("{seconds:.1}s")
+    } else if seconds < 60. {
+        format!("{}s", seconds as u64)
+    } else if seconds < 3600. {
+        let total = seconds as u64;
+        format!("{}m {:02}s", total / 60, total % 60)
+    } else {
+        let total = seconds as u64;
+        format!("{}h {:02}m", total / 3600, (total % 3600) / 60)
+    }
+}
+
 /// Non-interactive status text with an optional leading icon.
 fn status_label() -> gpui::Div {
     div()
@@ -403,8 +455,10 @@ mod tests {
 
     #[test]
     fn shifting_stays_within_bounds() {
-        let mut config = StatusBarSettings::default();
-        config.place(StatusItem::SidebarToggle, Some(Side::Left));
+        let mut config = StatusBarSettings {
+            left: vec![StatusItem::Process, StatusItem::SidebarToggle],
+            ..Default::default()
+        };
         config.shift(StatusItem::SidebarToggle, -1);
         assert_eq!(
             config.left,
@@ -427,6 +481,15 @@ mod tests {
         .deduplicated();
         assert_eq!(config.left, vec![StatusItem::Theme]);
         assert_eq!(config.right, vec![StatusItem::Settings]);
+    }
+
+    #[test]
+    fn durations_are_compact() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(420)), "0.4s");
+        assert_eq!(format_duration(Duration::from_secs(12)), "12s");
+        assert_eq!(format_duration(Duration::from_secs(185)), "3m 05s");
+        assert_eq!(format_duration(Duration::from_secs(3720)), "1h 02m");
     }
 
     #[test]

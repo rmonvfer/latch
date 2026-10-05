@@ -41,9 +41,10 @@ pub struct Pty {
 }
 
 impl Pty {
-    /// Start the user's shell in `cwd`, or the home directory when it is
-    /// absent or no longer exists.
+    /// Run `command` (normally the user's shell) in `cwd`, or the home
+    /// directory when it is absent or no longer exists.
     pub fn spawn(
+        mut command: CommandBuilder,
         dimensions: PtyDimensions,
         cwd: Option<&Path>,
     ) -> Result<(Self, async_channel::Receiver<Vec<u8>>)> {
@@ -51,7 +52,6 @@ impl Pty {
             .openpty(dimensions.to_pty_size())
             .context("failed to open pty")?;
 
-        let mut command = CommandBuilder::new_default_prog();
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));

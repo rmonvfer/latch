@@ -10,6 +10,7 @@ mod search;
 mod session;
 mod settings;
 mod settings_page;
+mod shell_integration;
 mod sidebar;
 mod status_bar;
 mod tabs;
@@ -41,6 +42,7 @@ fn main() {
         assets::load_fonts(cx);
         SettingsStore::init(cx);
         theme::init(cx);
+        shell_integration::ShellIntegration::init(cx);
         bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![Menu {
