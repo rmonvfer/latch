@@ -112,6 +112,8 @@ pub struct TabStyle {
     pub color: Option<TabColor>,
     pub icon: Option<TabIcon>,
     pub pinned: bool,
+    /// A git worktree created for this tab, offered for removal later.
+    pub worktree: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

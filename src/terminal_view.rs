@@ -33,6 +33,7 @@ use libghostty_vt::{
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
     components::{elevated_shadow, icon, icon_button},
+    git::{self, DiffStats},
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
@@ -86,6 +87,8 @@ pub struct TabMetadata {
     pub last_command: Option<CommandOutcome>,
     /// The coding agent in the foreground, if any, and what it is doing.
     pub agent: Option<AgentState>,
+    /// Uncommitted changes in the shell's repository.
+    pub diff: Option<DiffStats>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +137,9 @@ pub enum Attention {
 /// anyway.
 const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
+/// How often uncommitted changes are recounted.
+const DIFF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
 /// An agent must work at least this long before going quiet is news.
 const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
 
@@ -166,6 +172,7 @@ pub struct TerminalView {
     activity: Activity,
     /// A command to type once the shell shows its first prompt.
     pending_startup: Option<String>,
+    diff: Option<DiffStats>,
     /// When the foreground agent started its current stretch of work.
     working_since: Option<Instant>,
     command_started: Option<Instant>,
@@ -289,6 +296,32 @@ impl TerminalView {
                 })
                 .detach();
             }
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                loop {
+                    let Ok(cwd) = this.update(cx, |view, _| view.metadata.cwd.clone()) else {
+                        return;
+                    };
+                    let diff = match cwd {
+                        Some(cwd) => {
+                            cx.background_executor()
+                                .spawn(async move { git::diff_stats(&cwd) })
+                                .await
+                        }
+                        None => None,
+                    };
+                    let updated = this.update(cx, |view, cx| {
+                        if view.diff != diff {
+                            view.diff = diff;
+                            view.refresh_metadata(cx);
+                        }
+                    });
+                    if updated.is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(DIFF_REFRESH_INTERVAL).await;
+                }
+            })
+            .detach();
             let metadata_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 loop {
                     let refreshed = this.update(cx, |view, cx| view.refresh_metadata(cx));
@@ -330,6 +363,7 @@ impl TerminalView {
                 bell,
                 activity: Activity::default(),
                 pending_startup: startup.map(str::to_string),
+                diff: None,
                 working_since: None,
                 command_started: None,
                 last_command: None,
@@ -531,6 +565,7 @@ impl TerminalView {
             running,
             command_started: self.command_started,
             last_command: self.last_command,
+            diff: self.diff,
             agent: running
                 .then(|| foreground.and_then(process_info::process_args))
                 .flatten()

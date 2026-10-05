@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
-    Focusable, MouseButton, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString,
+    Focusable, MouseButton, MouseMoveEvent, Pixels, Point, PromptLevel, ScrollHandle, SharedString,
     Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 
@@ -14,17 +14,18 @@ use crate::{
     agents::AgentProfile,
     components::{icon, icon_button, keybinding},
     confirm::confirm_close,
+    git::{self, DiffStats},
     notifications,
     pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
     pane_tree::PaneNode,
+    process_info::shorten_home,
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
     sidebar::sidebar_child_index,
     status_bar::{StatusItem, format_duration},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout, TabStyle},
-    terminal_view::TerminalView,
-    terminal_view::{AgentState, Attention, TabMetadata},
+    terminal_view::{AgentState, Attention, TabMetadata, TerminalView},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Theme},
 };
@@ -120,6 +121,7 @@ pub(crate) struct TabDisplay {
     /// Something happened in this tab while it was in the background.
     pub attention: bool,
     pub agent: Option<AgentState>,
+    pub diff: Option<DiffStats>,
 }
 
 /// The window contents: a titlebar, a collapsible sidebar of tabs and tab
@@ -438,14 +440,110 @@ impl Workspace {
     ) {
         let group = self.active.and_then(|id| self.layout.group_of(id));
         let cwd = self.active_metadata(cx).and_then(|metadata| metadata.cwd);
+        let repository = cwd
+            .clone()
+            .filter(|_| SettingsStore::get(cx).agent_worktrees)
+            .filter(|dir| git::repo_root(dir).is_some());
+        let Some(repository) = repository else {
+            self.launch_agent(profile, cwd.as_deref(), None, group, window, cx);
+            return;
+        };
+
+        // Give the agent its own worktree so it never edits the same files
+        // as another agent; creating one runs off the UI thread.
+        let profile = profile.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let label = profile.name.clone();
+            let created = cx
+                .background_executor()
+                .spawn(async move { git::create_worktree(&repository, &label) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match created {
+                Ok(path) => {
+                    this.launch_agent(&profile, Some(&path), Some(path.clone()), group, window, cx);
+                }
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    // Only informs; the answer is not needed.
+                    let _acknowledged = window.prompt(
+                        PromptLevel::Warning,
+                        "Couldn't create a worktree",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn launch_agent(
+        &mut self,
+        profile: &AgentProfile,
+        cwd: Option<&Path>,
+        worktree: Option<PathBuf>,
+        group: Option<GroupId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let style = TabStyle {
             name: None,
             color: profile.color,
             icon: profile.icon,
             pinned: false,
+            worktree,
         };
         let command = profile.command_line();
-        self.open_terminal(cwd.as_deref(), Some(&command), group, style, window, cx);
+        self.open_terminal(cwd, Some(&command), group, style, window, cx);
+    }
+
+    /// Close a tab and delete the worktree it was opened in, after asking.
+    /// The worktree's branch is kept.
+    pub(crate) fn request_remove_worktree(
+        &mut self,
+        id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.layout.style(id).worktree else {
+            return;
+        };
+        let detail = format!(
+            "{}\n\nThe tab closes and the folder is deleted. Its branch is kept.",
+            shorten_home(&path)
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Remove this worktree?",
+            Some(&detail),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| this.close(id, window, cx));
+            let removed = cx
+                .background_executor()
+                .spawn(async move { git::remove_worktree(&path) })
+                .await;
+            if let Err(error) = removed {
+                let _ = this.update_in(cx, |_, window, cx| {
+                    let detail = format!("{error:#}");
+                    // Only informs; the answer is not needed.
+                    let _acknowledged = window.prompt(
+                        PromptLevel::Warning,
+                        "Couldn't remove the worktree",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn active_grid_size(&self, cx: &App) -> Option<(u16, u16)> {
@@ -477,6 +575,7 @@ impl Workspace {
                     branch: metadata.branch.clone(),
                     attention: self.attention.contains(&id),
                     agent: metadata.agent,
+                    diff: metadata.diff,
                     failed: metadata.command_started.is_none()
                         && metadata
                             .last_command
@@ -493,6 +592,7 @@ impl Workspace {
                 failed: false,
                 attention: false,
                 agent: None,
+                diff: None,
             },
         };
         Some(display)

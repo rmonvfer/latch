@@ -8,6 +8,7 @@ use crate::{
     agent_badge,
     components::{icon, status_divider, status_item},
     settings::SettingsStore,
+    sidebar,
     theme::{self, Theme},
     workspace::{OpenSettings, ToggleSidebar, Workspace},
 };
@@ -352,12 +353,19 @@ impl Workspace {
                     .into_any_element()
             }
             StatusItem::GitBranch => {
-                let branch = metadata?.branch?;
+                let metadata = metadata?;
+                let branch = metadata.branch?;
                 status_label()
-                    .max_w(px(180.))
+                    .max_w(px(260.))
                     .text_color(theme.text_muted)
                     .child(icon("git-branch", theme::ICON_XSMALL, theme.text_muted))
                     .child(div().truncate().child(branch))
+                    .children(
+                        metadata
+                            .diff
+                            .filter(|diff| diff.files > 0)
+                            .map(|diff| sidebar::diff_label(diff, theme)),
+                    )
                     .into_any_element()
             }
             StatusItem::TabCount => {

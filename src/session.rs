@@ -122,6 +122,7 @@ mod tests {
                         color: Some(TabColor::Green),
                         icon: Some(TabIcon::Server),
                         pinned: true,
+                        worktree: Some(PathBuf::from("/repo-worktrees/claude-code-1")),
                     },
                 }),
                 EntryState::Group(GroupState {

@@ -41,6 +41,8 @@ pub struct Settings {
     pub confirm_close: bool,
     /// Agents offered in the sidebar's `+` menu.
     pub agent_profiles: Vec<AgentProfile>,
+    /// Start each agent in a new git worktree of the current repository.
+    pub agent_worktrees: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +58,7 @@ impl Default for Settings {
             notifications: true,
             confirm_close: true,
             agent_profiles: agents::default_profiles(),
+            agent_worktrees: false,
         }
     }
 }

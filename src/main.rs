@@ -3,6 +3,7 @@ mod agents;
 mod assets;
 mod components;
 mod confirm;
+mod git;
 mod grid;
 mod input;
 mod links;

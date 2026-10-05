@@ -14,6 +14,7 @@ use crate::{
         DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
         menu_surface,
     },
+    git::DiffStats,
     pane_group::DraggedPane,
     settings::{Settings, SettingsStore},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
@@ -457,6 +458,9 @@ impl Workspace {
             .filter(|_| expanded && sidebar.show_directory);
         let branch = display.branch.filter(|_| expanded && sidebar.show_branch);
         let agent = display.agent.filter(|_| expanded);
+        let diff = display
+            .diff
+            .filter(|diff| expanded && sidebar.show_branch && diff.files > 0);
         let has_details = directory.is_some() || branch.is_some() || agent.is_some();
         let icon_color = if active { theme.text } else { theme.text_muted };
         let title_color = if active { theme.text } else { theme.text_muted };
@@ -607,7 +611,7 @@ impl Workspace {
                         }),
                 )
                 .when(has_details, |row| {
-                    row.child(tab_details(agent, directory, branch, theme))
+                    row.child(tab_details(agent, directory, branch, diff, theme))
                 }),
         )
     }
@@ -722,6 +726,22 @@ impl Workspace {
                             })),
                     )
                 })
+                .when(style.worktree.is_some(), |menu| {
+                    menu.child(menu_separator(theme)).child(
+                        menu_item(
+                            "menu-remove-worktree",
+                            "git-branch",
+                            "Remove Worktree…",
+                            theme,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.close_context_menu(cx);
+                                this.request_remove_worktree(id, window, cx);
+                            },
+                        )),
+                    )
+                })
                 .child(menu_separator(theme))
                 .child(
                     menu_item("menu-close", "x", "Close Tab", theme).on_click(cx.listener(
@@ -809,6 +829,7 @@ impl Workspace {
 
     fn render_new_tab_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let profiles = SettingsStore::get(cx).agent_profiles.clone();
+        let worktrees = SettingsStore::get(cx).agent_worktrees;
         let settings_path = SettingsStore::path(cx);
 
         div()
@@ -839,6 +860,24 @@ impl Workspace {
                     this.open_agent(&profile, window, cx);
                 }))
             }))
+            .child(
+                menu_item(
+                    "menu-agent-worktrees",
+                    if worktrees { "check" } else { "git-branch" },
+                    "New Worktree per Agent",
+                    theme,
+                )
+                .text_color(if worktrees {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .on_click(|_: &ClickEvent, _, cx| {
+                    SettingsStore::update(cx, |settings| {
+                        settings.agent_worktrees = !settings.agent_worktrees;
+                    });
+                }),
+            )
             .child(menu_separator(theme))
             .child(
                 menu_item("menu-edit-agents", "pencil", "Edit Agent Profiles…", theme).on_click(
@@ -997,10 +1036,30 @@ fn render_view_options_menu(config: &SidebarSettings, theme: &Theme) -> impl Int
         ))
 }
 
+/// "+12 −3" in the theme's green and red.
+pub(crate) fn diff_label(diff: DiffStats, theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_none()
+        .gap(px(3.))
+        .font_family(theme::FONT_FAMILY)
+        .child(
+            div()
+                .text_color(theme::to_hsla(theme.terminal.ansi[2]))
+                .child(SharedString::from(format!("+{}", diff.insertions))),
+        )
+        .child(
+            div()
+                .text_color(theme::to_hsla(theme.terminal.ansi[1]))
+                .child(SharedString::from(format!("−{}", diff.deletions))),
+        )
+}
+
 fn tab_details(
     agent: Option<AgentState>,
     directory: Option<SharedString>,
     branch: Option<SharedString>,
+    diff: Option<DiffStats>,
     theme: &Theme,
 ) -> impl IntoElement {
     let has_agent = agent.is_some();
@@ -1040,6 +1099,7 @@ fn tab_details(
                 .child(icon("git-branch", theme::ICON_XSMALL, muted))
                 .child(div().truncate().child(branch))
         }))
+        .children(diff.map(|diff| diff_label(diff, theme)))
         .when(has_branch && directory.is_some(), |row| {
             row.child(div().flex_none().text_color(separator_color).child("•"))
         })
