@@ -1,0 +1,139 @@
+//! Saving and restoring the window layout: groups, tab customizations, and
+//! each terminal's working directory.
+
+use std::{fs, path::PathBuf};
+
+use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    settings::SettingsStore,
+    tabs::{TabColor, TabStyle},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabKind {
+    Terminal,
+    Settings,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TabState {
+    pub kind: TabKind,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub style: TabStyle,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GroupState {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<TabColor>,
+    #[serde(default)]
+    pub collapsed: bool,
+    pub tabs: Vec<TabState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EntryState {
+    Tab(TabState),
+    Group(GroupState),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionState {
+    pub entries: Vec<EntryState>,
+    /// Position of the active tab in display order.
+    #[serde(default)]
+    pub active: usize,
+    #[serde(default = "default_true")]
+    pub sidebar_open: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn session_path() -> PathBuf {
+    SettingsStore::config_dir().join("session.json")
+}
+
+/// The saved session, if there is a readable one.
+pub fn load() -> Option<SessionState> {
+    let path = session_path();
+    let contents = fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&contents) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            log::warn!("ignoring invalid {}: {error}", path.display());
+            None
+        }
+    }
+}
+
+pub fn save(state: &SessionState) -> Result<()> {
+    let path = session_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create config directory")?;
+    }
+    let json = serde_json::to_string_pretty(state)?;
+    // Write then rename so a crash mid-write never leaves a truncated file.
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, json + "\n").context("failed to write session")?;
+    fs::rename(&temporary, &path).context("failed to replace session")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabs::TabIcon;
+
+    #[test]
+    fn session_round_trips_through_json() {
+        let state = SessionState {
+            entries: vec![
+                EntryState::Tab(TabState {
+                    kind: TabKind::Terminal,
+                    cwd: Some(PathBuf::from("/tmp")),
+                    style: TabStyle {
+                        name: Some("api".into()),
+                        color: Some(TabColor::Green),
+                        icon: Some(TabIcon::Server),
+                        pinned: true,
+                    },
+                }),
+                EntryState::Group(GroupState {
+                    name: "Infra".into(),
+                    color: Some(TabColor::Blue),
+                    collapsed: true,
+                    tabs: vec![TabState {
+                        kind: TabKind::Settings,
+                        cwd: None,
+                        style: TabStyle::default(),
+                    }],
+                }),
+            ],
+            active: 1,
+            sidebar_open: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<SessionState>(&json).unwrap(), state);
+    }
+
+    #[test]
+    fn minimal_session_uses_defaults() {
+        let state: SessionState =
+            serde_json::from_str(r#"{ "entries": [ { "type": "tab", "kind": "terminal" } ] }"#)
+                .unwrap();
+        assert!(state.sidebar_open);
+        assert_eq!(state.active, 0);
+        let EntryState::Tab(tab) = &state.entries[0] else {
+            panic!("expected a tab");
+        };
+        assert_eq!(tab.style, TabStyle::default());
+    }
+}
