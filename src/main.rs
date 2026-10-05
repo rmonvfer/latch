@@ -2,12 +2,15 @@ mod agent_badge;
 mod agents;
 mod app_menus;
 mod assets;
+mod cli;
 mod components;
 mod confirm;
+mod control;
 mod git;
 mod grid;
 mod input;
 mod links;
+mod mcp;
 mod notifications;
 mod osc;
 mod output;
@@ -50,6 +53,11 @@ const APP_IDENTIFIER: &str = "me.egrati.terminal";
 const APP_NAME: &str = "Terminal";
 
 fn main() {
+    // With arguments, act as the command-line client for a running app.
+    if let Some(code) = cli::run_from_args() {
+        std::process::exit(code);
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     application().with_assets(Assets).run(|cx: &mut App| {
@@ -103,6 +111,7 @@ fn main() {
         });
         if let Ok(workspace) = workspace {
             notifications::init(handle.into(), workspace.downgrade(), cx);
+            control::start(handle, cx);
         }
         cx.activate(true);
     });

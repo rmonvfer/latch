@@ -43,6 +43,9 @@ pub struct Settings {
     pub agent_profiles: Vec<AgentProfile>,
     /// Start each agent in a new git worktree of the current repository.
     pub agent_worktrees: bool,
+    /// Serve the control socket used by the `terminal` command and the MCP
+    /// server. Applies at launch.
+    pub control_api: bool,
 }
 
 impl Default for Settings {
@@ -59,6 +62,7 @@ impl Default for Settings {
             confirm_close: true,
             agent_profiles: agents::default_profiles(),
             agent_worktrees: false,
+            control_api: true,
         }
     }
 }

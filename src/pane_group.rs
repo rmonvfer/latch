@@ -376,20 +376,36 @@ impl PaneGroup {
     }
 
     fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = self.active_metadata(cx).cwd.clone();
-        let view = match TerminalView::build(cwd.as_deref(), None, cx) {
-            Ok(view) => view,
-            Err(error) => {
-                log::error!("failed to open terminal: {error:#}");
-                return;
-            }
-        };
         let target = self.active.clone();
-        if self.tree.split(&target, view.clone(), axis) {
-            self.zoomed = false;
-            self.watch(&view, window, cx);
-            self.focus(view, window, cx);
+        if let Err(error) = self.split_pane(&target, axis, None, window, cx) {
+            log::error!("failed to open terminal: {error:#}");
         }
+    }
+
+    /// Open a terminal beside `target` in its directory, optionally typing
+    /// `startup` into it, and focus it. Returns the new pane.
+    pub fn split_pane(
+        &mut self,
+        target: &Entity<TerminalView>,
+        axis: Axis,
+        startup: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<TerminalView>> {
+        let cwd = target.read(cx).metadata().cwd.clone();
+        let view = TerminalView::build(cwd.as_deref(), startup, cx)?;
+        if !self.tree.split(target, view.clone(), axis) {
+            return Err(anyhow!("the pane is not in this tab"));
+        }
+        self.zoomed = false;
+        self.watch(&view, window, cx);
+        self.focus(view.clone(), window, cx);
+        Ok(view)
+    }
+
+    /// Every pane, in reading order.
+    pub fn views(&self) -> Vec<Entity<TerminalView>> {
+        self.tree.leaves()
     }
 
     fn focus(&mut self, view: Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {

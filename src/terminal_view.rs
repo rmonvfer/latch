@@ -2,6 +2,7 @@ use std::{
     cell::Cell,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -33,6 +34,7 @@ use libghostty_vt::{
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
     components::{elevated_shadow, icon, icon_button},
+    control,
     git::{self, DiffStats},
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
@@ -137,6 +139,10 @@ pub enum Attention {
 /// anyway.
 const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
+/// Environment variable telling programs which pane they run in.
+pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
+static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// How often uncommitted changes are recounted.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -173,6 +179,7 @@ pub struct TerminalView {
     activity: Activity,
     /// A command to type once the shell shows its first prompt.
     pending_startup: Option<String>,
+    pane_id: u64,
     diff: Option<DiffStats>,
     /// When the foreground agent started its current stretch of work.
     working_since: Option<Instant>,
@@ -266,8 +273,14 @@ impl TerminalView {
             cell_width: 8,
             cell_height: 18,
         };
-        let command = shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
+        let pane_id = NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut command =
+            shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
+        // Lets programs in the pane, such as the control CLI, address it.
+        command.env(PANE_ID_VARIABLE, pane_id.to_string());
+        control::configure_command(&mut command, cx);
         let (pty, output) = Pty::spawn(command, initial, cwd)?;
+        let initial_cwd = pty.initial_cwd().map(Path::to_path_buf);
         let dimensions = Rc::new(Cell::new(initial));
 
         let mut terminal = Terminal::new(Options {
@@ -397,9 +410,16 @@ impl TerminalView {
                 metrics: None,
                 metadata: TabMetadata {
                     title: FALLBACK_TITLE.into(),
+                    directory: initial_cwd
+                        .as_deref()
+                        .map(|path| process_info::shorten_home(path).into()),
+                    cwd: initial_cwd.clone(),
                     ..Default::default()
                 },
-                process_metadata: ProcessMetadata::default(),
+                process_metadata: ProcessMetadata {
+                    directory: initial_cwd,
+                    ..Default::default()
+                },
                 _output_task: output_task,
                 _metadata_task: metadata_task,
                 // Font and padding changes take effect on the next frame.
@@ -414,6 +434,7 @@ impl TerminalView {
                 bell,
                 activity: Activity::default(),
                 pending_startup: startup.map(str::to_string),
+                pane_id,
                 diff: None,
                 working_since: None,
                 command_started: None,
@@ -430,6 +451,27 @@ impl TerminalView {
     }
 
     /// Where the terminal was last laid out, in window coordinates.
+    /// Identifies this pane to the control API for the app's lifetime.
+    pub fn pane_id(&self) -> u64 {
+        self.pane_id
+    }
+
+    /// The last `lines` non-empty lines of the screen and scrollback.
+    pub fn recent_text(&self, lines: usize) -> String {
+        let text = search::screen_text(&self.terminal).unwrap_or_default();
+        let kept: Vec<&str> = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect();
+        kept[kept.len().saturating_sub(lines)..].join("\n")
+    }
+
+    /// Type `text` into the pane as if the user had.
+    pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.write_input(text.as_bytes(), cx);
+    }
+
     pub fn bounds(&self) -> Option<Bounds<Pixels>> {
         self.bounds
     }

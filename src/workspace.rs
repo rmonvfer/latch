@@ -278,7 +278,7 @@ impl Workspace {
         }
     }
 
-    fn open_terminal(
+    pub(crate) fn open_terminal(
         &mut self,
         cwd: Option<&Path>,
         startup: Option<&str>,
