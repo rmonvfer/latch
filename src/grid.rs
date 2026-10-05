@@ -383,6 +383,23 @@ impl FrameRow {
     pub fn is_blank(&self) -> bool {
         self.texts.is_empty() && self.backgrounds.is_empty()
     }
+
+    /// The row's characters, with spaces for empty cells before the last
+    /// character.
+    pub fn text(&self) -> String {
+        let mut batches: Vec<&TextBatch> = self.texts.iter().collect();
+        batches.sort_by_key(|batch| batch.col);
+        let mut text = String::new();
+        let mut col = 0;
+        for batch in batches {
+            if batch.col > col {
+                text.extend(std::iter::repeat_n(' ', (batch.col - col) as usize));
+            }
+            text.push_str(&batch.text);
+            col = batch.col + batch.cells;
+        }
+        text
+    }
 }
 
 impl GridRenderer {

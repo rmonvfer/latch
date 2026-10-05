@@ -6,7 +6,7 @@ use gpui::{App, AssetSource, SharedString};
 /// Icons and fonts compiled into the binary.
 pub struct Assets;
 
-const ICONS: [(&str, &[u8]); 30] = [
+const ICONS: [(&str, &[u8]); 32] = [
     (
         "icons/arrow-down.svg",
         include_bytes!("../assets/icons/arrow-down.svg"),
@@ -20,6 +20,7 @@ const ICONS: [(&str, &[u8]); 30] = [
         "icons/check.svg",
         include_bytes!("../assets/icons/check.svg"),
     ),
+    ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
     (
         "icons/chevron-down.svg",
         include_bytes!("../assets/icons/chevron-down.svg"),
@@ -87,6 +88,10 @@ const ICONS: [(&str, &[u8]); 30] = [
     ),
     ("icons/pin.svg", include_bytes!("../assets/icons/pin.svg")),
     ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
+    (
+        "icons/rotate-ccw.svg",
+        include_bytes!("../assets/icons/rotate-ccw.svg"),
+    ),
     (
         "icons/rocket.svg",
         include_bytes!("../assets/icons/rocket.svg"),

@@ -4,7 +4,8 @@
 use std::{rc::Rc, time::Duration};
 
 use gpui::{
-    AnyElement, Hsla, ListState, Pixels, SharedString, canvas, div, list, point, prelude::*, px,
+    AnyElement, App, ClickEvent, Hsla, ListState, Pixels, SharedString, Window, canvas, div, list,
+    point, prelude::*, px,
 };
 
 use crate::{
@@ -34,17 +35,33 @@ pub enum ItemContent {
 pub struct Item {
     header: Option<Header>,
     content: ItemContent,
+    collapsed: bool,
+    selected: bool,
 }
+
+/// Something done to a block from its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockAction {
+    Select,
+    ToggleCollapsed,
+    CopyCommand,
+    CopyOutput,
+    Rerun,
+}
+
+/// Handles a block action for the block at an index.
+pub type OnBlockAction = Rc<dyn Fn(BlockAction, usize, &mut Window, &mut App)>;
 
 struct Header {
     command: SharedString,
     context: BlockContext,
     outcome: Option<Outcome>,
     failed: bool,
+    running: bool,
 }
 
 impl Item {
-    pub fn block(block: &Block, content: ItemContent) -> Self {
+    pub fn block(block: &Block, content: ItemContent, selected: bool) -> Self {
         Self {
             // Startup output has no command to show.
             header: (!block.command.is_empty()).then(|| Header {
@@ -52,8 +69,11 @@ impl Item {
                 context: block.context.clone(),
                 outcome: block.outcome,
                 failed: block.failed(),
+                running: block.is_running(),
             }),
             content,
+            collapsed: block.collapsed,
+            selected,
         }
     }
 
@@ -71,6 +91,8 @@ struct Palette {
     border: Hsla,
     chip: Hsla,
     error: Hsla,
+    selected: Hsla,
+    hover: Hsla,
 }
 
 impl Palette {
@@ -81,6 +103,8 @@ impl Palette {
             border: theme.border_variant,
             chip: theme.element_background,
             error: theme::to_hsla(theme.terminal.ansi[1]),
+            selected: theme.ghost_selected.opacity(0.5),
+            hover: theme.ghost_hover,
         }
     }
 }
@@ -93,25 +117,36 @@ pub fn render_list(
     live: Option<Rc<Frame>>,
     metrics: CellMetrics,
     theme: &Theme,
+    on_action: OnBlockAction,
 ) -> AnyElement {
     let palette = Palette::new(theme);
     list(state.clone(), move |index, _window, _cx| {
         let Some(item) = items.get(index) else {
             return div().into_any_element();
         };
-        render_item(item, live.clone(), metrics, palette)
+        render_item(
+            index,
+            item,
+            live.clone(),
+            metrics,
+            palette,
+            on_action.clone(),
+        )
     })
     .size_full()
     .into_any_element()
 }
 
 fn render_item(
+    index: usize,
     item: &Item,
     live: Option<Rc<Frame>>,
     metrics: CellMetrics,
     palette: Palette,
+    on_action: OnBlockAction,
 ) -> AnyElement {
     let (rows, scrollback, live_frame) = match &item.content {
+        _ if item.collapsed => (None, Vec::new(), None),
         ItemContent::Finished(rows) => (Some(rows.clone()), Vec::new(), None),
         ItemContent::Running(scrollback) => (None, scrollback.clone(), live),
     };
@@ -145,28 +180,72 @@ fn render_item(
     } else {
         gpui::transparent_black()
     };
+    let select = on_action.clone();
     div()
+        .id(("block", index))
+        .group("block")
         .flex()
         .flex_col()
         .w_full()
         .pb(px(BLOCK_GAP))
         .border_l(px(FAILURE_EDGE))
         .border_color(edge)
+        .when(item.selected, |this| this.bg(palette.selected))
         .when(item.header.is_some(), |this| {
             this.border_t_1().border_color(palette.border)
         })
         .when(item.header.is_none(), |this| this.pt(metrics.padding))
-        .children(
-            item.header
-                .as_ref()
-                .map(|header| render_header(header, padding, palette)),
-        )
+        .on_click(move |_: &ClickEvent, window, cx| select(BlockAction::Select, index, window, cx))
+        .children(item.header.as_ref().map(|header| {
+            render_header(index, header, item.collapsed, padding, palette, on_action)
+        }))
         .child(output)
         .into_any_element()
 }
 
-fn render_header(header: &Header, padding: Pixels, palette: Palette) -> AnyElement {
+fn render_header(
+    index: usize,
+    header: &Header,
+    collapsed: bool,
+    padding: Pixels,
+    palette: Palette,
+    on_action: OnBlockAction,
+) -> AnyElement {
     let chips = chips(&header.context, None, palette);
+    let button = |name: &'static str, action: BlockAction| {
+        let on_action = on_action.clone();
+        div()
+            .id((name, index))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded_sm()
+            .hover(|this| this.bg(palette.hover))
+            .child(icon(name, px(12.), palette.muted))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                on_action(action, index, window, cx);
+            })
+    };
+    let chevron = if collapsed {
+        "chevron-right"
+    } else {
+        "chevron-down"
+    };
+    // Actions show on hover so they don't crowd every header.
+    let actions = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_0p5()
+        .invisible()
+        .group_hover("block", |this| this.visible())
+        .child(button("terminal", BlockAction::CopyCommand))
+        .when(!header.running, |this| {
+            this.child(button("copy", BlockAction::CopyOutput))
+                .child(button("rotate-ccw", BlockAction::Rerun))
+        });
     let outcome = header.outcome.map(|outcome| {
         let failed = outcome.exit_code != 0;
         div()
@@ -193,9 +272,11 @@ fn render_header(header: &Header, padding: Pixels, palette: Palette) -> AnyEleme
         .gap_2()
         .min_h(px(HEADER_HEIGHT))
         .py_1()
-        .px(padding)
+        .pl(padding - px(20.))
+        .pr(padding)
         .text_xs()
         .font_family(theme::UI_FONT_FAMILY)
+        .child(button(chevron, BlockAction::ToggleCollapsed))
         .children(chips)
         .child(
             div()
@@ -206,6 +287,7 @@ fn render_header(header: &Header, padding: Pixels, palette: Palette) -> AnyEleme
                 .text_color(palette.text)
                 .child(header.command.clone()),
         )
+        .child(actions)
         .children(outcome)
         .into_any_element()
 }

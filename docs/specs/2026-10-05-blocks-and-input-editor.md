@@ -8,14 +8,15 @@ Shell integration reports the shell's lifecycle as hex-encoded JSON in a private
 
 | Hook | Value |
 |---|---|
-| `Bootstrapped` | shell name and version, histfile, aliases, functions, builtins |
-| `Precmd` | exit code of the last command, cwd, git branch, virtualenv, conda env |
+| `Bootstrapped` | shell name and version, histfile, PATH, aliases, functions, builtins |
+| `Precmd` | exit code of the last command, cwd, virtualenv, conda env |
 | `Preexec` | the command line as the shell received it |
 | `CommandFinished` | exit code |
+| `Completions` | the completed prefix, matching words, and their descriptions |
 
 Each pane generates a random session id and passes it to its shell in `TERMINAL_SESSION_ID`. Hooks carrying any other session id are ignored, so a program printing a forged hook cannot fake command boundaries. Timestamps are taken by the app when hooks arrive. OSC 133 marks remain in place for prompt navigation in shells without hook support.
 
-The scripts also rebind a kill-whole-line key (`^P`) on every prompt so the app can clear the line editor before injecting a command, and keep bracketed paste enabled.
+The scripts also rebind two private keys on every prompt: `ESC [ 9876 ~` runs kill-whole-line, so the app can clear the line editor before injecting a command, and in zsh `ESC [ 9877 ~` reports completions for the text typed before it.
 
 ## Blocks
 
@@ -45,12 +46,12 @@ A pane is in one of four modes, decided on every input event:
 
 ## Input editor
 
-A multi-line GPUI editor pinned below the block list. `Enter` runs, `Shift-Enter` inserts a newline. Running a command writes `^P` (clear line), the command in bracketed paste, then a newline, only once the shell is ready (after `Precmd` and the prompt's input mark); earlier submissions are queued.
+A multi-line GPUI editor pinned below the block list. `Enter` runs, `Shift-Enter` inserts a newline. Running a command writes the clear-line key, the command in bracketed paste, then Enter, only once the shell is ready (after `Precmd` and the prompt's input mark); earlier submissions are queued.
 
 - History: the shell's histfile (zsh extended and plain formats, bash) merged with the app's own per-directory history; `↑`/`↓` walk it, `Ctrl-R` opens a fuzzy search.
 - Autosuggestions: the most recent history entry extending the current text, shown as ghost text, accepted with `→`.
 - Highlighting: the command word is colored by whether it is an alias, function, builtin, or executable on PATH (from `Bootstrapped` data and a PATH scan); strings, flags, and paths are tinted.
-- Completions: native zsh completions. A completion request writes a hidden widget invocation that runs zsh's completion system with `compadd` redirected to emit matches (with descriptions) over a private OSC, framed by start and end marks. The editor shows them in a menu. bash falls back to command and path completion.
+- Completions: native zsh completions. Tab writes the clear-line key, the text before the cursor, and the completion key, whose widget runs zsh's completion system with `compadd` wrapped to record matches (with descriptions) and reports them in a `Completions` hook. One match completes at once; several extend the word by their shared start and open a menu that narrows as you type. bash falls back to command and path completion.
 
 ## Existing features in block mode
 

@@ -588,7 +588,7 @@ impl EntityInputHandler for CommandEditor {
         self.buffer.replace(range.clone(), text);
         self.marked_range = (!text.is_empty()).then(|| range.start..range.start + text.len());
         if let Some(selected) = new_selected_range_utf16 {
-            let marked_text = &text[..];
+            let marked_text = text;
             let to_utf8 = |utf16: usize| {
                 let mut units = 0;
                 marked_text

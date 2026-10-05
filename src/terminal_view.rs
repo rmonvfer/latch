@@ -33,7 +33,7 @@ use libghostty_vt::{
 
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
-    block_view::{self, Item, ItemContent},
+    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction},
     blocks::{self, BlockContext, BlockList},
     command_editor::{CommandEditor, CommandEditorEvent},
     completion::{self, CompletionMenu},
@@ -309,6 +309,8 @@ pub struct TerminalView {
     blocks: Option<BlockList>,
     /// Scroll and layout state of the block list, one item per block.
     block_list: ListState,
+    /// The block picked by clicking or with ⌘↑ and ⌘↓.
+    selected_block: Option<usize>,
     /// Where commands are typed while the shell waits at its prompt.
     editor: Entity<CommandEditor>,
     _editor_subscription: Subscription,
@@ -596,6 +598,7 @@ impl TerminalView {
                     state.set_follow_mode(FollowMode::Tail);
                     state
                 },
+                selected_block: None,
                 _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
                 editor,
                 shell_ready: false,
@@ -646,13 +649,37 @@ impl TerminalView {
 
     /// The last `lines` non-empty lines of the screen and scrollback.
     pub fn recent_text(&self, lines: usize) -> String {
-        let text = search::screen_text(&self.terminal).unwrap_or_default();
+        let text = match &self.blocks {
+            Some(blocks) => self.blocks_text(blocks),
+            None => search::screen_text(&self.terminal).unwrap_or_default(),
+        };
         let kept: Vec<&str> = text
             .lines()
             .map(str::trim_end)
             .filter(|line| !line.is_empty())
             .collect();
         kept[kept.len().saturating_sub(lines)..].join("\n")
+    }
+
+    /// Every block as text: each command after a `$`, then its output. A
+    /// running command's output is read from its terminal.
+    fn blocks_text(&self, blocks: &BlockList) -> String {
+        let mut text = String::new();
+        for block in blocks.blocks() {
+            if !block.command.is_empty() {
+                text.push_str("$ ");
+                text.push_str(&block.command);
+                text.push('\n');
+            }
+            let output = if block.is_running() {
+                search::screen_text(&self.terminal).unwrap_or_default()
+            } else {
+                block.output_text().unwrap_or_default()
+            };
+            text.push_str(&output);
+            text.push('\n');
+        }
+        text
     }
 
     /// Type `text` into the pane as if the user had.
@@ -750,6 +777,9 @@ impl TerminalView {
                 let dropped = count + 1 - blocks.blocks().len();
                 if dropped > 0 {
                     self.block_list.splice(0..dropped, 0);
+                    self.selected_block = self
+                        .selected_block
+                        .and_then(|index| index.checked_sub(dropped));
                 }
                 // The editor gives way to the command once it has run long
                 // enough to be more than a flicker.
@@ -804,7 +834,8 @@ impl TerminalView {
             } else {
                 ItemContent::Finished(block.finished_rows().unwrap_or_default())
             };
-            items.push(Item::block(block, content));
+            let selected = self.selected_block == Some(items.len());
+            items.push(Item::block(block, content, selected));
         }
         // A running block is drawn from the live terminal and grows with it.
         if blocks.running().is_some() {
@@ -877,15 +908,7 @@ impl TerminalView {
             }
             CommandEditorEvent::Submitted(command) => {
                 self.history_position = None;
-                if command.trim().is_empty() {
-                    return;
-                }
-                self.history.push(command);
-                if self.shell_ready {
-                    self.inject_command(command, cx);
-                } else {
-                    self.queued_command = Some(command.clone());
-                }
+                self.run_command(command, cx);
             }
             CommandEditorEvent::EndOfFile => self.write_input(b"\x04", cx),
             CommandEditorEvent::HistoryPrevious if self.completion.is_some() => {
@@ -927,8 +950,10 @@ impl TerminalView {
             CommandEditorEvent::Escaped => {
                 if self.completion.take().is_some() || self.history_search.take().is_some() {
                     self.sync_editor_menu(cx);
-                    cx.notify();
+                } else {
+                    self.selected_block = None;
                 }
+                cx.notify();
             }
             CommandEditorEvent::Changed => {
                 if let Some(position) = &mut self.history_position {
@@ -943,6 +968,77 @@ impl TerminalView {
                 self.decorate_editor(cx);
             }
         }
+    }
+
+    fn on_block_action(&self, cx: &Context<Self>) -> OnBlockAction {
+        let view = cx.entity().downgrade();
+        Rc::new(move |action, index, _window, cx| {
+            let _ = view.update(cx, |view, cx| view.block_action(action, index, cx));
+        })
+    }
+
+    /// Run `command` in the shell, now or once it is ready, and remember it.
+    fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if command.trim().is_empty() {
+            return;
+        }
+        self.selected_block = None;
+        self.history.push(command);
+        if self.shell_ready {
+            self.inject_command(command, cx);
+        } else {
+            self.queued_command = Some(command.to_string());
+        }
+    }
+
+    /// Carry out an action from a block's header.
+    fn block_action(&mut self, action: BlockAction, index: usize, cx: &mut Context<Self>) {
+        let Some(block) = self
+            .blocks
+            .as_mut()
+            .and_then(|blocks| blocks.blocks_mut().get_mut(index))
+        else {
+            return;
+        };
+        match action {
+            BlockAction::Select => self.selected_block = Some(index),
+            BlockAction::ToggleCollapsed => {
+                block.collapsed = !block.collapsed;
+                self.block_list.remeasure_items(index..index + 1);
+            }
+            BlockAction::CopyCommand => {
+                cx.write_to_clipboard(ClipboardItem::new_string(block.command.clone()));
+            }
+            BlockAction::CopyOutput => {
+                if let Some(text) = block.output_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            BlockAction::Rerun => {
+                let command = block.command.clone();
+                self.run_command(&command, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Select the block before (or after) the selected one, or the newest,
+    /// and scroll to it.
+    fn select_adjacent_block(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(count) = self.blocks.as_ref().map(|blocks| blocks.blocks().len()) else {
+            return;
+        };
+        let next = match (self.selected_block, forward) {
+            (None, false) => count.checked_sub(1),
+            (None, true) => None,
+            (Some(index), false) => Some(index.saturating_sub(1)),
+            (Some(index), true) => (index + 1 < count).then_some(index + 1),
+        };
+        self.selected_block = next;
+        if let Some(index) = next {
+            self.block_list.scroll_to_reveal_item(index);
+        }
+        cx.notify();
     }
 
     /// Ask for completions of the word before the cursor: from zsh's own
@@ -1370,11 +1466,19 @@ impl TerminalView {
     }
 
     fn previous_prompt(&mut self, _: &PreviousPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_to_prompt(false, cx);
+        if self.shows_blocks() {
+            self.select_adjacent_block(false, cx);
+        } else {
+            self.jump_to_prompt(false, cx);
+        }
     }
 
     fn next_prompt(&mut self, _: &NextPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_to_prompt(true, cx);
+        if self.shows_blocks() {
+            self.select_adjacent_block(true, cx);
+        } else {
+            self.jump_to_prompt(true, cx);
+        }
     }
 
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
@@ -2259,6 +2363,7 @@ impl Render for TerminalView {
                     frame.map(Rc::new),
                     metrics,
                     cx.theme(),
+                    self.on_block_action(cx),
                 );
                 let editor_panel = self
                     .shows_editor()

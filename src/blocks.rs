@@ -75,6 +75,8 @@ pub struct Block {
     pub started: Instant,
     pub outcome: Option<Outcome>,
     pub output: Output,
+    /// Whether only the header shows.
+    pub collapsed: bool,
     /// Everything the command wrote, while it fits the budget.
     raw: Option<Vec<u8>>,
 }
@@ -107,6 +109,16 @@ impl Block {
                 Ok(live.history.clone())
             }
         }
+    }
+
+    /// A finished block's output as plain text, one line per row.
+    pub fn output_text(&self) -> Option<String> {
+        let rows = self.finished_rows()?;
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|row| row.text().trim_end().to_string())
+            .collect();
+        Some(lines.join("\n"))
     }
 
     /// Rows of a finished block.
@@ -229,6 +241,7 @@ impl BlockList {
             started: Instant::now(),
             outcome: None,
             output: Output::Live(Box::new(LiveOutput::new()?)),
+            collapsed: false,
             raw: Some(Vec::new()),
         });
         if self.blocks.len() > self.limit {
@@ -281,6 +294,7 @@ impl BlockList {
                 duration: Duration::ZERO,
             }),
             output: Output::Done(rows),
+            collapsed: false,
             raw: None,
         });
         Ok(())
@@ -395,6 +409,9 @@ mod tests {
         let block = &list.blocks()[0];
         assert!(!block.is_running());
         assert_eq!(text(&block.finished_rows().unwrap()), 31);
+        let output = block.output_text().unwrap();
+        assert!(output.starts_with("1\n2\n3\n"));
+        assert!(output.ends_with("30\n31"));
     }
 
     #[test]

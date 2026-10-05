@@ -52,7 +52,10 @@ pub fn layout_rows(text: &str, cols: usize) -> Vec<VisualRow> {
 /// Row and column of byte `offset`. An offset where a long line wraps
 /// belongs to the start of the following row.
 pub fn position_of(text: &str, rows: &[VisualRow], offset: usize) -> (usize, usize) {
-    let row = rows.iter().rposition(|row| row.start <= offset).unwrap_or(0);
+    let row = rows
+        .iter()
+        .rposition(|row| row.start <= offset)
+        .unwrap_or(0);
     let start = rows.get(row).map_or(0, |row| row.start);
     (row, columns(&text[start..offset.max(start)]))
 }
@@ -206,7 +209,10 @@ impl EditorBuffer {
     pub fn previous_word(&self, offset: usize) -> usize {
         let graphemes: Vec<(usize, &str)> = self.text[..offset].grapheme_indices(true).collect();
         let mut iter = graphemes.iter().rev().peekable();
-        while iter.next_if(|(_, g)| class_of(g) == CharClass::Space).is_some() {}
+        while iter
+            .next_if(|(_, g)| class_of(g) == CharClass::Space)
+            .is_some()
+        {}
         let Some(&&(mut start, first)) = iter.peek() else {
             return 0;
         };
@@ -223,7 +229,10 @@ impl EditorBuffer {
             .grapheme_indices(true)
             .map(|(index, grapheme)| (offset + index, grapheme))
             .peekable();
-        while iter.next_if(|(_, g)| class_of(g) == CharClass::Space).is_some() {}
+        while iter
+            .next_if(|(_, g)| class_of(g) == CharClass::Space)
+            .is_some()
+        {}
         let Some(&(_, first)) = iter.peek() else {
             return self.text.len();
         };
