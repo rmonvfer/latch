@@ -7,17 +7,18 @@ use std::{
 
 use anyhow::Result;
 use gpui::{
-    App, AsyncApp, Bounds, ClipboardItem, Context, CursorStyle, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
-    WeakEntity, Window, actions, canvas, div, prelude::*,
+    AnyElement, App, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, KeyUpEvent, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
+    ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, div,
+    prelude::*, px,
 };
 use libghostty_vt::{
     Terminal,
     fmt::Format,
     key, mouse, paste,
     selection::{
-        FormatOptions,
+        FormatOptions, Selection,
         gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     },
     style::Palette,
@@ -29,15 +30,31 @@ use libghostty_vt::{
 };
 
 use crate::{
+    components::{elevated_shadow, icon, icon_button},
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
     process_info,
     pty::{Pty, PtyDimensions},
+    search::{self, SearchMatch},
     settings::SettingsStore,
-    theme::{ActiveTheme, ActiveThemeExt, TerminalColors},
+    text_input::{TextInput, TextInputEvent},
+    theme::{self, ActiveTheme, ActiveThemeExt, TerminalColors},
 };
 
-actions!(terminal, [Copy, Paste, SelectAll, ClearScrollback]);
+actions!(
+    terminal,
+    [
+        Copy,
+        Paste,
+        SelectAll,
+        ClearScrollback,
+        Find,
+        SearchNext,
+        SearchPrevious
+    ]
+);
+
+const SEARCH_CONTEXT: &str = "TerminalSearch";
 
 const SCROLLBACK_LINES: usize = 10_000;
 const FALLBACK_TITLE: &str = "shell";
@@ -81,6 +98,15 @@ pub struct TerminalView {
     _metadata_task: Task<()>,
     _settings_subscription: Subscription,
     _theme_subscription: Subscription,
+    search: Option<SearchBar>,
+}
+
+/// The find bar and its results.
+struct SearchBar {
+    input: Entity<TextInput>,
+    matches: Vec<SearchMatch>,
+    current: usize,
+    _subscription: Subscription,
 }
 
 struct KeyInput {
@@ -202,6 +228,7 @@ impl TerminalView {
                     view.metrics = None;
                     cx.notify();
                 }),
+                search: None,
                 _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
                     let colors = cx.theme().terminal.clone();
                     if let Err(error) = configure_colors(&mut view.terminal, &colors) {
@@ -319,9 +346,10 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // Command shortcuts belong to the app, never to the shell.
-        if event.keystroke.modifiers.platform {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Command shortcuts belong to the app, never to the shell, and keys
+        // typed into the find bar bubble through here without being sent.
+        if event.keystroke.modifiers.platform || !self.focus_handle.is_focused(window) {
             return;
         }
         let action = if event.is_held {
@@ -334,8 +362,8 @@ impl TerminalView {
         cx.stop_propagation();
     }
 
-    fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.modifiers.platform {
+    fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.platform || !self.focus_handle.is_focused(window) {
             return;
         }
         // Release events only produce output when the Kitty keyboard
@@ -379,6 +407,170 @@ impl TerminalView {
             bytes.extend_from_slice(text.as_bytes());
         }
         bytes
+    }
+
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(search) = &self.search {
+            let focus = search.input.focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        let input = cx.new(|cx| TextInput::new("Find", cx));
+        let subscription =
+            cx.subscribe_in(&input, window, |view, _, event, window, cx| match event {
+                TextInputEvent::Changed => view.refresh_matches(cx),
+                TextInputEvent::Confirmed => view.step_match(1, cx),
+                TextInputEvent::Cancelled => view.close_search(window, cx),
+            });
+        window.focus(&input.focus_handle(cx), cx);
+        self.search = Some(SearchBar {
+            input,
+            matches: Vec::new(),
+            current: 0,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            let _ = self.terminal.set_selection(None);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn refresh_matches(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let query = search.input.read(cx).text().to_string();
+        search.matches = match search::screen_text(&self.terminal) {
+            Ok(text) => search::find_matches(&text, &query),
+            Err(error) => {
+                log::warn!("failed to read terminal text: {error}");
+                Vec::new()
+            }
+        };
+        // Start from the newest match, nearest the prompt.
+        search.current = search.matches.len().saturating_sub(1);
+        self.reveal_current_match(cx);
+    }
+
+    fn step_match(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        let count = search.matches.len();
+        if count == 0 {
+            return;
+        }
+        search.current = (search.current as isize + delta).rem_euclid(count as isize) as usize;
+        self.reveal_current_match(cx);
+    }
+
+    fn search_next(&mut self, _: &SearchNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(1, cx);
+    }
+
+    fn search_previous(&mut self, _: &SearchPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(-1, cx);
+    }
+
+    /// Select the current match and scroll it to the middle of the view.
+    fn reveal_current_match(&mut self, cx: &mut Context<Self>) {
+        let found = self
+            .search
+            .as_ref()
+            .and_then(|search| search.matches.get(search.current).copied());
+        let Some(found) = found else {
+            let _ = self.terminal.set_selection(None);
+            cx.notify();
+            return;
+        };
+        let start = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+            x: found.start_col,
+            y: found.row,
+        }));
+        let end = self.terminal.grid_ref(Point::Screen(PointCoordinate {
+            x: found.end_col.saturating_sub(1),
+            y: found.row,
+        }));
+        if let (Ok(start), Ok(end)) = (start, end) {
+            let _ = self
+                .terminal
+                .set_selection(Some(&Selection::new(start, end, false)));
+        }
+        let rows = self.dimensions.get().rows as u32;
+        self.terminal.scroll_viewport(ScrollViewport::Row(
+            found.row.saturating_sub(rows / 2) as usize
+        ));
+        cx.notify();
+    }
+
+    fn render_search_bar(&self, search: &SearchBar, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let count = search.matches.len();
+        let has_query = !search.input.read(cx).text().is_empty();
+        let status = if count > 0 {
+            format!("{}/{}", search.current + 1, count)
+        } else if has_query {
+            "No results".to_string()
+        } else {
+            String::new()
+        };
+
+        div()
+            .absolute()
+            .top(px(8.))
+            .right(px(12.))
+            .key_context(SEARCH_CONTEXT)
+            .on_action(cx.listener(Self::search_next))
+            .on_action(cx.listener(Self::search_previous))
+            .child(
+                div()
+                    .id("terminal-search")
+                    .occlude()
+                    .cursor(CursorStyle::Arrow)
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .w(px(320.))
+                    .h(px(32.))
+                    .pl(px(10.))
+                    .pr(px(4.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.elevated_surface)
+                    .shadow(elevated_shadow())
+                    .font_family(theme::UI_FONT_FAMILY)
+                    .child(icon("search", theme::ICON_SMALL, theme.text_muted))
+                    .child(div().flex_1().min_w_0().child(search.input.clone()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(theme::TEXT_SMALL)
+                            .text_color(if has_query && count == 0 {
+                                theme::to_hsla(theme.terminal.ansi[1])
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(SharedString::from(status)),
+                    )
+                    .child(icon_button("search-previous", "arrow-up", &theme).on_click(
+                        cx.listener(|view, _: &ClickEvent, _, cx| view.step_match(-1, cx)),
+                    ))
+                    .child(icon_button("search-next", "arrow-down", &theme).on_click(
+                        cx.listener(|view, _: &ClickEvent, _, cx| view.step_match(1, cx)),
+                    ))
+                    .child(
+                        icon_button("search-close", "x", &theme).on_click(cx.listener(
+                            |view, _: &ClickEvent, window, cx| view.close_search(window, cx),
+                        )),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
@@ -703,9 +895,14 @@ impl Render for TerminalView {
             }
         };
         let view = cx.entity();
+        let search_bar = self
+            .search
+            .as_ref()
+            .map(|search| self.render_search_bar(search, cx));
 
         div()
             .id("terminal")
+            .relative()
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
@@ -714,6 +911,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_scrollback))
+            .on_action(cx.listener(Self::find))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -737,7 +935,18 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(search_bar)
     }
+}
+
+/// Key bindings for the find bar.
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-f", Find, Some("Terminal")),
+        KeyBinding::new("cmd-g", SearchNext, Some("Terminal")),
+        KeyBinding::new("cmd-shift-g", SearchPrevious, Some("Terminal")),
+        KeyBinding::new("shift-enter", SearchPrevious, Some(SEARCH_CONTEXT)),
+    ]
 }
 
 fn configure_colors(
