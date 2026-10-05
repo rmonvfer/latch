@@ -213,6 +213,11 @@ impl TerminalView {
         }))
     }
 
+    /// Where the terminal was last laid out, in window coordinates.
+    pub fn bounds(&self) -> Option<Bounds<Pixels>> {
+        self.bounds
+    }
+
     /// Current grid size as (columns, rows).
     pub fn grid_size(&self) -> (u16, u16) {
         let dimensions = self.dimensions.get();

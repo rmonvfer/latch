@@ -2,6 +2,8 @@ mod assets;
 mod components;
 mod grid;
 mod input;
+mod pane_group;
+mod pane_tree;
 mod process_info;
 mod pty;
 mod session;
@@ -111,5 +113,6 @@ fn bind_keys(cx: &mut App) {
         ));
     }
     bindings.extend(text_input::key_bindings());
+    bindings.extend(pane_group::key_bindings());
     cx.bind_keys(bindings);
 }

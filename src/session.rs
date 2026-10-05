@@ -7,6 +7,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    pane_group::PaneState,
     settings::SettingsStore,
     tabs::{TabColor, TabStyle},
 };
@@ -21,8 +22,9 @@ pub enum TabKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TabState {
     pub kind: TabKind,
+    /// The pane arrangement of a terminal tab.
     #[serde(default)]
-    pub cwd: Option<PathBuf>,
+    pub panes: Option<PaneState>,
     #[serde(default)]
     pub style: TabStyle,
 }
@@ -90,7 +92,7 @@ pub fn save(state: &SessionState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tabs::TabIcon;
+    use crate::{pane_tree::Axis, tabs::TabIcon};
 
     #[test]
     fn session_round_trips_through_json() {
@@ -98,7 +100,16 @@ mod tests {
             entries: vec![
                 EntryState::Tab(TabState {
                     kind: TabKind::Terminal,
-                    cwd: Some(PathBuf::from("/tmp")),
+                    panes: Some(PaneState::Split {
+                        axis: Axis::Horizontal,
+                        ratios: vec![0.6, 0.4],
+                        children: vec![
+                            PaneState::Terminal {
+                                cwd: Some(PathBuf::from("/tmp")),
+                            },
+                            PaneState::Terminal { cwd: None },
+                        ],
+                    }),
                     style: TabStyle {
                         name: Some("api".into()),
                         color: Some(TabColor::Green),
@@ -112,7 +123,7 @@ mod tests {
                     collapsed: true,
                     tabs: vec![TabState {
                         kind: TabKind::Settings,
-                        cwd: None,
+                        panes: None,
                         style: TabStyle::default(),
                     }],
                 }),

@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, Context, Entity, FocusHandle, Focusable,
@@ -12,13 +8,14 @@ use gpui::{
 
 use crate::{
     components::{icon, icon_button, keybinding},
+    pane_group::{PaneGroup, PaneGroupEvent},
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
     sidebar::sidebar_child_index,
     status_bar::StatusItem,
     tabs::{Entry, GroupId, Row, TabColor, TabIcon, TabId, TabLayout, TabStyle},
-    terminal_view::{TabMetadata, TerminalEvent, TerminalView},
+    terminal_view::TabMetadata,
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Theme},
 };
@@ -45,7 +42,7 @@ pub struct ActivateTab(pub usize);
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 enum TabContent {
-    Terminal(Entity<TerminalView>),
+    Terminal(Entity<PaneGroup>),
     Settings(Entity<SettingsPage>),
 }
 
@@ -59,7 +56,7 @@ impl TabContent {
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
-            TabContent::Terminal(view) => view.focus_handle(cx),
+            TabContent::Terminal(panes) => panes.focus_handle(cx),
             TabContent::Settings(page) => page.focus_handle(cx),
         }
     }
@@ -222,7 +219,16 @@ impl Workspace {
     ) {
         match tab.kind {
             TabKind::Terminal => {
-                self.open_terminal(tab.cwd.as_deref(), group, tab.style, window, cx);
+                let panes = match &tab.panes {
+                    Some(state) => PaneGroup::restore(state, window, cx),
+                    None => PaneGroup::build(None, window, cx),
+                };
+                match panes {
+                    Ok(panes) => {
+                        self.add_terminal_tab(panes, group, tab.style, window, cx);
+                    }
+                    Err(error) => log::error!("failed to restore tab: {error:#}"),
+                }
             }
             TabKind::Settings => {
                 if self.settings_tab().is_none() {
@@ -240,35 +246,45 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<TabId> {
-        let view = match TerminalView::build(cwd, cx) {
-            Ok(view) => view,
+        match PaneGroup::build(cwd, window, cx) {
+            Ok(panes) => Some(self.add_terminal_tab(panes, group, style, window, cx)),
             Err(error) => {
                 log::error!("failed to open terminal: {error:#}");
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    fn add_terminal_tab(
+        &mut self,
+        panes: Entity<PaneGroup>,
+        group: Option<GroupId>,
+        style: TabStyle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabId {
         let id = self.layout.add_tab(style, group);
         let subscription =
             cx.subscribe_in(
-                &view,
+                &panes,
                 window,
                 move |this, _, event, window, cx| match event {
-                    TerminalEvent::MetadataChanged => {
+                    PaneGroupEvent::MetadataChanged => {
                         cx.notify();
                         this.schedule_save(cx);
                     }
-                    TerminalEvent::Exited => this.close(id, window, cx),
+                    PaneGroupEvent::Exited => this.close(id, window, cx),
                 },
             );
         self.open_tabs.insert(
             id,
             OpenTab {
-                content: TabContent::Terminal(view),
+                content: TabContent::Terminal(panes),
                 _subscription: Some(subscription),
             },
         );
         self.activate(id, window, cx);
-        Some(id)
+        id
     }
 
     fn add_settings_tab(
@@ -371,14 +387,14 @@ impl Workspace {
 
     pub(crate) fn active_grid_size(&self, cx: &App) -> Option<(u16, u16)> {
         match &self.open_tabs.get(&self.active?)?.content {
-            TabContent::Terminal(view) => Some(view.read(cx).grid_size()),
+            TabContent::Terminal(panes) => Some(panes.read(cx).active_view().read(cx).grid_size()),
             TabContent::Settings(_) => None,
         }
     }
 
     pub(crate) fn active_metadata(&self, cx: &App) -> Option<TabMetadata> {
         match &self.open_tabs.get(&self.active?)?.content {
-            TabContent::Terminal(view) => Some(view.read(cx).metadata().clone()),
+            TabContent::Terminal(panes) => Some(panes.read(cx).active_metadata(cx).clone()),
             TabContent::Settings(_) => None,
         }
     }
@@ -387,8 +403,8 @@ impl Workspace {
         let style = self.layout.style(id);
         let custom_name = style.name.clone().map(SharedString::from);
         let display = match &self.open_tabs.get(&id)?.content {
-            TabContent::Terminal(view) => {
-                let metadata = view.read(cx).metadata();
+            TabContent::Terminal(panes) => {
+                let metadata = panes.read(cx).active_metadata(cx);
                 TabDisplay {
                     title: custom_name.unwrap_or_else(|| metadata.title.clone()),
                     icon: style.icon.unwrap_or(TabIcon::Terminal).asset(),
@@ -586,13 +602,13 @@ impl Workspace {
 
     fn tab_state(&self, id: TabId, cx: &App) -> Option<TabState> {
         let tab = self.open_tabs.get(&id)?;
-        let cwd: Option<PathBuf> = match &tab.content {
-            TabContent::Terminal(view) => view.read(cx).metadata().cwd.clone(),
+        let panes = match &tab.content {
+            TabContent::Terminal(panes) => Some(panes.read(cx).snapshot(cx)),
             TabContent::Settings(_) => None,
         };
         Some(TabState {
             kind: tab.content.kind(),
-            cwd,
+            panes,
             style: self.layout.style(id),
         })
     }
@@ -798,9 +814,9 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let content: AnyElement = match self.active.and_then(|id| self.open_tabs.get(&id)) {
             Some(OpenTab {
-                content: TabContent::Terminal(view),
+                content: TabContent::Terminal(panes),
                 ..
-            }) => view.clone().into_any_element(),
+            }) => panes.clone().into_any_element(),
             Some(OpenTab {
                 content: TabContent::Settings(page),
                 ..
