@@ -8,10 +8,11 @@
 
 use std::{
     fs,
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use gpui::{App, Global};
 use portable_pty::CommandBuilder;
 
@@ -61,17 +62,67 @@ impl ShellIntegration {
     }
 }
 
+/// Write the scripts into `dir`, which every new shell then sources. The
+/// directory and scripts must belong to the current user, be writable only
+/// by them, and not be symlinks; otherwise integration is refused, since
+/// anyone able to change these files could run code in every shell.
 fn install(dir: &Path) -> Result<()> {
+    ensure_private_dir(dir)?;
     for (relative, contents) in SCRIPTS {
         let path = dir.join(relative);
-        if fs::read_to_string(&path).is_ok_and(|existing| existing == contents) {
-            continue;
+        let parent = path.parent().expect("scripts live in a subdirectory");
+        ensure_private_dir(parent)?;
+        if path.exists() || path.is_symlink() {
+            ensure_private_file(&path)?;
+            if fs::read_to_string(&path).is_ok_and(|existing| existing == contents) {
+                continue;
+            }
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("failed to create integration directory")?;
-        }
-        fs::write(&path, contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        // Write then rename so the shell never sources a partial script, and
+        // so a planted symlink at `path` is replaced rather than followed.
+        let temporary = parent.join(format!(".{}.tmp", std::process::id()));
+        fs::write(&temporary, contents)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&temporary, &path)
+            .with_context(|| format!("failed to install {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() && !dir.is_symlink() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    let meta =
+        fs::symlink_metadata(dir).with_context(|| format!("cannot inspect {}", dir.display()))?;
+    if !meta.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    check_owner_only(dir, &meta)
+}
+
+fn ensure_private_file(path: &Path) -> Result<()> {
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("cannot inspect {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    check_owner_only(path, &meta)
+}
+
+fn check_owner_only(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        bail!("{} is owned by another user", path.display());
+    }
+    if meta.mode() & 0o022 != 0 {
+        bail!("{} is writable by other users", path.display());
     }
     Ok(())
 }
@@ -252,6 +303,34 @@ mod tests {
         long.extend(std::iter::repeat_n(b'x', 200));
         assert!(scanner.scan(&long).is_empty());
         assert_eq!(scanner.scan(b"\x1b]133;C\x07"), vec![CommandMark::Started]);
+    }
+
+    #[test]
+    fn refuses_group_writable_directory() {
+        let dir = std::env::temp_dir().join(format!("integration-perm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(install(&dir).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replaces_planted_symlink_instead_of_following_it() {
+        let dir = std::env::temp_dir().join(format!("integration-link-{}", std::process::id()));
+        let victim =
+            std::env::temp_dir().join(format!("integration-victim-{}", std::process::id()));
+        fs::write(&victim, "original").unwrap();
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("zsh"))
+            .unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("zsh/.zshenv")).unwrap();
+        // A symlinked script is not a regular file, so installation refuses.
+        assert!(install(&dir).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "original");
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_file(&victim).unwrap();
     }
 
     #[test]
