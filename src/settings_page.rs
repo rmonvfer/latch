@@ -1185,11 +1185,11 @@ const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 5] = [
             },
             Shortcut {
                 keys: &[&["⌘", "↑"]],
-                action: "Previous prompt",
+                action: "Previous prompt, or block with command blocks",
             },
             Shortcut {
                 keys: &[&["⌘", "↓"]],
-                action: "Next prompt",
+                action: "Next prompt, or block with command blocks",
             },
             Shortcut {
                 keys: &[&["⌘", "C"]],
