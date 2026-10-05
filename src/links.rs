@@ -58,6 +58,11 @@ pub fn link_at(
     }
 
     let path = resolve_path(strip_position(&token), cwd)?;
+    // Checking whether a network location exists can mount it, so such
+    // paths are never looked up just because the pointer passed over them.
+    if is_network_location(&path) {
+        return None;
+    }
     exists(&path).then_some(DetectedLink {
         start,
         end,
@@ -114,7 +119,7 @@ fn strip_position(token: &str) -> &str {
 }
 
 fn resolve_path(token: &str, cwd: Option<&Path>) -> Option<PathBuf> {
-    if token.is_empty() || !token.contains('/') && !token.contains('.') {
+    if token.is_empty() || !token.contains('/') && !token.contains('.') || token.starts_with("//") {
         return None;
     }
     if let Some(rest) = token.strip_prefix("~/") {
@@ -128,9 +133,10 @@ fn resolve_path(token: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// Open a link with the system. Executables and app bundles are revealed
-/// in Finder instead of launched, since link text comes from whatever is
-/// printed to the terminal.
+/// Open a link with the system. Only directories and files of known
+/// document and source types are opened; anything else (executables, app
+/// bundles, installers, scripts, unknown types) is revealed in Finder
+/// instead, since link text comes from whatever is printed to the terminal.
 pub fn open(target: &LinkTarget, cx: &App) {
     match target {
         LinkTarget::Url(url) => match url.strip_prefix("file://") {
@@ -145,27 +151,50 @@ pub fn open(target: &LinkTarget, cx: &App) {
 }
 
 fn open_path(path: &Path, cx: &App) {
-    if is_launchable(path) {
-        cx.reveal_path(path);
-    } else {
+    if is_network_location(path) {
+        return;
+    }
+    if is_safe_to_open(path) {
         cx.open_with_system(path);
+    } else {
+        cx.reveal_path(path);
     }
 }
 
-fn is_launchable(path: &Path) -> bool {
-    let bundle_like = path.extension().is_some_and(|extension| {
-        matches!(
-            extension.to_string_lossy().as_ref(),
-            "app" | "command" | "tool" | "terminal" | "workflow" | "pkg" | "dmg"
-        )
-    });
-    let executable = std::fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
-    bundle_like || executable
+/// File types that open in a viewer or editor rather than running anything.
+const OPENABLE_EXTENSIONS: [&str; 52] = [
+    "txt", "md", "markdown", "rst", "log", "csv", "tsv", "json", "jsonc", "yaml", "yml", "toml",
+    "ini", "cfg", "conf", "xml", "html", "htm", "css", "scss", "rs", "go", "py", "rb", "js", "mjs",
+    "cjs", "ts", "tsx", "jsx", "java", "kt", "swift", "c", "h", "cpp", "hpp", "cc", "cs", "php",
+    "lua", "sql", "proto", "diff", "patch", "png", "jpg", "jpeg", "gif", "webp", "pdf", "svg",
+];
+
+fn is_safe_to_open(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase());
+    if meta.is_dir() {
+        // Packages such as Foo.app are directories with an extension.
+        return extension.is_none();
+    }
+    let executable = meta.permissions().mode() & 0o111 != 0;
+    meta.is_file()
+        && !executable
+        && extension.is_some_and(|extension| OPENABLE_EXTENSIONS.contains(&extension.as_str()))
+}
+
+fn is_network_location(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.starts_with("//") || text.starts_with("/net/") || text.starts_with("/Network/")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn chars(text: &str) -> Vec<char> {
@@ -223,9 +252,35 @@ mod tests {
     }
 
     #[test]
-    fn executables_are_not_launched() {
-        assert!(is_launchable(Path::new("/Applications/Calculator.app")));
-        assert!(is_launchable(Path::new("/bin/ls")));
-        assert!(!is_launchable(Path::new("/etc/hosts")));
+    fn only_known_document_types_are_opened() {
+        let dir = std::env::temp_dir().join(format!("links-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("Tool.app")).unwrap();
+        for name in ["notes.md", "script.scpt", "plain"] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        let executable = dir.join("run.py");
+        fs::write(&executable, "x").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(is_safe_to_open(&dir.join("notes.md")));
+        assert!(is_safe_to_open(&dir));
+        assert!(!is_safe_to_open(&dir.join("Tool.app")));
+        assert!(!is_safe_to_open(&dir.join("script.scpt")));
+        assert!(!is_safe_to_open(&dir.join("plain")));
+        assert!(!is_safe_to_open(&executable));
+        assert!(!is_safe_to_open(Path::new("/bin/ls")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_paths_are_never_checked() {
+        let checked = std::cell::Cell::new(false);
+        let found = link_at(&chars("/net/server/share/file.txt"), 3, None, |_| {
+            checked.set(true);
+            true
+        });
+        assert!(found.is_none());
+        assert!(!checked.get());
+        assert!(link_at(&chars("//server/share.txt"), 3, None, |_| true).is_none());
     }
 }
