@@ -42,6 +42,9 @@ const MAX_PENDING_HOOK: usize = 1 << 20;
 /// accepted only from `session`, the id handed to this pane's shell.
 pub struct OscScanner {
     pending: Vec<u8>,
+    /// How much of a pending hook's payload is already known to be hex,
+    /// so each read checks only the new bytes.
+    verified_payload: usize,
     session: String,
 }
 
@@ -49,6 +52,7 @@ impl OscScanner {
     pub fn new(session: String) -> Self {
         Self {
             pending: Vec::new(),
+            verified_payload: 0,
             session,
         }
     }
@@ -73,12 +77,28 @@ impl OscScanner {
 
             if rest.starts_with(HOOK) {
                 let body_start = start + HOOK.len();
-                let Some(body_len) = find(&buffer[body_start..], STRING_TERMINATOR) else {
-                    flush(&mut pieces, flushed, start, &buffer);
-                    if buffer.len() - start <= MAX_PENDING_HOOK {
+                // Resume where the previous read stopped checking.
+                let resume = if start == 0 {
+                    std::mem::take(&mut self.verified_payload)
+                } else {
+                    0
+                };
+                let body_len = match hook_payload(&buffer[body_start..], resume) {
+                    HookPayload::Complete(body_len) => body_len,
+                    HookPayload::Incomplete(verified)
+                        if buffer.len() - start <= MAX_PENDING_HOOK =>
+                    {
+                        flush(&mut pieces, flushed, start, &buffer);
                         self.pending = buffer[start..].to_vec();
+                        self.verified_payload = verified;
+                        return pieces;
                     }
-                    return pieces;
+                    // Not hex, or too long: not a hook, so it is ordinary
+                    // output and reaches the terminal unchanged.
+                    HookPayload::Incomplete(_) | HookPayload::NotAHook => {
+                        index = start + 1;
+                        continue;
+                    }
                 };
                 // The hook never reaches the terminal, valid or not.
                 flush(&mut pieces, flushed, start, &buffer);
@@ -121,6 +141,33 @@ impl OscScanner {
         flush(&mut pieces, flushed, buffer.len(), &buffer);
         pieces
     }
+}
+
+enum HookPayload {
+    /// Hex digits followed by the string terminator; the payload length.
+    Complete(usize),
+    /// Hex digits so far with no terminator yet; how many were checked.
+    Incomplete(usize),
+    NotAHook,
+}
+
+/// Check a hook payload, starting `from` bytes in (those are already
+/// known to be hex).
+fn hook_payload(bytes: &[u8], from: usize) -> HookPayload {
+    for (index, byte) in bytes.iter().enumerate().skip(from) {
+        match byte {
+            byte if byte.is_ascii_hexdigit() => {}
+            0x1b => {
+                return match bytes.get(index + 1) {
+                    Some(b'\\') => HookPayload::Complete(index),
+                    Some(_) => HookPayload::NotAHook,
+                    None => HookPayload::Incomplete(index),
+                };
+            }
+            _ => return HookPayload::NotAHook,
+        }
+    }
+    HookPayload::Incomplete(bytes.len())
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -269,6 +316,33 @@ mod tests {
             scanner.scan_events(tail),
             vec![OscEvent::Hook(Hook::CommandFinished { exit_code: 2 })]
         );
+    }
+
+    #[test]
+    fn lookalike_hooks_with_other_content_are_ordinary_output() {
+        let mut scanner = OscScanner::new("s1".into());
+        let text = b"\x1bP$dvisible text\x1b\\after";
+        let pieces = scanner.scan(text);
+        assert_eq!(output(&pieces), text.to_vec());
+        assert!(events(pieces).is_empty());
+    }
+
+    #[test]
+    fn long_hooks_split_into_many_reads_are_checked_once() {
+        let mut scanner = OscScanner::new("s1".into());
+        let padding = "0".repeat(400_000);
+        let mut hook = hooks::encode("CommandFinished", "s1", r#"{"exit_code":3}"#);
+        // Pad inside the hex payload with whitespace-free hex the decoder
+        // rejects, to exercise scanning cost without a valid hook.
+        hook.splice(4..4, padding.bytes());
+        let started = std::time::Instant::now();
+        for chunk in hook.chunks(1024) {
+            let _ = scanner.scan(chunk);
+        }
+        // Linear scanning finishes in well under a second; rescanning the
+        // whole pending buffer on every read would not.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(scanner.pending.is_empty());
     }
 
     #[test]
