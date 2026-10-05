@@ -22,7 +22,7 @@ use crate::{
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
-    sidebar::sidebar_child_index,
+    sidebar::{SidebarDrop, sidebar_child_index},
     status_bar::{StatusItem, format_duration},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout, TabStyle},
     terminal_view::{AgentState, Attention, TabMetadata, TerminalView},
@@ -137,6 +137,8 @@ pub struct Workspace {
     titlebar_dragging: bool,
     pub(crate) tab_scroll: ScrollHandle,
     pub(crate) context_menu: Option<ContextMenu>,
+    /// Where a drag over the sidebar's tab rows would land.
+    pub(crate) sidebar_drop: Option<SidebarDrop>,
     pub(crate) renaming: Option<Renaming>,
     pub(crate) tab_search: Entity<TextInput>,
     focus_handle: FocusHandle,
@@ -190,6 +192,7 @@ impl Workspace {
             titlebar_dragging: false,
             tab_scroll: ScrollHandle::new(),
             context_menu: None,
+            sidebar_drop: None,
             renaming: None,
             tab_search,
             focus_handle: cx.focus_handle(),
@@ -598,14 +601,14 @@ impl Workspace {
         Some(display)
     }
 
-    fn panes_of(&self, tab: TabId) -> Option<Entity<PaneGroup>> {
+    pub(crate) fn panes_of(&self, tab: TabId) -> Option<Entity<PaneGroup>> {
         match &self.open_tabs.get(&tab)?.content {
             TabContent::Terminal(panes) => Some(panes.clone()),
             TabContent::Settings(_) => None,
         }
     }
 
-    fn tab_holding(&self, panes: &WeakEntity<PaneGroup>) -> Option<TabId> {
+    pub(crate) fn tab_holding(&self, panes: &WeakEntity<PaneGroup>) -> Option<TabId> {
         self.open_tabs
             .iter()
             .find_map(|(id, tab)| match &tab.content {
@@ -632,7 +635,7 @@ impl Workspace {
     }
 
     /// Move a pane dragged from another tab next to `target` in `tab`.
-    fn move_pane_into(
+    pub(crate) fn move_pane_into(
         &mut self,
         tab: TabId,
         dragged: DraggedPane,
@@ -658,7 +661,7 @@ impl Workspace {
     }
 
     /// Merge every pane of `source_tab` into `tab`, next to `target`.
-    fn merge_tab_into(
+    pub(crate) fn merge_tab_into(
         &mut self,
         tab: TabId,
         source_tab: TabId,

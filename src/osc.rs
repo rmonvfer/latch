@@ -2,6 +2,8 @@
 //! libghostty consumes them: command boundaries from shell integration
 //! (OSC 133) and desktop notification requests (OSC 9 and OSC 777).
 
+use std::borrow::Cow;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OscEvent {
     /// OSC 133;A — the shell is drawing a prompt.
@@ -28,8 +30,13 @@ pub struct OscScanner {
 
 impl OscScanner {
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<OscEvent> {
-        let mut buffer = std::mem::take(&mut self.pending);
-        buffer.extend_from_slice(bytes);
+        let buffer = if self.pending.is_empty() {
+            Cow::Borrowed(bytes)
+        } else {
+            let mut pending = std::mem::take(&mut self.pending);
+            pending.extend_from_slice(bytes);
+            Cow::Owned(pending)
+        };
         let mut events = Vec::new();
         let mut index = 0;
 
@@ -60,9 +67,15 @@ impl OscScanner {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    let mut index = 0;
+    while let Some(offset) = haystack[index..].iter().position(|byte| *byte == needle[0]) {
+        index += offset;
+        if haystack[index..].starts_with(needle) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Length of the body and of its terminator (BEL or ESC \).
@@ -163,6 +176,52 @@ mod tests {
     }
 
     #[test]
+    fn every_sequence_boundary_preserves_events() {
+        let output = b"out\x1b]133;A\x07$ \x1b]133;C\x1b\\ls\x1b]133;D;0\x07";
+        let expected = OscScanner::default().scan(output);
+        for split in 0..=output.len() {
+            let mut scanner = OscScanner::default();
+            let mut events = scanner.scan(&output[..split]);
+            events.extend(scanner.scan(&output[split..]));
+            assert_eq!(events, expected, "split at {split}");
+            assert!(scanner.pending.is_empty());
+        }
+        let mut scanner = OscScanner::default();
+        let mut events = Vec::new();
+        for byte in output {
+            events.extend(scanner.scan(std::slice::from_ref(byte)));
+        }
+        assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn ordinary_output_keeps_no_pending_bytes() {
+        let mut scanner = OscScanner::default();
+        let output = b"ordinary terminal output\r\n".repeat(4096);
+        for _ in 0..16 {
+            assert!(scanner.scan(&output).is_empty());
+            assert_eq!(scanner.pending.capacity(), 0);
+        }
+        assert!(scanner.scan(b"\x1b[31mcolored\x1b[0m\r\n").is_empty());
+        assert!(scanner.pending.is_empty());
+    }
+
+    #[test]
+    fn broken_sequences_preserve_following_introducers() {
+        let mut scanner = OscScanner::default();
+        assert_eq!(
+            scanner.scan(b"\x1b]9;first\x1b]133;C\x07"),
+            vec![
+                OscEvent::Notify {
+                    title: None,
+                    body: "first".into(),
+                },
+                OscEvent::CommandStarted,
+            ]
+        );
+    }
+
+    #[test]
     fn parses_notifications() {
         let mut scanner = OscScanner::default();
         let events = scanner.scan(b"\x1b]9;Build done\x07\x1b]777;notify;Claude;Needs input\x1b\\");
@@ -215,6 +274,21 @@ mod tests {
         assert_eq!(
             scanner.scan(b"\x1b]133;C\x07"),
             vec![OscEvent::CommandStarted]
+        );
+    }
+
+    #[test]
+    fn pending_sequences_stay_bounded_across_reads() {
+        let mut scanner = OscScanner::default();
+        assert!(scanner.scan(b"\x1b]9;").is_empty());
+        let body = vec![b'x'; MAX_PENDING - 4];
+        assert!(scanner.scan(&body).is_empty());
+        assert_eq!(scanner.pending.len(), MAX_PENDING);
+        assert!(scanner.scan(b"x").is_empty());
+        assert!(scanner.pending.is_empty());
+        assert_eq!(
+            scanner.scan(b"\x1b]133;A\x07"),
+            vec![OscEvent::PromptStarted]
         );
     }
 }

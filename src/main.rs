@@ -9,6 +9,7 @@ mod input;
 mod links;
 mod notifications;
 mod osc;
+mod output;
 mod pane_group;
 mod pane_tree;
 mod process_info;

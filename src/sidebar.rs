@@ -2,8 +2,8 @@
 //! rows, drag and drop, and the menus for tabs, groups, and view options.
 
 use gpui::{
-    AnyElement, ClickEvent, Context, CursorStyle, Hsla, MouseButton, MouseDownEvent, SharedString,
-    anchored, deferred, div, prelude::*, px,
+    AnyElement, App, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Hsla, MouseButton,
+    MouseDownEvent, SharedString, Window, anchored, deferred, div, prelude::*, px, relative,
 };
 
 use serde::{Deserialize, Serialize};
@@ -15,10 +15,10 @@ use crate::{
         menu_surface,
     },
     git::DiffStats,
-    pane_group::DraggedPane,
+    pane_group::{DraggedPane, Edge},
     settings::{Settings, SettingsStore},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
-    terminal_view::AgentState,
+    terminal_view::{AgentState, TerminalView},
     theme::{self, Theme},
     workspace::{MenuKind, Target, Workspace},
 };
@@ -116,6 +116,120 @@ fn tab_color(color: Option<TabColor>, theme: &Theme) -> Option<Hsla> {
 }
 
 impl Workspace {
+    pub(crate) fn track_row_drop<T: 'static>(
+        &mut self,
+        tab: TabId,
+        drag: RowDrag,
+        event: &DragMoveEvent<T>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = event.bounds;
+        let position = event.event.position;
+        let next = if bounds.contains(&position) {
+            let fraction = (position.y - bounds.top()) / bounds.size.height;
+            let zone = row_zone(fraction, &drag, event.event.modifiers.alt);
+            self.drop_allowed(tab, &drag, zone)
+                .then_some(SidebarDrop { tab, zone })
+        } else if self.sidebar_drop.is_some_and(|drop| drop.tab == tab) {
+            None
+        } else {
+            return;
+        };
+        if next != self.sidebar_drop {
+            self.sidebar_drop = next;
+            cx.notify();
+        }
+    }
+
+    fn drop_allowed(&self, target: TabId, drag: &RowDrag, zone: RowZone) -> bool {
+        match (drag, zone) {
+            (RowDrag::Tab(dragged), RowZone::Group | RowZone::Split) if *dragged == target => false,
+            (RowDrag::Tab(dragged), RowZone::Split) => {
+                self.panes_of(target).is_some() && self.panes_of(*dragged).is_some()
+            }
+            (RowDrag::Pane, RowZone::Group | RowZone::Split) => self.panes_of(target).is_some(),
+            _ => true,
+        }
+    }
+
+    fn take_row_drop(&mut self, target: TabId) -> Option<RowZone> {
+        self.sidebar_drop
+            .take()
+            .filter(|drop| drop.tab == target)
+            .map(|drop| drop.zone)
+    }
+
+    pub(crate) fn drop_tab_on_row(
+        &mut self,
+        dragged: TabId,
+        target: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(zone) = self.take_row_drop(target) else {
+            cx.notify();
+            return;
+        };
+        match zone {
+            RowZone::Before => self
+                .layout
+                .move_tab(dragged, TabDestination::Before(target)),
+            RowZone::After => self.layout.move_tab(dragged, TabDestination::After(target)),
+            RowZone::Group => {
+                let was_grouped = self.layout.group_of(target).is_some();
+                let name = format!("Group {}", self.layout.groups().len() + 1);
+                if let Some(group) = self.layout.group_together(target, dragged, name)
+                    && !was_grouped
+                {
+                    self.layout_changed(cx);
+                    self.start_rename(Target::Group(group), window, cx);
+                    return;
+                }
+            }
+            RowZone::Split => {
+                if let Some(view) = self.active_pane_of(target, cx) {
+                    self.merge_tab_into(target, dragged, view, Edge::Right, window, cx);
+                }
+                return;
+            }
+        }
+        self.layout_changed(cx);
+    }
+
+    pub(crate) fn drop_pane_on_row(
+        &mut self,
+        dragged: &DraggedPane,
+        target: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(zone) = self.take_row_drop(target) else {
+            cx.notify();
+            return;
+        };
+        match zone {
+            RowZone::Before => {
+                self.pane_to_tab(dragged, TabDestination::Before(target), window, cx)
+            }
+            RowZone::After => self.pane_to_tab(dragged, TabDestination::After(target), window, cx),
+            RowZone::Group | RowZone::Split => {
+                // A pane combined with its own tab would just be put back.
+                if self.tab_holding(&dragged.source) == Some(target) {
+                    cx.notify();
+                    return;
+                }
+                if let Some(view) = self.active_pane_of(target, cx) {
+                    self.move_pane_into(target, dragged.clone(), view, Edge::Right, window, cx);
+                }
+            }
+        }
+    }
+
+    fn active_pane_of(&self, tab: TabId, cx: &App) -> Option<Entity<TerminalView>> {
+        self.panes_of(tab)
+            .map(|panes| panes.read(cx).active_view().clone())
+    }
+
     /// Rows currently shown, after applying the search query.
     pub(crate) fn visible_rows(&self, cx: &gpui::App) -> Vec<Row> {
         let query = self.tab_search.read(cx).text().to_string();
@@ -132,7 +246,15 @@ impl Workspace {
         })
     }
 
-    pub(crate) fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_sidebar(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // A drag that ended elsewhere leaves no marker behind.
+        if !cx.has_active_drag() {
+            self.sidebar_drop = None;
+        }
         let searching = !self.tab_search.read(cx).text().trim().is_empty();
         let mut rows: Vec<AnyElement> = Vec::new();
         for row in self.visible_rows(cx) {
@@ -465,6 +587,10 @@ impl Workspace {
         let icon_color = if active { theme.text } else { theme.text_muted };
         let title_color = if active { theme.text } else { theme.text_muted };
         let in_group = group.is_some();
+        let drop_zone = self
+            .sidebar_drop
+            .filter(|drop| drop.tab == id && cx.has_active_drag())
+            .map(|drop| drop.zone);
 
         Some(
             div()
@@ -517,7 +643,17 @@ impl Workspace {
                         })
                     },
                 )
-                .drag_over::<DraggedTab>(move |style, _, _, _| style.border_color(accent))
+                .on_drag_move::<DraggedTab>(cx.listener(
+                    move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                        let dragged = event.drag(cx).id;
+                        this.track_row_drop(id, RowDrag::Tab(dragged), event, cx);
+                    },
+                ))
+                .on_drag_move::<DraggedPane>(cx.listener(
+                    move |this, event: &DragMoveEvent<DraggedPane>, _, cx| {
+                        this.track_row_drop(id, RowDrag::Pane, event, cx);
+                    },
+                ))
                 .drag_over::<DraggedGroup>(move |style, _, _, _| {
                     if in_group {
                         style
@@ -525,13 +661,11 @@ impl Workspace {
                         style.border_color(accent)
                     }
                 })
-                .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
-                    this.layout.move_tab(dragged.id, TabDestination::Before(id));
-                    this.layout_changed(cx);
+                .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                    this.drop_tab_on_row(dragged.id, id, window, cx);
                 }))
-                .drag_over::<DraggedPane>(move |style, _, _, _| style.border_color(accent))
                 .on_drop(cx.listener(move |this, dragged: &DraggedPane, window, cx| {
-                    this.pane_to_tab(dragged, TabDestination::Before(id), window, cx);
+                    this.drop_pane_on_row(dragged, id, window, cx);
                 }))
                 .on_drop(cx.listener(move |this, dragged: &DraggedGroup, _, cx| {
                     // Groups only live at the top level: land before this
@@ -554,6 +688,7 @@ impl Workspace {
                             .bg(group_color),
                     )
                 })
+                .children(drop_zone.map(|zone| drop_zone_indicator(zone, accent)))
                 .child(
                     div()
                         .flex()
@@ -1036,6 +1171,66 @@ fn render_view_options_menu(config: &SidebarSettings, theme: &Theme) -> impl Int
         ))
 }
 
+/// What is being dragged over a tab row.
+pub(crate) enum RowDrag {
+    Tab(TabId),
+    Pane,
+}
+
+/// Where on a tab row a drag would land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowZone {
+    Before,
+    After,
+    /// Put both tabs in one group.
+    Group,
+    /// Add the dragged terminal(s) to this tab as a split.
+    Split,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SidebarDrop {
+    pub tab: TabId,
+    pub zone: RowZone,
+}
+
+/// The top and bottom thirds of a row reorder; the middle combines.
+/// Dragging a tab combines into a group, or a split with ⌥ held; a pane
+/// always combines as a split.
+pub(crate) fn row_zone(fraction: f32, drag: &RowDrag, alt: bool) -> RowZone {
+    if fraction < 0.3 {
+        RowZone::Before
+    } else if fraction > 0.7 {
+        RowZone::After
+    } else {
+        match drag {
+            RowDrag::Tab(_) if !alt => RowZone::Group,
+            _ => RowZone::Split,
+        }
+    }
+}
+
+fn drop_zone_indicator(zone: RowZone, accent: Hsla) -> impl IntoElement {
+    let marker = div().absolute();
+    match zone {
+        RowZone::Before => marker.top_0().left_0().right_0().h(px(2.)).bg(accent),
+        RowZone::After => marker.bottom_0().left_0().right_0().h(px(2.)).bg(accent),
+        RowZone::Group => marker
+            .inset_0()
+            .bg(accent.opacity(0.14))
+            .border_1()
+            .border_color(accent.opacity(0.7)),
+        RowZone::Split => marker
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(relative(0.5))
+            .bg(accent.opacity(0.2))
+            .border_l_2()
+            .border_color(accent),
+    }
+}
+
 /// "+12 −3" in the theme's green and red.
 pub(crate) fn diff_label(diff: DiffStats, theme: &Theme) -> impl IntoElement {
     div()
@@ -1130,6 +1325,17 @@ mod tests {
 
     fn text_of(layout: &TabLayout) -> impl Fn(TabId) -> String + '_ {
         |id| layout.style(id).name.unwrap_or_default()
+    }
+
+    #[test]
+    fn row_zones_reorder_at_edges_and_combine_in_the_middle() {
+        let (_, ids) = named_layout(&["a"]);
+        let tab = RowDrag::Tab(ids[0]);
+        assert_eq!(row_zone(0.1, &tab, false), RowZone::Before);
+        assert_eq!(row_zone(0.9, &tab, false), RowZone::After);
+        assert_eq!(row_zone(0.5, &tab, false), RowZone::Group);
+        assert_eq!(row_zone(0.5, &tab, true), RowZone::Split);
+        assert_eq!(row_zone(0.5, &RowDrag::Pane, false), RowZone::Split);
     }
 
     #[test]

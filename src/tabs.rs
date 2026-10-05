@@ -142,6 +142,8 @@ pub enum Entry {
 pub enum TabDestination {
     /// Directly before another tab, in that tab's container.
     Before(TabId),
+    /// Directly after another tab, in that tab's container.
+    After(TabId),
     /// At the end of a group.
     IntoGroup(GroupId),
     /// At the end of the top level.
@@ -274,12 +276,14 @@ impl TabLayout {
     }
 
     pub fn move_tab(&mut self, tab: TabId, destination: TabDestination) {
-        if destination == TabDestination::Before(tab) || !self.contains(tab) {
+        if matches!(destination, TabDestination::Before(other) | TabDestination::After(other) if other == tab)
+            || !self.contains(tab)
+        {
             return;
         }
         // Detaching may delete the source group, so resolve the target first.
         let target_group = match destination {
-            TabDestination::Before(other) => self.group_of(other),
+            TabDestination::Before(other) | TabDestination::After(other) => self.group_of(other),
             TabDestination::IntoGroup(group) => Some(group),
             TabDestination::End => None,
         };
@@ -292,26 +296,31 @@ impl TabLayout {
         // Keep the source group alive while the tab moves within it.
         self.remove_from_container(tab);
 
-        match (destination, target_group) {
-            (TabDestination::Before(other), Some(group)) => {
+        let (anchor, offset) = match destination {
+            TabDestination::Before(other) => (Some(other), 0),
+            TabDestination::After(other) => (Some(other), 1),
+            _ => (None, 0),
+        };
+        match (anchor, destination, target_group) {
+            (Some(other), _, Some(group)) => {
                 if let Some(group) = self.group_mut(group) {
                     let index = group
                         .tabs
                         .iter()
                         .position(|id| *id == other)
-                        .unwrap_or(group.tabs.len());
+                        .map_or(group.tabs.len(), |index| index + offset);
                     group.tabs.insert(index, tab);
                 }
             }
-            (TabDestination::Before(other), None) => {
+            (Some(other), _, None) => {
                 let index = self
                     .entries
                     .iter()
                     .position(|entry| *entry == Entry::Tab(other))
-                    .unwrap_or(self.entries.len());
+                    .map_or(self.entries.len(), |index| index + offset);
                 self.entries.insert(index, Entry::Tab(tab));
             }
-            (TabDestination::IntoGroup(_), Some(group)) => {
+            (None, TabDestination::IntoGroup(_), Some(group)) => {
                 if let Some(group) = self.group_mut(group) {
                     group.tabs.push(tab);
                 }
@@ -322,6 +331,26 @@ impl TabLayout {
             self.remove_group_if_empty(source);
         }
         self.normalize();
+    }
+
+    /// Put `dragged` in the same group as `target`: `target`'s group if it
+    /// has one, otherwise a new group named `name` holding both. Returns
+    /// the group, or `None` if they are the same tab.
+    pub fn group_together(
+        &mut self,
+        target: TabId,
+        dragged: TabId,
+        name: String,
+    ) -> Option<GroupId> {
+        if target == dragged || !self.contains(target) || !self.contains(dragged) {
+            return None;
+        }
+        let group = match self.group_of(target) {
+            Some(group) => group,
+            None => self.group_tab(target, name),
+        };
+        self.move_tab(dragged, TabDestination::After(target));
+        Some(group)
     }
 
     /// Move a group to just before a top-level entry, or to the end.
@@ -493,6 +522,45 @@ mod tests {
         let group = layout.group_tab(tabs[0], "Solo".into());
         layout.move_tab(tabs[0], TabDestination::Before(tabs[0]));
         assert!(layout.group(group).is_some());
+    }
+
+    #[test]
+    fn moving_after_a_tab() {
+        let (mut layout, tabs) = layout_with(3);
+        layout.move_tab(tabs[0], TabDestination::After(tabs[2]));
+        assert_eq!(layout.ordered_tabs(), vec![tabs[1], tabs[2], tabs[0]]);
+        layout.move_tab(tabs[0], TabDestination::After(tabs[0]));
+        assert_eq!(layout.ordered_tabs(), vec![tabs[1], tabs[2], tabs[0]]);
+    }
+
+    #[test]
+    fn grouping_two_loose_tabs_creates_a_group_in_place() {
+        let (mut layout, tabs) = layout_with(3);
+        let group = layout
+            .group_together(tabs[1], tabs[2], "Pair".into())
+            .unwrap();
+        assert_eq!(
+            layout.entries(),
+            &[Entry::Tab(tabs[0]), Entry::Group(group)]
+        );
+        assert_eq!(layout.group(group).unwrap().tabs(), &[tabs[1], tabs[2]]);
+    }
+
+    #[test]
+    fn grouping_onto_a_grouped_tab_joins_its_group() {
+        let (mut layout, tabs) = layout_with(3);
+        let group = layout.group_tab(tabs[0], "Work".into());
+        assert_eq!(
+            layout.group_together(tabs[0], tabs[2], "Other".into()),
+            Some(group)
+        );
+        assert_eq!(layout.group(group).unwrap().tabs(), &[tabs[0], tabs[2]]);
+        assert_eq!(layout.groups().len(), 1);
+        assert!(
+            layout
+                .group_together(tabs[1], tabs[1], "Self".into())
+                .is_none()
+        );
     }
 
     #[test]

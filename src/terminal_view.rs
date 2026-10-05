@@ -38,7 +38,7 @@ use crate::{
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
     osc::{OscEvent, OscScanner},
-    process_info,
+    output, process_info,
     pty::{Pty, PtyDimensions},
     search::{self, SearchMatch},
     settings::SettingsStore,
@@ -157,6 +157,7 @@ pub struct TerminalView {
     bounds: Option<Bounds<Pixels>>,
     metrics: Option<CellMetrics>,
     metadata: TabMetadata,
+    process_metadata: ProcessMetadata,
     _output_task: Task<()>,
     _metadata_task: Task<()>,
     _settings_subscription: Subscription,
@@ -197,6 +198,32 @@ struct SearchBar {
     matches: Vec<SearchMatch>,
     current: usize,
     _subscription: Subscription,
+}
+
+/// Process and filesystem observations collected away from the UI thread.
+#[derive(Default)]
+struct ProcessMetadata {
+    foreground: Option<i32>,
+    process: Option<String>,
+    directory: Option<PathBuf>,
+    branch: Option<String>,
+    agent: Option<Agent>,
+}
+
+impl ProcessMetadata {
+    fn read(foreground: Option<i32>, shell: Option<i32>) -> Self {
+        let directory = shell.and_then(process_info::working_directory);
+        Self {
+            foreground,
+            process: foreground.and_then(process_info::process_name),
+            branch: directory.as_deref().and_then(process_info::git_branch),
+            directory,
+            agent: foreground
+                .filter(|pid| Some(*pid) != shell)
+                .and_then(process_info::process_args)
+                .and_then(|args| agents::detect(&args)),
+        }
+    }
 }
 
 struct KeyInput {
@@ -276,16 +303,25 @@ impl TerminalView {
 
         Ok(cx.new(|cx| {
             let output_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                while let Ok(first) = output.recv().await {
-                    let mut chunks = vec![first];
-                    while let Ok(next) = output.try_recv() {
-                        chunks.push(next);
-                    }
-                    let updated = this.update(cx, |view, cx| view.process_output(&chunks, cx));
-                    if updated.is_err() {
-                        return;
-                    }
-                }
+                let executor = cx.background_executor().clone();
+                let mut last_frame = Instant::now() - output::FRAME_INTERVAL;
+                let pending = output.clone();
+                output::consume(
+                    output,
+                    |batch| {
+                        this.update(cx, |view, cx| {
+                            view.process_output(batch, cx);
+                            if pending.is_empty() || last_frame.elapsed() >= output::FRAME_INTERVAL
+                            {
+                                last_frame = Instant::now();
+                                cx.notify();
+                            }
+                        })
+                        .is_ok()
+                    },
+                    || executor.timer(output::YIELD_INTERVAL),
+                )
+                .await;
                 let _ = this.update(cx, |_, cx| cx.emit(TerminalEvent::Exited));
             });
             if startup.is_some() {
@@ -301,7 +337,7 @@ impl TerminalView {
                     let Ok(cwd) = this.update(cx, |view, _| view.metadata.cwd.clone()) else {
                         return;
                     };
-                    let diff = match cwd {
+                    let diff = match cwd.clone() {
                         Some(cwd) => {
                             cx.background_executor()
                                 .spawn(async move { git::diff_stats(&cwd) })
@@ -310,7 +346,7 @@ impl TerminalView {
                         None => None,
                     };
                     let updated = this.update(cx, |view, cx| {
-                        if view.diff != diff {
+                        if view.metadata.cwd == cwd && view.diff != diff {
                             view.diff = diff;
                             view.refresh_metadata(cx);
                         }
@@ -324,7 +360,21 @@ impl TerminalView {
             .detach();
             let metadata_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 loop {
-                    let refreshed = this.update(cx, |view, cx| view.refresh_metadata(cx));
+                    let Ok((foreground, shell)) = this.update(cx, |view, _| {
+                        (view.pty.foreground_pid(), view.pty.shell_pid())
+                    }) else {
+                        return;
+                    };
+                    let metadata = cx
+                        .background_executor()
+                        .spawn(async move { ProcessMetadata::read(foreground, shell) })
+                        .await;
+                    let refreshed = this.update(cx, |view, cx| {
+                        if view.pty.foreground_pid() == foreground {
+                            view.process_metadata = metadata;
+                            view.refresh_metadata(cx);
+                        }
+                    });
                     if refreshed.is_err() {
                         return;
                     }
@@ -349,6 +399,7 @@ impl TerminalView {
                     title: FALLBACK_TITLE.into(),
                     ..Default::default()
                 },
+                process_metadata: ProcessMetadata::default(),
                 _output_task: output_task,
                 _metadata_task: metadata_task,
                 // Font and padding changes take effect on the next frame.
@@ -393,13 +444,13 @@ impl TerminalView {
         &self.metadata
     }
 
-    fn process_output(&mut self, chunks: &[Vec<u8>], cx: &mut Context<Self>) {
+    fn process_output(&mut self, chunks: &mut output::OutputBatch<'_>, cx: &mut Context<Self>) {
         let mut command_changed = false;
         for chunk in chunks {
-            for event in self.osc.scan(chunk) {
+            for event in self.osc.scan(&chunk) {
                 command_changed |= self.apply_osc_event(event, cx);
             }
-            self.terminal.vt_write(chunk);
+            self.terminal.vt_write(&chunk);
         }
         self.activity.output(Instant::now());
         if self.bell.replace(false) {
@@ -409,7 +460,6 @@ impl TerminalView {
         if command_changed {
             self.refresh_metadata(cx);
         }
-        cx.notify();
     }
 
     /// Returns whether the command state changed.
@@ -533,8 +583,8 @@ impl TerminalView {
     }
 
     fn read_metadata(&self) -> TabMetadata {
-        let foreground = self.pty.foreground_pid();
-        let process = foreground.and_then(process_info::process_name);
+        let foreground = self.process_metadata.foreground;
+        let process = self.process_metadata.process.clone();
         let running = foreground.is_some() && foreground != self.pty.shell_pid();
         let program_title = self.terminal.title().unwrap_or_default().trim().to_string();
         let title = if program_title.is_empty() {
@@ -548,11 +598,8 @@ impl TerminalView {
         // Ask the kernel rather than trusting OSC 7: any program writing to
         // the terminal can emit that sequence and claim an arbitrary path,
         // which new tabs, splits, and session restore would then open.
-        let directory = self
-            .pty
-            .shell_pid()
-            .and_then(process_info::working_directory);
-        let branch = directory.as_deref().and_then(process_info::git_branch);
+        let directory = self.process_metadata.directory.clone();
+        let branch = self.process_metadata.branch.clone();
 
         TabMetadata {
             title: title.into(),
@@ -566,14 +613,10 @@ impl TerminalView {
             command_started: self.command_started,
             last_command: self.last_command,
             diff: self.diff,
-            agent: running
-                .then(|| foreground.and_then(process_info::process_args))
-                .flatten()
-                .and_then(|args| agents::detect(&args))
-                .map(|agent| AgentState {
-                    agent,
-                    status: self.activity.status(Instant::now()),
-                }),
+            agent: self.process_metadata.agent.map(|agent| AgentState {
+                agent,
+                status: self.activity.status(Instant::now()),
+            }),
         }
     }
 
