@@ -90,6 +90,18 @@ impl CommandIndex {
         }
     }
 
+    /// Known names starting with `prefix`, sorted.
+    pub fn names_with_prefix(&self, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .names
+            .iter()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Whether `word` runs something: a known name, or a path to an
     /// executable (relative to `cwd`).
     pub fn knows(&self, word: &str, cwd: Option<&Path>) -> bool {

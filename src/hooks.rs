@@ -1,7 +1,7 @@
 //! Lifecycle hooks sent by shell integration: hex-encoded JSON carried in a
 //! private DCS (`ESC P $ d <hex> ESC \`).
 
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +41,26 @@ pub enum Hook {
     CommandFinished {
         exit_code: i32,
     },
+    /// Completions for the text typed before the completion key: each
+    /// replaces `prefix`, the end of that text.
+    Completions {
+        prefix: String,
+        matches: Vec<Completion>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub word: String,
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompletionsValue {
+    prefix: String,
+    words: Vec<String>,
+    #[serde(default)]
+    descriptions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +100,24 @@ pub fn decode(hex: &[u8], session: &str) -> Option<Hook> {
         "CommandFinished" => Some(Hook::CommandFinished {
             exit_code: envelope.value.get("exit_code")?.as_i64()? as i32,
         }),
+        "Completions" => {
+            let value: CompletionsValue = serde_json::from_value(envelope.value).ok()?;
+            let mut seen = HashSet::new();
+            let matches = value
+                .words
+                .into_iter()
+                .enumerate()
+                .filter(|(_, word)| seen.insert(word.clone()))
+                .map(|(index, word)| Completion {
+                    word,
+                    description: empty_to_none(value.descriptions.get(index).cloned()),
+                })
+                .collect();
+            Some(Hook::Completions {
+                prefix: value.prefix,
+                matches,
+            })
+        }
         _ => None,
     }
 }
@@ -132,6 +170,27 @@ mod tests {
             decode(payload(&preexec), "s1"),
             Some(Hook::Preexec {
                 command: "echo \"hi\"".into()
+            })
+        );
+        let completions = encode(
+            "Completions",
+            "s1",
+            r#"{"prefix":"che","words":["checkout","cherry","checkout"],"descriptions":["switch branches","","switch branches"]}"#,
+        );
+        assert_eq!(
+            decode(payload(&completions), "s1"),
+            Some(Hook::Completions {
+                prefix: "che".into(),
+                matches: vec![
+                    Completion {
+                        word: "checkout".into(),
+                        description: Some("switch branches".into()),
+                    },
+                    Completion {
+                        word: "cherry".into(),
+                        description: None,
+                    },
+                ],
             })
         );
         let finished = encode("CommandFinished", "s1", r#"{"exit_code":130}"#);

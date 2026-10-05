@@ -36,13 +36,14 @@ use crate::{
     block_view::{self, Item, ItemContent},
     blocks::{self, BlockContext, BlockList},
     command_editor::{CommandEditor, CommandEditorEvent},
+    completion::{self, CompletionMenu},
     components::{elevated_shadow, icon, icon_button},
     control,
     git::{self, DiffStats},
     grid::{CellMetrics, Frame, GridRenderer},
     highlight::{self, CommandIndex, TokenKind},
     history::{self, History},
-    hooks::{Bootstrapped, Hook, Precmd},
+    hooks::{Bootstrapped, Completion, Hook, Precmd},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
     osc::{OscEvent, OscScanner, Piece},
@@ -147,6 +148,92 @@ const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
 /// Environment variable telling programs which pane they run in.
 pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
+/// The completion menu: a window of rows around the selection, each with
+/// its description.
+fn render_completion_menu(menu: &CompletionMenu, theme: &theme::Theme) -> impl IntoElement {
+    let count = menu.visible().count();
+    let first = menu
+        .selected()
+        .saturating_sub(COMPLETION_ROWS / 2)
+        .min(count.saturating_sub(COMPLETION_ROWS));
+    let rows = menu
+        .visible()
+        .skip(first)
+        .take(COMPLETION_ROWS)
+        .map(|(index, completion)| {
+            let selected = index == menu.selected();
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .when(selected, |row| row.bg(theme.ghost_selected))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(completion.word.clone()),
+                )
+                .children(completion.description.clone().map(|description| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .font_family(theme::UI_FONT_FAMILY)
+                        .text_color(theme.text_placeholder)
+                        .child(description)
+                }))
+        });
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .pb_1()
+        .font_family(theme::FONT_FAMILY)
+        .text_sm()
+        .children(rows)
+        .when(count > COMPLETION_ROWS, |list| {
+            list.child(
+                div()
+                    .px_2()
+                    .text_xs()
+                    .font_family(theme::UI_FONT_FAMILY)
+                    .text_color(theme.text_placeholder)
+                    .child(format!("{} of {count}", menu.selected() + 1)),
+            )
+        })
+}
+
+/// Completions listed at once.
+const COMPLETION_ROWS: usize = 10;
+
+/// The longest start every word shares.
+fn common_prefix<'a>(mut words: impl Iterator<Item = &'a str>) -> String {
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut shared = first.len();
+    for word in words {
+        shared = first
+            .char_indices()
+            .zip(word.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((index, ch), _)| index + ch.len_utf8())
+            .min(shared);
+    }
+    first[..shared].to_string()
+}
+
 /// Matches listed by the Ctrl-R history search.
 const HISTORY_SEARCH_RESULTS: usize = 8;
 
@@ -238,6 +325,11 @@ pub struct TerminalView {
     history_search: Option<HistorySearch>,
     /// Names the shell can run, once indexed.
     commands: Option<Rc<CommandIndex>>,
+    /// Text before the cursor that completions were asked for, while the
+    /// shell works them out.
+    pending_completion: Option<String>,
+    /// Completions shown over the editor.
+    completion: Option<CompletionMenu>,
     /// The shell's state at its most recent prompt.
     prompt: Option<Precmd>,
     pane_id: u64,
@@ -512,6 +604,8 @@ impl TerminalView {
                 history_position: None,
                 history_search: None,
                 commands: None,
+                pending_completion: None,
+                completion: None,
                 prompt: None,
                 pane_id,
                 control_token,
@@ -665,6 +759,15 @@ impl TerminalView {
                 })
                 .detach();
             }
+            Hook::Completions { prefix, matches } => {
+                let Some(anchor) = self.pending_completion.take() else {
+                    return;
+                };
+                // Completions for text since edited no longer apply.
+                if self.editor.read(cx).text_before_cursor() == anchor {
+                    self.show_completions(anchor, prefix, matches, cx);
+                }
+            }
             Hook::CommandFinished { exit_code } => {
                 let Some(blocks) = &mut self.blocks else {
                     return;
@@ -752,11 +855,27 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            CommandEditorEvent::Submitted(command) => {
-                if self.history_search.is_some() {
+            CommandEditorEvent::Confirmed => {
+                if self.completion.is_some() {
+                    self.accept_completion(cx);
+                } else {
                     self.pick_history_match(cx);
-                    return;
                 }
+            }
+            CommandEditorEvent::Complete => match &mut self.completion {
+                Some(menu) => {
+                    menu.select_next();
+                    cx.notify();
+                }
+                None => self.request_completions(cx),
+            },
+            CommandEditorEvent::CompletePrevious => {
+                if let Some(menu) = &mut self.completion {
+                    menu.select_previous();
+                    cx.notify();
+                }
+            }
+            CommandEditorEvent::Submitted(command) => {
                 self.history_position = None;
                 if command.trim().is_empty() {
                     return;
@@ -769,6 +888,18 @@ impl TerminalView {
                 }
             }
             CommandEditorEvent::EndOfFile => self.write_input(b"\x04", cx),
+            CommandEditorEvent::HistoryPrevious if self.completion.is_some() => {
+                if let Some(menu) = &mut self.completion {
+                    menu.select_previous();
+                }
+                cx.notify();
+            }
+            CommandEditorEvent::HistoryNext if self.completion.is_some() => {
+                if let Some(menu) = &mut self.completion {
+                    menu.select_next();
+                }
+                cx.notify();
+            }
             CommandEditorEvent::HistoryPrevious => match &mut self.history_search {
                 Some(search) => {
                     search.selected =
@@ -785,14 +916,17 @@ impl TerminalView {
                 None => self.walk_history(true, cx),
             },
             CommandEditorEvent::SearchHistory => {
+                self.completion = None;
                 if self.history_search.take().is_none() {
                     self.history_search = Some(HistorySearch::default());
                     self.update_history_search(cx);
                 }
+                self.sync_editor_menu(cx);
                 cx.notify();
             }
             CommandEditorEvent::Escaped => {
-                if self.history_search.take().is_some() {
+                if self.completion.take().is_some() || self.history_search.take().is_some() {
+                    self.sync_editor_menu(cx);
                     cx.notify();
                 }
             }
@@ -805,9 +939,116 @@ impl TerminalView {
                     }
                 }
                 self.update_history_search(cx);
+                self.refine_completions(cx);
                 self.decorate_editor(cx);
             }
         }
+    }
+
+    /// Ask for completions of the word before the cursor: from zsh's own
+    /// completion system when it is idle at its prompt, otherwise from
+    /// command names and paths.
+    fn request_completions(&mut self, cx: &mut Context<Self>) {
+        let before = self.editor.read(cx).text_before_cursor().to_string();
+        let shell_idle = self.shell_ready
+            && self
+                .blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.running().is_none());
+        let zsh = self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.shell == "zsh");
+        if zsh && shell_idle {
+            let mut data = before.as_bytes().to_vec();
+            let mut encoded = vec![0u8; data.len() + 32];
+            let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+            let Ok(len) = paste::encode(&mut data, bracketed, &mut encoded) else {
+                return;
+            };
+            let mut bytes = shell_integration::CLEAR_LINE_KEY.to_vec();
+            bytes.extend_from_slice(&encoded[..len]);
+            bytes.extend_from_slice(shell_integration::COMPLETE_KEY);
+            self.pending_completion = Some(before);
+            self.write_input(&bytes, cx);
+            return;
+        }
+        let cwd = self.prompt.as_ref().and_then(|prompt| prompt.cwd.clone());
+        let (prefix, matches) =
+            completion::local_completions(&before, self.commands.as_deref(), cwd.as_deref());
+        self.show_completions(before, prefix, matches, cx);
+    }
+
+    /// Complete at once when there is one match; otherwise extend the word
+    /// by what every match shares and list them.
+    fn show_completions(
+        &mut self,
+        anchor: String,
+        prefix: String,
+        matches: Vec<Completion>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut menu = CompletionMenu::new(anchor.clone(), prefix.clone(), matches);
+        match menu.visible().count() {
+            0 => return,
+            1 => {
+                if let Some((len, text)) = menu.apply(&anchor) {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.replace_before_cursor(len, &text, cx)
+                    });
+                }
+                return;
+            }
+            _ => {}
+        }
+        let shared = common_prefix(
+            menu.visible()
+                .map(|(_, completion)| completion.word.as_str()),
+        );
+        if shared.len() > prefix.len() && anchor.ends_with(&prefix) {
+            let before = format!("{}{shared}", &anchor[..anchor.len() - prefix.len()]);
+            self.editor.update(cx, |editor, cx| {
+                editor.replace_before_cursor(prefix.len(), &shared, cx)
+            });
+            menu.refine(&before);
+        }
+        self.completion = Some(menu);
+        self.history_search = None;
+        self.sync_editor_menu(cx);
+        cx.notify();
+    }
+
+    fn refine_completions(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.completion else {
+            return;
+        };
+        let before = self.editor.read(cx).text_before_cursor().to_string();
+        if !menu.refine(&before) || menu.is_empty() {
+            self.completion = None;
+            self.sync_editor_menu(cx);
+        }
+        cx.notify();
+    }
+
+    fn accept_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.completion.take() else {
+            return;
+        };
+        let before = self.editor.read(cx).text_before_cursor().to_string();
+        self.sync_editor_menu(cx);
+        if let Some((len, text)) = menu.apply(&before) {
+            self.editor.update(cx, |editor, cx| {
+                editor.replace_before_cursor(len, &text, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    /// Tell the editor whether a menu takes its Up, Down, and Enter.
+    fn sync_editor_menu(&mut self, cx: &mut Context<Self>) {
+        let open = self.completion.is_some() || self.history_search.is_some();
+        self.editor
+            .update(cx, |editor, _| editor.set_menu_open(open));
     }
 
     /// Load the shell's history and index the commands it can run, off
@@ -887,6 +1128,7 @@ impl TerminalView {
         let Some(search) = self.history_search.take() else {
             return;
         };
+        self.sync_editor_menu(cx);
         if let Some(entry) = search.matches.get(search.selected) {
             let entry = entry.clone();
             self.editor
@@ -976,6 +1218,10 @@ impl TerminalView {
                 })
                 .children(rows)
         });
+        let completions = self
+            .completion
+            .as_ref()
+            .map(|menu| render_completion_menu(menu, theme));
         div()
             .flex_none()
             .flex()
@@ -985,6 +1231,7 @@ impl TerminalView {
             .py_2()
             .border_t_1()
             .border_color(theme.border_variant)
+            .children(completions)
             .children(search)
             .child(
                 div()

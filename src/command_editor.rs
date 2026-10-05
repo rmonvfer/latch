@@ -50,6 +50,8 @@ actions!(
         EndOfFile,
         Unselect,
         SearchHistory,
+        Complete,
+        CompletePrevious,
     ]
 );
 
@@ -63,14 +65,21 @@ pub enum CommandEditorEvent {
     Submitted(String),
     /// Ctrl-D in an empty editor.
     EndOfFile,
-    /// Up on the first row.
+    /// Up on the first row, or any Up while a menu is open.
     HistoryPrevious,
-    /// Down on the last row.
+    /// Down on the last row, or any Down while a menu is open.
     HistoryNext,
+    /// Enter while a menu is open: pick its selection; the text stays.
+    Confirmed,
     /// Ctrl-R.
     SearchHistory,
     /// Escape with nothing selected.
     Escaped,
+    /// Tab: complete the word before the cursor, or move to the next
+    /// completion.
+    Complete,
+    /// Shift-Tab: move to the previous completion.
+    CompletePrevious,
     Changed,
 }
 
@@ -91,6 +100,9 @@ pub struct CommandEditor {
     /// Text that would complete the command, shown after the cursor when it
     /// is at the end.
     suggestion: Option<String>,
+    /// Whether a menu attached to the editor (completions, history search)
+    /// takes Up, Down, and Enter.
+    menu_open: bool,
 }
 
 impl EventEmitter<CommandEditorEvent> for CommandEditor {}
@@ -115,7 +127,26 @@ impl CommandEditor {
             selecting: false,
             highlights: Vec::new(),
             suggestion: None,
+            menu_open: false,
         }
+    }
+
+    pub fn set_menu_open(&mut self, open: bool) {
+        self.menu_open = open;
+    }
+
+    /// The text before the cursor.
+    pub fn text_before_cursor(&self) -> &str {
+        &self.buffer.text()[..self.buffer.cursor()]
+    }
+
+    /// Replace the `len` bytes before the cursor with `text`.
+    pub fn replace_before_cursor(&mut self, len: usize, text: &str, cx: &mut Context<Self>) {
+        let cursor = self.buffer.cursor();
+        self.buffer
+            .replace(cursor.saturating_sub(len)..cursor, text);
+        self.marked_range = None;
+        self.edited(cx);
     }
 
     pub fn set_highlights(
@@ -232,6 +263,10 @@ impl CommandEditor {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_open {
+            cx.emit(CommandEditorEvent::HistoryPrevious);
+            return;
+        }
         match self.buffer.vertical(&self.rows, false) {
             Some(offset) => {
                 self.buffer.move_to(offset, false);
@@ -242,6 +277,10 @@ impl CommandEditor {
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_open {
+            cx.emit(CommandEditorEvent::HistoryNext);
+            return;
+        }
         match self.buffer.vertical(&self.rows, true) {
             Some(offset) => {
                 self.buffer.move_to(offset, false);
@@ -341,6 +380,10 @@ impl CommandEditor {
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_open {
+            cx.emit(CommandEditorEvent::Confirmed);
+            return;
+        }
         let command = self.buffer.take();
         self.marked_range = None;
         self.scroll_row = 0;
@@ -379,6 +422,14 @@ impl CommandEditor {
 
     fn search_history(&mut self, _: &SearchHistory, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(CommandEditorEvent::SearchHistory);
+    }
+
+    fn complete(&mut self, _: &Complete, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(CommandEditorEvent::Complete);
+    }
+
+    fn complete_previous(&mut self, _: &CompletePrevious, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(CommandEditorEvent::CompletePrevious);
     }
 
     fn on_mouse_down(
@@ -711,6 +762,8 @@ impl Render for CommandEditor {
             .on_action(cx.listener(Self::end_of_file))
             .on_action(cx.listener(Self::unselect))
             .on_action(cx.listener(Self::search_history))
+            .on_action(cx.listener(Self::complete))
+            .on_action(cx.listener(Self::complete_previous))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(
                 MouseButton::Left,
@@ -904,5 +957,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-d", EndOfFile, context),
         KeyBinding::new("escape", Unselect, context),
         KeyBinding::new("ctrl-r", SearchHistory, context),
+        KeyBinding::new("tab", Complete, context),
+        KeyBinding::new("shift-tab", CompletePrevious, context),
     ]
 }

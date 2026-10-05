@@ -6,6 +6,7 @@ mod block_view;
 mod blocks;
 mod cli;
 mod command_editor;
+mod completion;
 mod components;
 mod confirm;
 mod control;

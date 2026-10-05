@@ -22,6 +22,10 @@ use crate::settings::SettingsStore;
 /// typing a command into it.
 pub const CLEAR_LINE_KEY: &[u8] = b"\x1b[9876~";
 
+/// The key the zsh script binds to report completions for the text typed
+/// before it.
+pub const COMPLETE_KEY: &[u8] = b"\x1b[9877~";
+
 const SCRIPTS: [(&str, &str); 3] = [
     (
         "zsh/.zshenv",
