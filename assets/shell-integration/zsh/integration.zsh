@@ -83,13 +83,14 @@ _terminal_preexec() {
 _terminal_bootstrapped() {
   # Locals avoid the names aliases/functions/builtins, which would hide
   # zsh's own tables of those names.
-  local histfile alias_names function_names builtin_names version
+  local histfile alias_names function_names builtin_names version path_value
   _terminal_json "${HISTFILE:-}"; histfile=$REPLY
+  _terminal_json "$PATH"; path_value=$REPLY
   _terminal_json "$ZSH_VERSION"; version=$REPLY
   _terminal_json_array ${(k)aliases}; alias_names=$REPLY
   _terminal_json_array ${(k)functions}; function_names=$REPLY
   _terminal_json_array ${(k)builtins}; builtin_names=$REPLY
-  _terminal_hook Bootstrapped "{\"shell\":\"zsh\",\"version\":$version,\"histfile\":$histfile,\"aliases\":$alias_names,\"functions\":$function_names,\"builtins\":$builtin_names}"
+  _terminal_hook Bootstrapped "{\"shell\":\"zsh\",\"version\":$version,\"histfile\":$histfile,\"path\":$path_value,\"aliases\":$alias_names,\"functions\":$function_names,\"builtins\":$builtin_names}"
 }
 
 # Run after the user's own hooks (installed later by .zshrc) by moving to

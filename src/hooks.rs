@@ -13,6 +13,8 @@ pub struct Bootstrapped {
     pub shell: String,
     pub version: String,
     pub histfile: Option<PathBuf>,
+    /// The shell's PATH, which its startup files may have changed.
+    pub path: String,
     pub aliases: Vec<String>,
     pub functions: Vec<String>,
     pub builtins: Vec<String>,

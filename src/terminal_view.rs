@@ -34,12 +34,14 @@ use libghostty_vt::{
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
     block_view::{self, Item, ItemContent},
-    command_editor::{CommandEditor, CommandEditorEvent},
     blocks::{self, BlockContext, BlockList},
+    command_editor::{CommandEditor, CommandEditorEvent},
     components::{elevated_shadow, icon, icon_button},
     control,
     git::{self, DiffStats},
     grid::{CellMetrics, Frame, GridRenderer},
+    highlight::{self, CommandIndex, TokenKind},
+    history::{self, History},
     hooks::{Bootstrapped, Hook, Precmd},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
@@ -145,6 +147,27 @@ const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
 /// Environment variable telling programs which pane they run in.
 pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
+/// Matches listed by the Ctrl-R history search.
+const HISTORY_SEARCH_RESULTS: usize = 8;
+
+/// A place in history reached with Up and Down.
+struct HistoryPosition {
+    index: usize,
+    /// What was typed before walking history.
+    draft: String,
+    /// The editor change this position caused is still to be reported,
+    /// and must not end the walk.
+    applying: bool,
+}
+
+/// The Ctrl-R search: the editor's text is the query.
+#[derive(Default)]
+struct HistorySearch {
+    /// Best match first.
+    matches: Vec<String>,
+    selected: usize,
+}
+
 /// How long a command runs before the editor hides and keys go to it.
 const EDITOR_GRACE: Duration = Duration::from_millis(50);
 
@@ -208,6 +231,13 @@ pub struct TerminalView {
     shell_ready: bool,
     /// A command submitted before the shell was ready.
     queued_command: Option<String>,
+    history: History,
+    /// Where Up and Down have moved through history, if they have.
+    history_position: Option<HistoryPosition>,
+    /// The open Ctrl-R search, if any.
+    history_search: Option<HistorySearch>,
+    /// Names the shell can run, once indexed.
+    commands: Option<Rc<CommandIndex>>,
     /// The shell's state at its most recent prompt.
     prompt: Option<Precmd>,
     pane_id: u64,
@@ -478,6 +508,10 @@ impl TerminalView {
                 editor,
                 shell_ready: false,
                 queued_command: None,
+                history: History::default(),
+                history_position: None,
+                history_search: None,
+                commands: None,
                 prompt: None,
                 pane_id,
                 control_token,
@@ -574,6 +608,7 @@ impl TerminalView {
     fn apply_hook(&mut self, hook: Hook, cx: &mut Context<Self>) {
         match hook {
             Hook::Bootstrapped(bootstrapped) => {
+                self.index_shell(bootstrapped.clone(), cx);
                 self.shell = Some(bootstrapped);
                 if SettingsStore::get(cx).command_blocks && self.blocks.is_none() {
                     let mut blocks = BlockList::new(MAX_BLOCKS);
@@ -718,9 +753,15 @@ impl TerminalView {
     ) {
         match event {
             CommandEditorEvent::Submitted(command) => {
+                if self.history_search.is_some() {
+                    self.pick_history_match(cx);
+                    return;
+                }
+                self.history_position = None;
                 if command.trim().is_empty() {
                     return;
                 }
+                self.history.push(command);
                 if self.shell_ready {
                     self.inject_command(command, cx);
                 } else {
@@ -728,10 +769,167 @@ impl TerminalView {
                 }
             }
             CommandEditorEvent::EndOfFile => self.write_input(b"\x04", cx),
-            CommandEditorEvent::HistoryPrevious
-            | CommandEditorEvent::HistoryNext
-            | CommandEditorEvent::Changed => {}
+            CommandEditorEvent::HistoryPrevious => match &mut self.history_search {
+                Some(search) => {
+                    search.selected =
+                        (search.selected + 1).min(search.matches.len().saturating_sub(1));
+                    cx.notify();
+                }
+                None => self.walk_history(false, cx),
+            },
+            CommandEditorEvent::HistoryNext => match &mut self.history_search {
+                Some(search) => {
+                    search.selected = search.selected.saturating_sub(1);
+                    cx.notify();
+                }
+                None => self.walk_history(true, cx),
+            },
+            CommandEditorEvent::SearchHistory => {
+                if self.history_search.take().is_none() {
+                    self.history_search = Some(HistorySearch::default());
+                    self.update_history_search(cx);
+                }
+                cx.notify();
+            }
+            CommandEditorEvent::Escaped => {
+                if self.history_search.take().is_some() {
+                    cx.notify();
+                }
+            }
+            CommandEditorEvent::Changed => {
+                if let Some(position) = &mut self.history_position {
+                    if position.applying {
+                        position.applying = false;
+                    } else {
+                        self.history_position = None;
+                    }
+                }
+                self.update_history_search(cx);
+                self.decorate_editor(cx);
+            }
         }
+    }
+
+    /// Load the shell's history and index the commands it can run, off
+    /// the main thread.
+    fn index_shell(&mut self, shell: Bootstrapped, cx: &mut Context<Self>) {
+        let work = cx.background_executor().spawn(async move {
+            let history = shell.histfile.as_deref().map(|path| {
+                history::load(path, &shell.shell).unwrap_or_else(|error| {
+                    log::warn!("failed to read {}: {error:#}", path.display());
+                    History::default()
+                })
+            });
+            (history, CommandIndex::new(&shell))
+        });
+        cx.spawn(async move |view, cx| {
+            let (history, commands) = work.await;
+            let _ = view.update(cx, |view, cx| {
+                if let Some(history) = history {
+                    view.history.prepend(history);
+                }
+                view.commands = Some(Rc::new(commands));
+                view.decorate_editor(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Show the previous (or next) history entry in the editor, keeping
+    /// what was typed to come back to past the newest entry.
+    fn walk_history(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let len = self.history.len();
+        let next = match (&self.history_position, forward) {
+            (None, true) => return,
+            (None, false) => len.checked_sub(1),
+            (Some(position), false) => position.index.checked_sub(1),
+            (Some(position), true) => Some(position.index + 1),
+        };
+        let Some(index) = next else {
+            return;
+        };
+        let draft = match self.history_position.take() {
+            Some(position) => position.draft,
+            None => self.editor.read(cx).text().to_string(),
+        };
+        let text = match self.history.get(index) {
+            Some(entry) => {
+                self.history_position = Some(HistoryPosition {
+                    index,
+                    draft,
+                    applying: true,
+                });
+                entry.to_string()
+            }
+            None => draft,
+        };
+        self.editor
+            .update(cx, |editor, cx| editor.set_text(text, cx));
+    }
+
+    fn update_history_search(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.history_search else {
+            return;
+        };
+        let query = self.editor.read(cx).text();
+        search.matches = self
+            .history
+            .search(query, HISTORY_SEARCH_RESULTS)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        search.selected = 0;
+        cx.notify();
+    }
+
+    /// Put the selected search match in the editor.
+    fn pick_history_match(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.history_search.take() else {
+            return;
+        };
+        if let Some(entry) = search.matches.get(search.selected) {
+            let entry = entry.clone();
+            self.editor
+                .update(cx, |editor, cx| editor.set_text(entry, cx));
+        }
+        cx.notify();
+    }
+
+    /// Refresh the editor's highlighting and history suggestion.
+    fn decorate_editor(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text().to_string();
+        let suggestion = self
+            .history
+            .suggestion(&text)
+            .filter(|_| self.history_search.is_none())
+            .map(str::to_string);
+        let highlights = match &self.commands {
+            Some(commands) => {
+                let colors = &cx.theme().terminal;
+                let cwd = self
+                    .prompt
+                    .as_ref()
+                    .and_then(|prompt| prompt.cwd.as_deref());
+                highlight::highlight(&text, commands, cwd)
+                    .into_iter()
+                    .map(|token| {
+                        let color = match token.kind {
+                            TokenKind::Command => colors.ansi[2],
+                            TokenKind::UnknownCommand => colors.ansi[1],
+                            TokenKind::Flag => colors.ansi[6],
+                            TokenKind::String => colors.ansi[3],
+                            TokenKind::Operator => colors.ansi[5],
+                        };
+                        (token.range, theme::to_hsla(color))
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.set_suggestion(suggestion, cx);
+            editor.set_highlights(highlights, cx);
+        });
     }
 
     /// The editor with the shell's context above it.
@@ -742,11 +940,42 @@ impl TerminalView {
             .as_ref()
             .map(BlockContext::from)
             .unwrap_or_default();
-        let chips = block_view::context_chips(
-            &context,
-            self.process_metadata.branch.as_deref(),
-            theme,
-        );
+        let chips =
+            block_view::context_chips(&context, self.process_metadata.branch.as_deref(), theme);
+        // Ctrl-R matches, best at the bottom, next to the editor.
+        let search = self.history_search.as_ref().map(|search| {
+            let rows = search
+                .matches
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, entry)| {
+                    let first_line = entry.lines().next().unwrap_or_default().to_string();
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .when(index == search.selected, |row| {
+                            row.bg(theme.ghost_selected).text_color(theme.text)
+                        })
+                        .child(first_line)
+                });
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .pb_1()
+                .font_family(theme::FONT_FAMILY)
+                .text_sm()
+                .text_color(theme.text_muted)
+                .when(search.matches.is_empty(), |list| {
+                    list.child(div().px_2().child("No matching commands"))
+                })
+                .children(rows)
+        });
         div()
             .flex_none()
             .flex()
@@ -756,6 +985,7 @@ impl TerminalView {
             .py_2()
             .border_t_1()
             .border_color(theme.border_variant)
+            .children(search)
             .child(
                 div()
                     .flex()

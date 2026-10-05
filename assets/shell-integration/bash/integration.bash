@@ -90,13 +90,14 @@ if [[ $- == *i* ]]; then
   }
 
   _terminal_bootstrapped() {
-    local histfile version alias_names function_names builtin_names
+    local histfile version path alias_names function_names builtin_names
     _terminal_json "${HISTFILE:-}"; histfile=$REPLY
+    _terminal_json "$PATH"; path=$REPLY
     _terminal_json "$BASH_VERSION"; version=$REPLY
     _terminal_json_array $(compgen -a); alias_names=$REPLY
     _terminal_json_array $(compgen -A function); function_names=$REPLY
     _terminal_json_array $(compgen -b); builtin_names=$REPLY
-    _terminal_hook Bootstrapped "{\"shell\":\"bash\",\"version\":$version,\"histfile\":$histfile,\"aliases\":$alias_names,\"functions\":$function_names,\"builtins\":$builtin_names}"
+    _terminal_hook Bootstrapped "{\"shell\":\"bash\",\"version\":$version,\"histfile\":$histfile,\"path\":$path,\"aliases\":$alias_names,\"functions\":$function_names,\"builtins\":$builtin_names}"
   }
   _terminal_bootstrapped
 

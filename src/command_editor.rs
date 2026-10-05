@@ -49,6 +49,7 @@ actions!(
         Clear,
         EndOfFile,
         Unselect,
+        SearchHistory,
     ]
 );
 
@@ -66,6 +67,10 @@ pub enum CommandEditorEvent {
     HistoryPrevious,
     /// Down on the last row.
     HistoryNext,
+    /// Ctrl-R.
+    SearchHistory,
+    /// Escape with nothing selected.
+    Escaped,
     Changed,
 }
 
@@ -81,6 +86,11 @@ pub struct CommandEditor {
     /// First visual row shown when the text has more rows than fit.
     scroll_row: usize,
     selecting: bool,
+    /// Colors for ranges of the text; the rest is the terminal foreground.
+    highlights: Vec<(Range<usize>, Hsla)>,
+    /// Text that would complete the command, shown after the cursor when it
+    /// is at the end.
+    suggestion: Option<String>,
 }
 
 impl EventEmitter<CommandEditorEvent> for CommandEditor {}
@@ -103,7 +113,35 @@ impl CommandEditor {
             rows: Vec::new(),
             scroll_row: 0,
             selecting: false,
+            highlights: Vec::new(),
+            suggestion: None,
         }
+    }
+
+    pub fn set_highlights(
+        &mut self,
+        highlights: Vec<(Range<usize>, Hsla)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlights = highlights;
+        cx.notify();
+    }
+
+    pub fn set_suggestion(&mut self, suggestion: Option<String>, cx: &mut Context<Self>) {
+        self.suggestion = suggestion;
+        cx.notify();
+    }
+
+    /// Take the suggestion if the cursor is at the end, where it shows.
+    fn accept_suggestion(&mut self, cx: &mut Context<Self>) -> bool {
+        let at_end =
+            self.buffer.selection().is_empty() && self.buffer.cursor() == self.buffer.text().len();
+        let Some(suggestion) = self.suggestion.take().filter(|_| at_end) else {
+            return false;
+        };
+        self.buffer.insert(&suggestion);
+        self.edited(cx);
+        true
     }
 
     pub fn text(&self) -> &str {
@@ -114,6 +152,7 @@ impl CommandEditor {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.buffer.set_text(text);
         self.marked_range = None;
+        self.scroll_row = 0;
         self.edited(cx);
     }
 
@@ -187,7 +226,9 @@ impl CommandEditor {
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        self.step(true, cx);
+        if !self.accept_suggestion(cx) {
+            self.step(true, cx);
+        }
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
@@ -268,6 +309,9 @@ impl CommandEditor {
     }
 
     fn line_end(&mut self, _: &LineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_suggestion(cx) {
+            return;
+        }
         self.buffer
             .move_to(self.buffer.line_end(self.buffer.cursor()), false);
         self.moved(cx);
@@ -275,7 +319,8 @@ impl CommandEditor {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.buffer.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
+            self.buffer
+                .insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
             self.edited(cx);
         }
     }
@@ -324,8 +369,16 @@ impl CommandEditor {
     }
 
     fn unselect(&mut self, _: &Unselect, _: &mut Window, cx: &mut Context<Self>) {
+        if self.buffer.selection().is_empty() {
+            cx.emit(CommandEditorEvent::Escaped);
+            return;
+        }
         self.buffer.move_to(self.buffer.cursor(), false);
         self.moved(cx);
+    }
+
+    fn search_history(&mut self, _: &SearchHistory, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(CommandEditorEvent::SearchHistory);
     }
 
     fn on_mouse_down(
@@ -558,7 +611,12 @@ impl Render for CommandEditor {
         let paint_rows: Vec<PaintRow> = if text.is_empty() {
             vec![PaintRow {
                 text: self.placeholder.clone(),
-                runs: vec![run(&font, self.placeholder.len(), theme.text_placeholder, false)],
+                runs: vec![run(
+                    &font,
+                    self.placeholder.len(),
+                    theme.text_placeholder,
+                    false,
+                )],
                 selection: None,
             }]
         } else {
@@ -574,24 +632,22 @@ impl Render for CommandEditor {
                                 ..marked.end.clamp(row.start, row.end) - row.start
                         })
                         .filter(|marked| !marked.is_empty());
-                    let runs = match marked {
-                        Some(marked) => vec![
-                            run(&font, marked.start, foreground, false),
-                            run(&font, marked.len(), foreground, true),
-                            run(&font, row_text.len() - marked.end, foreground, false),
-                        ],
-                        None => vec![run(&font, row_text.len(), foreground, false)],
-                    };
-                    let selected = (selection.start.max(row.start)
-                        ..selection.end.min(row.end))
-                        .clone();
+                    let runs = row_runs(
+                        row.start..row.end,
+                        &self.highlights,
+                        marked.map(|marked| row.start + marked.start..row.start + marked.end),
+                        &font,
+                        foreground,
+                    );
+                    let selected =
+                        (selection.start.max(row.start)..selection.end.min(row.end)).clone();
                     let selection = (!selected.is_empty()).then(|| {
                         editor_buffer::columns(&text[row.start..selected.start])
                             ..editor_buffer::columns(&text[row.start..selected.end])
                     });
                     PaintRow {
                         text: row_text.to_string().into(),
-                        runs: runs.into_iter().filter(|run| run.len > 0).collect(),
+                        runs,
                         selection,
                     }
                 })
@@ -601,6 +657,21 @@ impl Render for CommandEditor {
             let (row, col) = editor_buffer::position_of(text, &self.rows, self.buffer.cursor());
             (row - self.scroll_row, col)
         });
+        let ghost = self
+            .suggestion
+            .as_ref()
+            .filter(|_| focused && selection.is_empty() && self.buffer.cursor() == text.len())
+            .and_then(|suggestion| {
+                let (row, col) = editor_buffer::position_of(text, &self.rows, text.len());
+                let room = self.cols().saturating_sub(col);
+                let first_line = suggestion.lines().next().unwrap_or_default();
+                let fitted = fit_columns(first_line, room);
+                (!fitted.is_empty() && row >= self.scroll_row).then(|| {
+                    let fitted: SharedString = fitted.to_string().into();
+                    let runs = vec![run(&font, fitted.len(), theme.text_placeholder, false)];
+                    (row - self.scroll_row, col, fitted, runs)
+                })
+            });
         let height = metrics.height * visible.len().max(1) as f32;
         let entity = cx.entity();
         let focus_handle = self.focus_handle.clone();
@@ -639,6 +710,7 @@ impl Render for CommandEditor {
             .on_action(cx.listener(Self::clear))
             .on_action(cx.listener(Self::end_of_file))
             .on_action(cx.listener(Self::unselect))
+            .on_action(cx.listener(Self::search_history))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(
                 MouseButton::Left,
@@ -690,6 +762,22 @@ impl Render for CommandEditor {
                                 cx,
                             );
                         }
+                        if let Some((row, col, text, runs)) = &ghost {
+                            let line = window.text_system().shape_line(
+                                text.clone(),
+                                metrics.font_size,
+                                runs,
+                                Some(metrics.width),
+                            );
+                            let _ = line.paint(
+                                cell(*row, *col),
+                                metrics.height,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
                         if let Some((row, col)) = cursor {
                             window.paint_quad(fill(
                                 Bounds::new(cell(row, col), size(px(2.), metrics.height)),
@@ -706,6 +794,54 @@ impl Render for CommandEditor {
                 .size_full(),
             )
     }
+}
+
+/// Text runs for the bytes `row` of the text: highlighted ranges in their
+/// colors, the IME's marked range underlined.
+fn row_runs(
+    row: Range<usize>,
+    highlights: &[(Range<usize>, Hsla)],
+    marked: Option<Range<usize>>,
+    font: &gpui::Font,
+    foreground: Hsla,
+) -> Vec<TextRun> {
+    let mut edges = vec![row.start, row.end];
+    for range in highlights
+        .iter()
+        .map(|(range, _)| range)
+        .chain(marked.as_ref())
+    {
+        edges.extend([range.start, range.end]);
+    }
+    edges.retain(|edge| (row.start..=row.end).contains(edge));
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+        .windows(2)
+        .map(|pair| {
+            let color = highlights
+                .iter()
+                .find(|(range, _)| range.start <= pair[0] && pair[0] < range.end)
+                .map_or(foreground, |(_, color)| *color);
+            let underline = marked
+                .as_ref()
+                .is_some_and(|marked| marked.start <= pair[0] && pair[0] < marked.end);
+            run(font, pair[1] - pair[0], color, underline)
+        })
+        .collect()
+}
+
+/// The longest prefix of `text` that fits in `cols` grid columns.
+fn fit_columns(text: &str, cols: usize) -> &str {
+    let mut width = 0;
+    for (index, grapheme) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
+    {
+        width += editor_buffer::columns(grapheme);
+        if width > cols {
+            return &text[..index];
+        }
+    }
+    text
 }
 
 fn run(font: &gpui::Font, len: usize, color: Hsla, underline: bool) -> TextRun {
@@ -767,5 +903,6 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", Clear, context),
         KeyBinding::new("ctrl-d", EndOfFile, context),
         KeyBinding::new("escape", Unselect, context),
+        KeyBinding::new("ctrl-r", SearchHistory, context),
     ]
 }
