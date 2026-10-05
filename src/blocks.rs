@@ -265,6 +265,27 @@ impl BlockList {
         Ok(())
     }
 
+    /// Keep what the shell printed while starting up (a greeting, messages
+    /// from its config) as a block without a command, if there is any.
+    pub fn push_startup(&mut self, terminal: &mut Terminal<'static, 'static>) -> Result<()> {
+        let rows = LiveOutput::new()?.rows(terminal)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.blocks.push(Block {
+            command: String::new(),
+            context: self.context.clone(),
+            started: Instant::now(),
+            outcome: Some(Outcome {
+                exit_code: 0,
+                duration: Duration::ZERO,
+            }),
+            output: Output::Done(rows),
+            raw: None,
+        });
+        Ok(())
+    }
+
     /// Keep `bytes` the running command wrote, for rebuilding its rows.
     pub fn record(&mut self, bytes: &[u8]) {
         let Some(raw) = self
@@ -424,6 +445,18 @@ mod tests {
 
         list.rebuild_rows(|| Ok(terminal(10, 5))).unwrap();
         assert_eq!(list.blocks()[0].finished_rows().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn startup_output_becomes_a_block_only_when_there_is_some() {
+        let mut list = BlockList::new(10);
+        list.push_startup(&mut terminal(10, 3)).unwrap();
+        assert!(list.blocks().is_empty());
+        let mut startup = terminal(10, 3);
+        startup.vt_write(b"welcome\r\n");
+        list.push_startup(&mut startup).unwrap();
+        assert_eq!(list.blocks()[0].command, "");
+        assert!(!list.blocks()[0].is_running());
     }
 
     #[test]

@@ -26,8 +26,6 @@ pub enum ItemContent {
     /// A running command: rows that scrolled off its terminal, followed by
     /// the terminal's live screen.
     Running(Vec<Rows>),
-    /// The shell's prompt, drawn from the live terminal.
-    Prompt,
 }
 
 pub struct Item {
@@ -45,20 +43,14 @@ struct Header {
 impl Item {
     pub fn block(block: &Block, content: ItemContent) -> Self {
         Self {
-            header: Some(Header {
+            // Startup output has no command to show.
+            header: (!block.command.is_empty()).then(|| Header {
                 command: block.command.clone().into(),
                 context: block.context.clone(),
                 outcome: block.outcome,
                 failed: block.failed(),
             }),
             content,
-        }
-    }
-
-    pub fn prompt() -> Self {
-        Self {
-            header: None,
-            content: ItemContent::Prompt,
         }
     }
 
@@ -90,8 +82,8 @@ impl Palette {
     }
 }
 
-/// The block list. `live` is the frame of the terminal receiving output,
-/// painted under the running block's scrollback or as the prompt.
+/// The block list. `live` is the frame of the running command's terminal,
+/// painted under its scrollback.
 pub fn render_list(
     state: &ListState,
     items: Rc<Vec<Item>>,
@@ -119,7 +111,6 @@ fn render_item(
     let (rows, scrollback, live_frame) = match &item.content {
         ItemContent::Finished(rows) => (Some(rows.clone()), Vec::new(), None),
         ItemContent::Running(scrollback) => (None, scrollback.clone(), live),
-        ItemContent::Prompt => (None, Vec::new(), live),
     };
     let row_count = rows.as_ref().map_or(0, |rows| rows.len())
         + scrollback.iter().map(|page| page.len()).sum::<usize>()
@@ -172,24 +163,7 @@ fn render_item(
 }
 
 fn render_header(header: &Header, padding: Pixels, palette: Palette) -> AnyElement {
-    let context = &header.context;
-    let chips = context
-        .cwd
-        .as_ref()
-        .map(|cwd| chip("folder", shorten_home(cwd), palette))
-        .into_iter()
-        .chain(
-            context
-                .virtualenv
-                .as_ref()
-                .map(|venv| chip("package", venv.clone(), palette)),
-        )
-        .chain(
-            context
-                .conda_env
-                .as_ref()
-                .map(|conda| chip("flask-conical", conda.clone(), palette)),
-        );
+    let chips = chips(&header.context, None, palette);
     let outcome = header.outcome.map(|outcome| {
         let failed = outcome.exit_code != 0;
         div()
@@ -231,6 +205,33 @@ fn render_header(header: &Header, padding: Pixels, palette: Palette) -> AnyEleme
         )
         .children(outcome)
         .into_any_element()
+}
+
+/// Chips for a command's context: directory, git branch, and Python
+/// environments.
+pub fn context_chips(
+    context: &BlockContext,
+    branch: Option<&str>,
+    theme: &Theme,
+) -> Vec<AnyElement> {
+    chips(context, branch, Palette::new(theme))
+}
+
+fn chips(context: &BlockContext, branch: Option<&str>, palette: Palette) -> Vec<AnyElement> {
+    let mut chips = Vec::new();
+    if let Some(cwd) = &context.cwd {
+        chips.push(chip("folder", shorten_home(cwd), palette).into_any_element());
+    }
+    if let Some(branch) = branch {
+        chips.push(chip("git-branch", branch.to_string(), palette).into_any_element());
+    }
+    if let Some(venv) = &context.virtualenv {
+        chips.push(chip("package", venv.clone(), palette).into_any_element());
+    }
+    if let Some(conda) = &context.conda_env {
+        chips.push(chip("flask-conical", conda.clone(), palette).into_any_element());
+    }
+    chips
 }
 
 fn chip(icon_name: &'static str, label: String, palette: Palette) -> impl IntoElement {

@@ -18,6 +18,10 @@ use portable_pty::CommandBuilder;
 
 use crate::settings::SettingsStore;
 
+/// The key the scripts bind to clear the shell's line editor, sent before
+/// typing a command into it.
+pub const CLEAR_LINE_KEY: &[u8] = b"\x1b[9876~";
+
 const SCRIPTS: [(&str, &str); 3] = [
     (
         "zsh/.zshenv",

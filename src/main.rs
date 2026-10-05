@@ -4,6 +4,8 @@ mod app_menus;
 mod assets;
 mod block_view;
 mod blocks;
+mod command_editor;
+mod editor_buffer;
 mod cli;
 mod components;
 mod confirm;
@@ -154,6 +156,7 @@ fn bind_keys(cx: &mut App) {
         ));
     }
     bindings.extend(text_input::key_bindings());
+    bindings.extend(command_editor::key_bindings());
     bindings.extend(pane_group::key_bindings());
     bindings.extend(terminal_view::key_bindings());
     cx.bind_keys(bindings);

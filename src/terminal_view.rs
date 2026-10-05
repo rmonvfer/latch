@@ -34,7 +34,8 @@ use libghostty_vt::{
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
     block_view::{self, Item, ItemContent},
-    blocks::{self, BlockList},
+    command_editor::{CommandEditor, CommandEditorEvent},
+    blocks::{self, BlockContext, BlockList},
     components::{elevated_shadow, icon, icon_button},
     control,
     git::{self, DiffStats},
@@ -144,6 +145,9 @@ const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
 /// Environment variable telling programs which pane they run in.
 pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
+/// How long a command runs before the editor hides and keys go to it.
+const EDITOR_GRACE: Duration = Duration::from_millis(50);
+
 /// Most command blocks a pane keeps; older ones are dropped.
 const MAX_BLOCKS: usize = 1000;
 
@@ -193,9 +197,17 @@ pub struct TerminalView {
     /// and blocks are enabled. `terminal` then belongs to whatever is
     /// running: the current command, or the shell's prompt between them.
     blocks: Option<BlockList>,
-    /// Scroll and layout state of the block list: one item per block, plus
-    /// the prompt while no command runs.
+    /// Scroll and layout state of the block list, one item per block.
     block_list: ListState,
+    /// Where commands are typed while the shell waits at its prompt.
+    editor: Entity<CommandEditor>,
+    _editor_subscription: Subscription,
+    /// Whether the shell has drawn a prompt since starting, so injected
+    /// commands are no longer at risk of being read as replies to its
+    /// startup queries.
+    shell_ready: bool,
+    /// A command submitted before the shell was ready.
+    queued_command: Option<String>,
     /// The shell's state at its most recent prompt.
     prompt: Option<Precmd>,
     pane_id: u64,
@@ -416,6 +428,7 @@ impl TerminalView {
                         .await;
                 }
             });
+            let editor = cx.new(|cx| CommandEditor::new("Run a command", cx));
 
             Self {
                 terminal,
@@ -461,6 +474,10 @@ impl TerminalView {
                     state.set_follow_mode(FollowMode::Tail);
                     state
                 },
+                _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
+                editor,
+                shell_ready: false,
+                queued_command: None,
                 prompt: None,
                 pane_id,
                 control_token,
@@ -559,8 +576,17 @@ impl TerminalView {
             Hook::Bootstrapped(bootstrapped) => {
                 self.shell = Some(bootstrapped);
                 if SettingsStore::get(cx).command_blocks && self.blocks.is_none() {
-                    self.blocks = Some(BlockList::new(MAX_BLOCKS));
-                    self.block_list.reset(1);
+                    let mut blocks = BlockList::new(MAX_BLOCKS);
+                    if let Err(error) = blocks.push_startup(&mut self.terminal) {
+                        log::error!("failed to keep startup output: {error:#}");
+                    }
+                    self.block_list.reset(blocks.blocks().len());
+                    self.blocks = Some(blocks);
+                    // The prompt is drawn into a fresh terminal and hidden
+                    // behind the editor.
+                    if let Err(error) = self.replace_terminal(cx) {
+                        log::error!("failed to reset the terminal: {error:#}");
+                    }
                 }
             }
             Hook::Precmd(precmd) => {
@@ -568,6 +594,10 @@ impl TerminalView {
                     blocks.set_context(&precmd);
                 }
                 self.prompt = Some(precmd);
+                self.shell_ready = true;
+                if let Some(command) = self.queued_command.take() {
+                    self.inject_command(&command, cx);
+                }
             }
             Hook::Preexec { command } => {
                 if self.blocks.is_none() {
@@ -582,31 +612,30 @@ impl TerminalView {
                     return;
                 };
                 let count = blocks.blocks().len();
-                let had_prompt = blocks.running().is_none();
                 if let Err(error) = blocks.start(command) {
                     log::error!("failed to start a block: {error:#}");
                     return;
                 }
-                // The prompt item becomes the running block, and blocks
-                // beyond the cap leave from the top.
-                let replaced = usize::from(had_prompt);
-                self.block_list.splice(count..count + replaced, 1);
+                // Blocks beyond the cap leave from the top.
+                self.block_list.splice(count..count, 1);
                 let dropped = count + 1 - blocks.blocks().len();
                 if dropped > 0 {
                     self.block_list.splice(0..dropped, 0);
                 }
+                // The editor gives way to the command once it has run long
+                // enough to be more than a flicker.
+                cx.spawn(async move |view, cx| {
+                    cx.background_executor().timer(EDITOR_GRACE).await;
+                    let _ = view.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
             }
             Hook::CommandFinished { exit_code } => {
                 let Some(blocks) = &mut self.blocks else {
                     return;
                 };
-                let was_running = blocks.running().is_some();
                 if let Err(error) = blocks.finish(exit_code, &mut self.terminal) {
                     log::error!("failed to capture a block's output: {error:#}");
-                }
-                if was_running {
-                    let count = blocks.blocks().len();
-                    self.block_list.splice(count..count, 1);
                 }
                 // The next prompt is drawn into a fresh terminal.
                 if let Err(error) = self.replace_terminal(cx) {
@@ -639,11 +668,9 @@ impl TerminalView {
             };
             items.push(Item::block(block, content));
         }
-        if blocks.running().is_none() {
-            items.push(Item::prompt());
-        }
-        // The last item is drawn from the live terminal and grows with it.
-        if let Some(last) = items.len().checked_sub(1) {
+        // A running block is drawn from the live terminal and grows with it.
+        if blocks.running().is_some() {
+            let last = items.len() - 1;
             self.block_list.remeasure_items(last..items.len());
         }
         Some(items)
@@ -670,6 +697,96 @@ impl TerminalView {
             log::error!("failed to rebuild blocks: {error:#}");
         }
         self.block_list.remeasure();
+    }
+
+    /// Whether the editor is shown: in block mode, unless a command has
+    /// been running past the grace period and takes the keyboard.
+    fn shows_editor(&self) -> bool {
+        self.shows_blocks()
+            && self
+                .blocks
+                .as_ref()
+                .and_then(BlockList::running)
+                .is_none_or(|block| block.started.elapsed() < EDITOR_GRACE)
+    }
+
+    fn on_editor_event(
+        &mut self,
+        _: Entity<CommandEditor>,
+        event: &CommandEditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            CommandEditorEvent::Submitted(command) => {
+                if command.trim().is_empty() {
+                    return;
+                }
+                if self.shell_ready {
+                    self.inject_command(command, cx);
+                } else {
+                    self.queued_command = Some(command.clone());
+                }
+            }
+            CommandEditorEvent::EndOfFile => self.write_input(b"\x04", cx),
+            CommandEditorEvent::HistoryPrevious
+            | CommandEditorEvent::HistoryNext
+            | CommandEditorEvent::Changed => {}
+        }
+    }
+
+    /// The editor with the shell's context above it.
+    fn render_editor_panel(&self, metrics: CellMetrics, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let context = self
+            .prompt
+            .as_ref()
+            .map(BlockContext::from)
+            .unwrap_or_default();
+        let chips = block_view::context_chips(
+            &context,
+            self.process_metadata.branch.as_deref(),
+            theme,
+        );
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .px(metrics.padding)
+            .py_2()
+            .border_t_1()
+            .border_color(theme.border_variant)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .font_family(theme::UI_FONT_FAMILY)
+                    .children(chips),
+            )
+            .child(self.editor.clone())
+            .into_any_element()
+    }
+
+    /// Run `command` in the shell: clear its line editor, paste the
+    /// command, and press Enter.
+    fn inject_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+        let mut data = command.as_bytes().to_vec();
+        let mut encoded = vec![0u8; data.len() + 32];
+        let len = match paste::encode(&mut data, bracketed, &mut encoded) {
+            Ok(len) => len,
+            Err(error) => {
+                log::warn!("failed to encode a command: {error}");
+                return;
+            }
+        };
+        let mut bytes = shell_integration::CLEAR_LINE_KEY.to_vec();
+        bytes.extend_from_slice(&encoded[..len]);
+        bytes.push(b'\r');
+        self.write_input(&bytes, cx);
     }
 
     /// Whether the pane shows its block list rather than a single terminal
@@ -1328,6 +1445,10 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.shows_editor() {
+            window.focus(&self.editor.focus_handle(cx), cx);
+            return;
+        }
         window.focus(&self.focus_handle, cx);
         if self.shows_blocks() {
             return;
@@ -1609,6 +1730,16 @@ impl Render for TerminalView {
         let metrics = *self
             .metrics
             .get_or_insert_with(|| CellMetrics::measure(SettingsStore::get(cx), window));
+        // Keys go to the editor while it shows and to the terminal
+        // otherwise, wherever the pane's focus was put.
+        let editor_focus = self.editor.focus_handle(cx);
+        if self.shows_editor() {
+            if self.focus_handle.is_focused(window) {
+                window.focus(&editor_focus, cx);
+            }
+        } else if editor_focus.is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
         let focused = self.focus_handle.is_focused(window);
         let block_items = self.block_items();
         let frame = match self.renderer.build_frame(&self.terminal, focused) {
@@ -1642,7 +1773,18 @@ impl Render for TerminalView {
                     metrics,
                     cx.theme(),
                 );
-                (Screen::Blocks(background), Some(list))
+                let editor_panel = self
+                    .shows_editor()
+                    .then(|| self.render_editor_panel(metrics, cx));
+                let content = div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(list))
+                    .children(editor_panel)
+                    .into_any_element();
+                (Screen::Blocks(background), Some(content))
             }
             (None, frame) => (Screen::Terminal(frame), None),
         };
