@@ -170,18 +170,6 @@ fn hook_payload(bytes: &[u8], from: usize) -> HookPayload {
     HookPayload::Incomplete(bytes.len())
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let mut index = 0;
-    while let Some(offset) = haystack[index..].iter().position(|byte| *byte == needle[0]) {
-        index += offset;
-        if haystack[index..].starts_with(needle) {
-            return Some(index);
-        }
-        index += 1;
-    }
-    None
-}
-
 /// Length of the body and of its terminator (BEL or ESC \).
 fn terminator(bytes: &[u8]) -> Option<(usize, usize)> {
     for (index, byte) in bytes.iter().enumerate() {

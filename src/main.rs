@@ -2,6 +2,8 @@ mod agent_badge;
 mod agents;
 mod app_menus;
 mod assets;
+mod block_view;
+mod blocks;
 mod cli;
 mod components;
 mod confirm;

@@ -9,10 +9,10 @@ use std::{
 use anyhow::Result;
 use gpui::{
     AnyElement, App, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, KeyUpEvent, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, actions,
-    canvas, div, prelude::*, px,
+    EventEmitter, FocusHandle, Focusable, FollowMode, KeyBinding, KeyDownEvent, KeyUpEvent,
+    ListAlignment, ListState, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString,
+    Subscription, Task, WeakEntity, Window, actions, canvas, div, fill, prelude::*, px,
 };
 use libghostty_vt::{
     Terminal,
@@ -33,10 +33,12 @@ use libghostty_vt::{
 
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
+    block_view::{self, Item, ItemContent},
+    blocks::{self, BlockList},
     components::{elevated_shadow, icon, icon_button},
     control,
     git::{self, DiffStats},
-    grid::{CellMetrics, GridRenderer},
+    grid::{CellMetrics, Frame, GridRenderer},
     hooks::{Bootstrapped, Hook, Precmd},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
@@ -142,6 +144,9 @@ const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
 /// Environment variable telling programs which pane they run in.
 pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
+/// Most command blocks a pane keeps; older ones are dropped.
+const MAX_BLOCKS: usize = 1000;
+
 /// Environment variable carrying the id shell integration stamps on hooks.
 pub const SESSION_ID_VARIABLE: &str = "TERMINAL_SESSION_ID";
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
@@ -184,6 +189,13 @@ pub struct TerminalView {
     pending_startup: Option<String>,
     /// What shell integration reported when the shell finished starting.
     shell: Option<Bootstrapped>,
+    /// The pane's command blocks, once shell integration has bootstrapped
+    /// and blocks are enabled. `terminal` then belongs to whatever is
+    /// running: the current command, or the shell's prompt between them.
+    blocks: Option<BlockList>,
+    /// Scroll and layout state of the block list: one item per block, plus
+    /// the prompt while no command runs.
+    block_list: ListState,
     /// The shell's state at its most recent prompt.
     prompt: Option<Precmd>,
     pane_id: u64,
@@ -297,14 +309,8 @@ impl TerminalView {
         let initial_cwd = pty.initial_cwd().map(Path::to_path_buf);
         let dimensions = Rc::new(Cell::new(initial));
 
-        let mut terminal = Terminal::new(Options {
-            cols: initial.cols,
-            rows: initial.rows,
-            max_scrollback: SCROLLBACK_LINES,
-        })?;
-        configure_colors(&mut terminal, &cx.theme().terminal)?;
         let bell = Rc::new(Cell::new(false));
-        register_effects(&mut terminal, &pty, dimensions.clone(), bell.clone())?;
+        let terminal = new_terminal(&pty, dimensions.clone(), bell.clone(), &cx.theme().terminal)?;
 
         let renderer = GridRenderer::new()?;
         let keys = KeyInput {
@@ -449,6 +455,12 @@ impl TerminalView {
                 activity: Activity::default(),
                 pending_startup: startup.map(str::to_string),
                 shell: None,
+                blocks: None,
+                block_list: {
+                    let state = ListState::new(0, ListAlignment::Top, px(400.));
+                    state.set_follow_mode(FollowMode::Tail);
+                    state
+                },
                 prompt: None,
                 pane_id,
                 control_token,
@@ -536,20 +548,124 @@ impl TerminalView {
         }
     }
 
-    fn apply_hook(&mut self, hook: Hook) {
+    fn apply_hook(&mut self, hook: Hook, cx: &mut Context<Self>) {
         match hook {
-            Hook::Bootstrapped(bootstrapped) => self.shell = Some(bootstrapped),
-            Hook::Precmd(precmd) => self.prompt = Some(precmd),
-            Hook::Preexec { .. } | Hook::CommandFinished { .. } => {}
+            Hook::Bootstrapped(bootstrapped) => {
+                self.shell = Some(bootstrapped);
+                if SettingsStore::get(cx).command_blocks && self.blocks.is_none() {
+                    self.blocks = Some(BlockList::new(MAX_BLOCKS));
+                    self.block_list.reset(1);
+                }
+            }
+            Hook::Precmd(precmd) => {
+                if let Some(blocks) = &mut self.blocks {
+                    blocks.set_context(&precmd);
+                }
+                self.prompt = Some(precmd);
+            }
+            Hook::Preexec { command } => {
+                if self.blocks.is_none() {
+                    return;
+                }
+                // The command's output goes to a terminal of its own.
+                if let Err(error) = self.replace_terminal(cx) {
+                    log::error!("failed to start a block: {error:#}");
+                    return;
+                }
+                let Some(blocks) = &mut self.blocks else {
+                    return;
+                };
+                let count = blocks.blocks().len();
+                let had_prompt = blocks.running().is_none();
+                if let Err(error) = blocks.start(command) {
+                    log::error!("failed to start a block: {error:#}");
+                    return;
+                }
+                // The prompt item becomes the running block, and blocks
+                // beyond the cap leave from the top.
+                let replaced = usize::from(had_prompt);
+                self.block_list.splice(count..count + replaced, 1);
+                let dropped = count + 1 - blocks.blocks().len();
+                if dropped > 0 {
+                    self.block_list.splice(0..dropped, 0);
+                }
+            }
+            Hook::CommandFinished { exit_code } => {
+                let Some(blocks) = &mut self.blocks else {
+                    return;
+                };
+                let was_running = blocks.running().is_some();
+                if let Err(error) = blocks.finish(exit_code, &mut self.terminal) {
+                    log::error!("failed to capture a block's output: {error:#}");
+                }
+                if was_running {
+                    let count = blocks.blocks().len();
+                    self.block_list.splice(count..count, 1);
+                }
+                // The next prompt is drawn into a fresh terminal.
+                if let Err(error) = self.replace_terminal(cx) {
+                    log::error!("failed to reset the terminal: {error:#}");
+                }
+            }
         }
+    }
+
+    /// The list items to show, when the pane shows blocks. Capturing a
+    /// running block's scrollback leaves its terminal scrolled to the
+    /// bottom, ready for its live screen to be drawn.
+    fn block_items(&mut self) -> Option<Vec<Item>> {
+        if !self.shows_blocks() {
+            return None;
+        }
+        let blocks = self.blocks.as_mut()?;
+        let mut items = Vec::with_capacity(blocks.blocks().len() + 1);
+        for block in blocks.blocks_mut() {
+            let content = if block.is_running() {
+                match block.scrollback(&mut self.terminal) {
+                    Ok(pages) => ItemContent::Running(pages),
+                    Err(error) => {
+                        log::error!("failed to read a block's output: {error:#}");
+                        ItemContent::Running(Vec::new())
+                    }
+                }
+            } else {
+                ItemContent::Finished(block.finished_rows().unwrap_or_default())
+            };
+            items.push(Item::block(block, content));
+        }
+        if blocks.running().is_none() {
+            items.push(Item::prompt());
+        }
+        // The last item is drawn from the live terminal and grows with it.
+        if let Some(last) = items.len().checked_sub(1) {
+            self.block_list.remeasure_items(last..items.len());
+        }
+        Some(items)
+    }
+
+    /// Whether the pane shows its block list rather than a single terminal
+    /// screen, which full-screen programs still get.
+    fn shows_blocks(&self) -> bool {
+        self.blocks.is_some() && !blocks::is_full_screen(&self.terminal)
+    }
+
+    /// Swap in a fresh terminal at the pane's size and theme.
+    fn replace_terminal(&mut self, cx: &App) -> Result<()> {
+        self.terminal = new_terminal(
+            &self.pty,
+            self.dimensions.clone(),
+            self.bell.clone(),
+            &cx.theme().terminal,
+        )?;
+        Ok(())
     }
 
     /// Returns whether the command state changed.
     fn apply_osc_event(&mut self, event: OscEvent, cx: &mut Context<Self>) -> bool {
         match event {
             OscEvent::Hook(hook) => {
-                self.apply_hook(hook);
-                false
+                self.apply_hook(hook, cx);
+                true
             }
             OscEvent::PromptStarted => {
                 self.send_startup_command(cx);
@@ -735,6 +851,9 @@ impl TerminalView {
         }
         self.dimensions.set(next);
         self.pty.resize(next);
+        if let Some(blocks) = &mut self.blocks {
+            blocks.terminal_resized();
+        }
         cx.notify();
     }
 
@@ -1177,6 +1296,9 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
+        if self.shows_blocks() {
+            return;
+        }
         let Some(bounds) = self.bounds else {
             return;
         };
@@ -1226,6 +1348,9 @@ impl TerminalView {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.shows_blocks() {
+            return;
+        }
         let Some(bounds) = self.bounds else {
             return;
         };
@@ -1261,6 +1386,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.shows_blocks() {
+            return;
+        }
         let Some(bounds) = self.bounds else {
             return;
         };
@@ -1321,6 +1449,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The block list scrolls itself.
+        if self.shows_blocks() {
+            return;
+        }
         let Some(metrics) = self.metrics else {
             return;
         };
@@ -1445,6 +1577,7 @@ impl Render for TerminalView {
             .metrics
             .get_or_insert_with(|| CellMetrics::measure(SettingsStore::get(cx), window));
         let focused = self.focus_handle.is_focused(window);
+        let block_items = self.block_items();
         let frame = match self.renderer.build_frame(&self.terminal, focused) {
             Ok(mut frame) => {
                 if let Some(link) = &self.link_hover {
@@ -1461,6 +1594,24 @@ impl Render for TerminalView {
                 log::error!("failed to build terminal frame: {error}");
                 None
             }
+        };
+        // With blocks, the canvas only sizes the terminal and paints the
+        // background; the list paints the content.
+        let (screen, block_list) = match (block_items, frame) {
+            (Some(items), frame) => {
+                let background = frame
+                    .as_ref()
+                    .map_or(cx.theme().terminal_background(), |frame| frame.background);
+                let list = block_view::render_list(
+                    &self.block_list,
+                    Rc::new(items),
+                    frame.map(Rc::new),
+                    metrics,
+                    cx.theme(),
+                );
+                (Screen::Blocks(background), Some(list))
+            }
+            (None, frame) => (Screen::Terminal(frame), None),
         };
         let view = cx.entity();
         let search_bar = self
@@ -1506,17 +1657,27 @@ impl Render for TerminalView {
                     move |bounds, _window, cx| {
                         view.update(cx, |view, cx| view.fit_to_bounds(bounds, metrics, cx));
                     },
-                    move |bounds, (), window, cx| {
-                        if let Some(frame) = frame {
-                            frame.paint(bounds, metrics, window, cx);
-                        }
+                    move |bounds, (), window, cx| match screen {
+                        Screen::Terminal(Some(frame)) => frame.paint(bounds, metrics, window, cx),
+                        Screen::Terminal(None) => {}
+                        Screen::Blocks(background) => window.paint_quad(fill(bounds, background)),
                     },
                 )
+                .absolute()
                 .size_full(),
             )
+            .children(block_list)
             .children(search_bar)
             .children(link_tooltip)
     }
+}
+
+/// What the pane's canvas paints.
+enum Screen {
+    /// A single terminal screen.
+    Terminal(Option<Frame>),
+    /// The background behind the block list, in this color.
+    Blocks(gpui::Hsla),
 }
 
 /// Key bindings for the find bar.
@@ -1529,6 +1690,31 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-g", SearchPrevious, Some("Terminal")),
         KeyBinding::new("shift-enter", SearchPrevious, Some(SEARCH_CONTEXT)),
     ]
+}
+
+/// A terminal at the pane's current size that answers program queries
+/// through `pty` and reports the bell through `bell`.
+fn new_terminal(
+    pty: &Pty,
+    dimensions: Rc<Cell<PtyDimensions>>,
+    bell: Rc<Cell<bool>>,
+    colors: &TerminalColors,
+) -> Result<Terminal<'static, 'static>> {
+    let size = dimensions.get();
+    let mut terminal = Terminal::new(Options {
+        cols: size.cols,
+        rows: size.rows,
+        max_scrollback: SCROLLBACK_LINES,
+    })?;
+    terminal.resize(
+        size.cols,
+        size.rows,
+        size.cell_width as u32,
+        size.cell_height as u32,
+    )?;
+    configure_colors(&mut terminal, colors)?;
+    register_effects(&mut terminal, pty, dimensions, bell)?;
+    Ok(terminal)
 }
 
 fn configure_colors(
