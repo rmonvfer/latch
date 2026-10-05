@@ -6,10 +6,10 @@ use std::{
     fs,
     ops::Range,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
-use crate::hooks::Bootstrapped;
+use crate::{hooks::Bootstrapped, links};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
@@ -101,10 +101,50 @@ impl CommandIndex {
                     None => PathBuf::from(word),
                 }),
             };
-            return path.is_some_and(|path| is_executable(&path));
+            return path.is_some_and(|path| is_runnable_path(&normalize(&path)));
         }
         self.names.contains(word)
     }
+}
+
+/// `path` with `.` and `..` resolved without touching the file system.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// Whether `path` names something runnable. This runs as the user types,
+/// so it must never reach the network: network locations are not checked
+/// and symlinks are not followed. A path through a symlink is assumed
+/// runnable rather than shown as an error.
+fn is_runnable_path(path: &Path) -> bool {
+    if !path.is_absolute() || links::is_network_location(path) {
+        return false;
+    }
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        let Ok(metadata) = fs::symlink_metadata(&prefix) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+        if prefix.as_path() == path {
+            return metadata.is_dir()
+                || (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+        }
+    }
+    false
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -297,5 +337,14 @@ mod tests {
         let index = CommandIndex::default();
         let tokens = highlight("/bin/ls -l", &index, None);
         assert_eq!(tokens[0].kind, TokenKind::Command);
+        assert!(index.knows("../../bin/ls", Some(Path::new("/usr/local"))));
+    }
+
+    #[test]
+    fn network_paths_are_never_checked() {
+        let index = CommandIndex::default();
+        assert!(!index.knows("/net/server/tool", None));
+        assert!(!index.knows("../../net/server/tool", Some(Path::new("/tmp/a"))));
+        assert!(!index.knows("//server/share/tool", None));
     }
 }
