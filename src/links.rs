@@ -151,14 +151,34 @@ pub fn open(target: &LinkTarget, cx: &App) {
 }
 
 fn open_path(path: &Path, cx: &App) {
+    match decide(path) {
+        Some(Decision::Open(real)) => cx.open_with_system(&real),
+        Some(Decision::Reveal(real)) => cx.reveal_path(&real),
+        None => {}
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Open(PathBuf),
+    Reveal(PathBuf),
+}
+
+/// How to handle a clicked path. The decision is made on, and applied to,
+/// the real file: a symlink's own name says nothing about its target.
+fn decide(path: &Path) -> Option<Decision> {
     if is_network_location(path) {
-        return;
+        return None;
     }
-    if is_safe_to_open(path) {
-        cx.open_with_system(path);
+    let real = std::fs::canonicalize(path).ok()?;
+    if is_network_location(&real) {
+        return None;
+    }
+    Some(if is_safe_to_open(&real) {
+        Decision::Open(real)
     } else {
-        cx.reveal_path(path);
-    }
+        Decision::Reveal(real)
+    })
 }
 
 /// File types that open in a viewer or editor rather than running anything.
@@ -169,16 +189,18 @@ const OPENABLE_EXTENSIONS: [&str; 52] = [
     "lua", "sql", "proto", "diff", "patch", "png", "jpg", "jpeg", "gif", "webp", "pdf", "svg",
 ];
 
+/// Whether a resolved (symlink-free) path may be opened with the system.
 fn is_safe_to_open(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
     let extension = path
         .extension()
         .map(|extension| extension.to_string_lossy().to_lowercase());
     if meta.is_dir() {
-        // Packages such as Foo.app are directories with an extension.
-        return extension.is_none();
+        // Packages such as Foo.app are directories with an extension or a
+        // bundle manifest; opening one launches it.
+        return extension.is_none() && !path.join("Contents/Info.plist").exists();
     }
     let executable = meta.permissions().mode() & 0o111 != 0;
     meta.is_file()
@@ -269,6 +291,17 @@ mod tests {
         assert!(!is_safe_to_open(&dir.join("plain")));
         assert!(!is_safe_to_open(&executable));
         assert!(!is_safe_to_open(Path::new("/bin/ls")));
+
+        // A link with a harmless name is judged by what it points to.
+        let disguised = dir.join("readme.md");
+        std::os::unix::fs::symlink(dir.join("Tool.app"), &disguised).unwrap();
+        let real_tool = dir.join("Tool.app").canonicalize().unwrap();
+        assert_eq!(decide(&disguised), Some(Decision::Reveal(real_tool)));
+
+        // A bundle without an extension is still a bundle.
+        fs::create_dir_all(dir.join("Sneaky/Contents")).unwrap();
+        fs::write(dir.join("Sneaky/Contents/Info.plist"), "x").unwrap();
+        assert!(!is_safe_to_open(&dir.join("Sneaky")));
         fs::remove_dir_all(&dir).unwrap();
     }
 
