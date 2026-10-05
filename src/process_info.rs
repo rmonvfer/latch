@@ -16,6 +16,51 @@ pub fn process_name(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&buffer[..len as usize]).into_owned())
 }
 
+/// The parent of a running process.
+#[cfg(target_os = "macos")]
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a zeroed proc_bsdinfo of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole struct.
+    let parent = unsafe { info.assume_init() }.pbi_ppid as i32;
+    (parent > 0).then_some(parent)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|parent: &i32| *parent > 0)
+}
+
+/// The process and its ancestors, nearest first.
+pub fn ancestry(pid: i32) -> Vec<i32> {
+    let mut chain = vec![pid];
+    while let Some(parent) = chain.last().and_then(|pid| parent_pid(*pid)) {
+        if chain.contains(&parent) || chain.len() > 64 {
+            break;
+        }
+        chain.push(parent);
+    }
+    chain
+}
+
 /// The executable path and arguments of a running process.
 #[cfg(target_os = "macos")]
 pub fn process_args(pid: i32) -> Option<Vec<String>> {
@@ -198,6 +243,14 @@ mod tests {
             parse_procargs(&raw).unwrap(),
             vec!["/usr/local/bin/node", "node", "/opt/bin/claude"]
         );
+    }
+
+    #[test]
+    fn ancestry_reaches_this_process_parent() {
+        let pid = std::process::id() as i32;
+        let chain = ancestry(pid);
+        assert_eq!(chain[0], pid);
+        assert_eq!(chain.get(1).copied(), parent_pid(pid));
     }
 
     #[test]

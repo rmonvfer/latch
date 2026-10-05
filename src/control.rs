@@ -2,10 +2,14 @@
 //! the MCP server, scripts, agents) list, open, drive, and read tabs.
 //!
 //! Requests and replies are single JSON lines. The socket is created
-//! owner-only and connections from other users are refused, since sending
-//! input to a shell amounts to running commands.
+//! owner-only and connections from other users are refused. Anything
+//! beyond listing tabs (reading output, typing, opening or closing tabs)
+//! needs the user's approval for the calling program, since a sandboxed
+//! process able to reach the socket could otherwise run commands in an
+//! unsandboxed shell or read other tabs.
 
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
     os::{
@@ -21,7 +25,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use gpui::{App, AsyncApp, Context, Entity, Window, WindowHandle};
+use gpui::{App, AsyncApp, Context, Entity, PromptLevel, Window, WindowHandle};
 use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +33,7 @@ use serde_json::{Value, json};
 use crate::{
     agent_badge, notifications,
     pane_tree::Axis,
+    process_info,
     settings::SettingsStore,
     tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
@@ -158,7 +163,22 @@ pub fn configure_command(command: &mut CommandBuilder, cx: &App) {
     }
 }
 
-type Pending = (Request, mpsc::Sender<Result<Value, String>>);
+type Pending = (Request, Option<i32>, mpsc::Sender<Result<Value, String>>);
+
+impl Request {
+    /// Listing tabs reveals only titles and directories; everything else
+    /// reads terminal contents or acts on the user's behalf.
+    fn needs_approval(&self) -> bool {
+        !matches!(self, Request::ListTabs)
+    }
+}
+
+/// Who is calling: the program, and the tab it runs in if any.
+struct Client {
+    /// Approval is remembered under this key for the app's lifetime.
+    key: String,
+    description: String,
+}
 
 /// Start serving the control API for the workspace in `window`.
 pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
@@ -186,7 +206,51 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
     }
 
     cx.spawn(async move |cx: &mut AsyncApp| {
-        while let Ok((request, reply)) = requests_rx.recv().await {
+        let mut decisions: HashMap<String, bool> = HashMap::new();
+        while let Ok((request, peer, reply)) = requests_rx.recv().await {
+            if request.needs_approval() {
+                let client = cx
+                    .update(|cx| {
+                        window.update(cx, |workspace, _, cx| workspace.identify_client(peer, cx))
+                    })
+                    .ok();
+                let Some(client) = client else {
+                    let _ = reply.send(Err("the window is closed".to_string()));
+                    continue;
+                };
+                let allowed = match decisions.get(&client.key) {
+                    Some(allowed) => *allowed,
+                    None => {
+                        let answer = cx.update(|cx| {
+                            window.update(cx, |_, window, cx| {
+                                let detail = format!(
+                                    "{} wants to control your terminals: read their output, type into them, and open or close tabs.",
+                                    client.description
+                                );
+                                window.prompt(
+                                    PromptLevel::Warning,
+                                    "Allow terminal control?",
+                                    Some(&detail),
+                                    &["Allow", "Deny"],
+                                    cx,
+                                )
+                            })
+                        });
+                        let allowed = match answer {
+                            Ok(answer) => answer.await == Ok(0),
+                            Err(_) => false,
+                        };
+                        decisions.insert(client.key, allowed);
+                        allowed
+                    }
+                };
+                if !allowed {
+                    let _ = reply.send(Err(
+                        "the user denied terminal control to this program".to_string(),
+                    ));
+                    continue;
+                }
+            }
             let result = cx
                 .update(|cx| {
                     window.update(cx, |workspace, window, cx| {
@@ -266,7 +330,26 @@ fn same_user(stream: &UnixStream) -> bool {
     result == 0 && uid == unsafe { libc::getuid() }
 }
 
+/// The process on the other end of a local socket.
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    let mut pid: libc::pid_t = 0;
+    let mut size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: the descriptor is a live socket and `pid`/`size` describe a
+    // valid buffer for LOCAL_PEERPID.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut size,
+        )
+    };
+    (result == 0 && pid > 0).then_some(pid)
+}
+
 fn serve_connection(stream: UnixStream, requests: async_channel::Sender<Pending>) {
+    let peer = peer_pid(&stream);
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
@@ -281,7 +364,7 @@ fn serve_connection(stream: UnixStream, requests: async_channel::Sender<Pending>
             Ok(envelope) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let outcome = requests
-                    .send_blocking((envelope.request, reply_tx))
+                    .send_blocking((envelope.request, peer, reply_tx))
                     .map_err(|_| "the app is shutting down".to_string())
                     .and_then(|_| {
                         reply_rx
@@ -343,6 +426,47 @@ pub fn call(request: Request) -> Result<Value> {
 }
 
 impl Workspace {
+    /// Describe a calling process by name and the tab it runs in, found by
+    /// walking up its parents to a pane's shell.
+    fn identify_client(&self, pid: Option<i32>, cx: &App) -> Client {
+        let Some(pid) = pid else {
+            return Client {
+                key: "unknown".to_string(),
+                description: "An unidentified program".to_string(),
+            };
+        };
+        let name = process_info::process_name(pid).unwrap_or_else(|| format!("process {pid}"));
+        let executable = process_info::process_args(pid)
+            .and_then(|args| args.into_iter().next())
+            .unwrap_or_else(|| name.clone());
+        let ancestry = process_info::ancestry(pid);
+        let pane = self.layout.ordered_tabs().into_iter().find_map(|tab| {
+            let panes = self.panes_of(tab)?;
+            panes.read(cx).views().into_iter().find_map(|view| {
+                let shell = view.read(cx).shell_pid()?;
+                ancestry
+                    .contains(&shell)
+                    .then(|| (tab, view.read(cx).pane_id()))
+            })
+        });
+        match pane {
+            Some((tab, pane_id)) => {
+                let title = self
+                    .display(tab, cx)
+                    .map(|display| display.title.to_string())
+                    .unwrap_or_default();
+                Client {
+                    key: format!("pane:{pane_id}:{executable}"),
+                    description: format!("“{name}” in the tab “{title}”"),
+                }
+            }
+            None => Client {
+                key: format!("process:{executable}"),
+                description: format!("“{name}”, running outside this app,"),
+            },
+        }
+    }
+
     pub(crate) fn handle_control(
         &mut self,
         request: Request,
@@ -564,6 +688,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_listing_is_free() {
+        assert!(!Request::ListTabs.needs_approval());
+        assert!(
+            Request::ReadOutput {
+                target: PaneTarget::default(),
+                lines: 1
+            }
+            .needs_approval()
+        );
+        assert!(Request::FocusTab { tab: 1 }.needs_approval());
+    }
+
+    #[test]
     fn requests_use_method_and_params() {
         let envelope = Envelope {
             id: 7,
@@ -597,7 +734,8 @@ mod tests {
         let (requests_tx, requests_rx) = async_channel::unbounded::<Pending>();
         thread::spawn(move || accept_connections(listener, requests_tx));
         thread::spawn(move || {
-            while let Ok((request, reply)) = requests_rx.recv_blocking() {
+            while let Ok((request, peer, reply)) = requests_rx.recv_blocking() {
+                assert_eq!(peer, Some(std::process::id() as i32));
                 let _ = reply.send(match request {
                     Request::ListTabs => Ok(json!({ "tabs": [] })),
                     _ => Err("unsupported".to_string()),

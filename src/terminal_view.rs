@@ -451,6 +451,11 @@ impl TerminalView {
     }
 
     /// Where the terminal was last laid out, in window coordinates.
+    /// The process id of the pane's shell.
+    pub fn shell_pid(&self) -> Option<i32> {
+        self.pty.shell_pid()
+    }
+
     /// Identifies this pane to the control API for the app's lifetime.
     pub fn pane_id(&self) -> u64 {
         self.pane_id
