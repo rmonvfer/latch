@@ -35,6 +35,7 @@ actions!(
     [
         NewTab,
         CloseTab,
+        CloseWindow,
         NextTab,
         PreviousTab,
         ToggleSidebar,
@@ -52,6 +53,11 @@ fn clamp_sidebar_width(width: Pixels) -> Pixels {
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct ActivateTab(pub usize);
+
+/// Open a tab running the agent profile at the given index in settings.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct NewAgent(pub usize);
 
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Commands running at least this long notify when they finish.
@@ -975,6 +981,13 @@ impl Workspace {
         self.new_tab_in(group, window, cx);
     }
 
+    fn new_agent(&mut self, action: &NewAgent, window: &mut Window, cx: &mut Context<Self>) {
+        let profile = SettingsStore::get(cx).agent_profiles.get(action.0).cloned();
+        if let Some(profile) = profile {
+            self.open_agent(&profile, window, cx);
+        }
+    }
+
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.active
             && !self.layout.style(id).pinned
@@ -1047,6 +1060,12 @@ impl Workspace {
             window.remove_window();
         });
         false
+    }
+
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.should_close_window(window, cx) {
+            window.remove_window();
+        }
     }
 
     fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1283,7 +1302,9 @@ impl Render for Workspace {
             .text_color(theme.text)
             .font_family(theme::UI_FONT_FAMILY)
             .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::new_agent))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::activate_tab))

@@ -1,5 +1,6 @@
 mod agent_badge;
 mod agents;
+mod app_menus;
 mod assets;
 mod components;
 mod confirm;
@@ -28,18 +29,19 @@ mod theme;
 mod workspace;
 
 use gpui::{
-    App, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point,
-    prelude::*, px, size,
+    App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
+    size,
 };
 use gpui_platform::application;
 
 use crate::{
+    app_menus::{DecreaseFontSize, Hide, HideOthers, IncreaseFontSize, Minimize, ResetFontSize},
     assets::Assets,
     settings::SettingsStore,
     terminal_view::{ClearScrollback, Copy, Paste, SelectAll},
     workspace::{
-        ActivateTab, CloseTab, NewTab, NextTab, OpenSettings, PreviousTab, Quit, RenameTab,
-        ToggleSidebar, Workspace,
+        ActivateTab, CloseTab, CloseWindow, NewTab, NextTab, OpenSettings, PreviousTab, Quit,
+        RenameTab, ToggleSidebar, Workspace,
     },
 };
 
@@ -58,20 +60,7 @@ fn main() {
         shell_integration::ShellIntegration::init(cx);
         bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: env!("CARGO_PKG_NAME").into(),
-            items: vec![
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("New Tab", NewTab),
-                MenuItem::action("Rename Tab", RenameTab),
-                MenuItem::action("Close Tab", CloseTab),
-                MenuItem::action("Toggle Sidebar", ToggleSidebar),
-                MenuItem::separator(),
-                MenuItem::action("Quit", Quit),
-            ],
-            disabled: false,
-        }]);
+        app_menus::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -122,8 +111,16 @@ fn main() {
 fn bind_keys(cx: &mut App) {
     let mut bindings = vec![
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("cmd-alt-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-=", IncreaseFontSize, None),
+        KeyBinding::new("cmd--", DecreaseFontSize, None),
+        KeyBinding::new("cmd-0", ResetFontSize, None),
         KeyBinding::new("cmd-t", NewTab, Some("Workspace")),
+        KeyBinding::new("cmd-alt-w", CloseTab, Some("Workspace")),
         KeyBinding::new("cmd-w", CloseTab, Some("Workspace")),
+        KeyBinding::new("cmd-shift-w", CloseWindow, Some("Workspace")),
         KeyBinding::new("cmd-}", NextTab, Some("Workspace")),
         KeyBinding::new("cmd-{", PreviousTab, Some("Workspace")),
         KeyBinding::new("ctrl-tab", NextTab, Some("Workspace")),
