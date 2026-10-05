@@ -1233,6 +1233,18 @@ const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 5] = [
                 action: "Search history",
             },
             Shortcut {
+                keys: &[&["Tab"]],
+                action: "Complete, or next completion",
+            },
+            Shortcut {
+                keys: &[&["⇧", "Tab"]],
+                action: "Previous completion",
+            },
+            Shortcut {
+                keys: &[&["→"], &["End"]],
+                action: "Accept the suggestion",
+            },
+            Shortcut {
                 keys: &[&["⌃", "C"]],
                 action: "Clear the command",
             },
