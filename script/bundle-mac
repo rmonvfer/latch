@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Build the app and wrap it in a macOS .app bundle. Running from the bundle
+# is what lets macOS deliver the app's notifications.
+#
+#   script/bundle-mac            release build → target/release/Terminal.app
+#   script/bundle-mac --debug    debug build   → target/debug/Terminal.app
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+profile=release
+cargo_flags=(--release)
+if [[ "${1:-}" == "--debug" ]]; then
+  profile=debug
+  cargo_flags=()
+fi
+
+cargo build "${cargo_flags[@]+"${cargo_flags[@]}"}"
+
+name="Terminal"
+identifier="me.egrati.terminal"
+executable="terminal"
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+bundle="target/$profile/$name.app"
+
+rm -rf "$bundle"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+cp "target/$profile/$executable" "$bundle/Contents/MacOS/$executable"
+
+cat > "$bundle/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>$name</string>
+  <key>CFBundleDisplayName</key><string>$name</string>
+  <key>CFBundleIdentifier</key><string>$identifier</string>
+  <key>CFBundleExecutable</key><string>$executable</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$version</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+
+# Ad-hoc signature so macOS treats the bundle as one app across launches.
+codesign --force --deep --sign - "$bundle" >/dev/null
+echo "$bundle"

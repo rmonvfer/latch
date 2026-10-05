@@ -1,8 +1,11 @@
 mod assets;
 mod components;
+mod confirm;
 mod grid;
 mod input;
 mod links;
+mod notifications;
+mod osc;
 mod pane_group;
 mod pane_tree;
 mod process_info;
@@ -36,10 +39,15 @@ use crate::{
     },
 };
 
+/// Bundle identifier, matching the app bundle built by script/bundle-mac.
+const APP_IDENTIFIER: &str = "me.egrati.terminal";
+const APP_NAME: &str = "Terminal";
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     application().with_assets(Assets).run(|cx: &mut App| {
+        cx.set_app_identity(APP_IDENTIFIER, APP_NAME);
         assets::load_fonts(cx);
         SettingsStore::init(cx);
         theme::init(cx);
@@ -82,10 +90,26 @@ fn main() {
             },
             |window, cx| cx.new(|cx| Workspace::new(window, cx)),
         );
-        if let Err(error) = opened {
-            log::error!("failed to open window: {error:#}");
-            cx.quit();
-            return;
+        let handle = match opened {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::error!("failed to open window: {error:#}");
+                cx.quit();
+                return;
+            }
+        };
+        let workspace = handle.update(cx, |_, window, cx| {
+            let workspace = cx.entity();
+            let guarded = workspace.clone();
+            window.on_window_should_close(cx, move |window, cx| {
+                guarded.update(cx, |workspace, cx| {
+                    workspace.should_close_window(window, cx)
+                })
+            });
+            workspace
+        });
+        if let Ok(workspace) = workspace {
+            notifications::init(handle.into(), workspace.downgrade(), cx);
         }
         cx.activate(true);
     });

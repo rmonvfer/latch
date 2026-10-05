@@ -30,6 +30,11 @@ pub struct Settings {
     /// Inject prompt marks into zsh and bash for prompt navigation and
     /// command status. Applies to newly opened terminals.
     pub shell_integration: bool,
+    /// Desktop notifications for background tabs while the window is
+    /// inactive: program notifications and long commands finishing.
+    pub notifications: bool,
+    /// Ask before closing a pane, tab, or window with a running program.
+    pub confirm_close: bool,
 }
 
 impl Default for Settings {
@@ -42,6 +47,8 @@ impl Default for Settings {
             status_bar: StatusBarSettings::default(),
             sidebar: SidebarSettings::default(),
             shell_integration: true,
+            notifications: true,
+            confirm_close: true,
         }
     }
 }

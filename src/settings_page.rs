@@ -944,6 +944,32 @@ impl Render for SettingsPage {
                             |settings| settings.shell_integration = !settings.shell_integration,
                         )),
                     )
+                    .child(
+                        setting_row(
+                            "Notifications",
+                            "Notify when a background tab's program asks to, or a long command finishes, while the window is inactive.",
+                            &theme,
+                        )
+                        .child(switch(
+                            "notifications",
+                            settings.notifications,
+                            &theme,
+                            |settings| settings.notifications = !settings.notifications,
+                        )),
+                    )
+                    .child(
+                        setting_row(
+                            "Confirm Close",
+                            "Ask before closing a pane, tab, or window with a program still running.",
+                            &theme,
+                        )
+                        .child(switch(
+                            "confirm-close",
+                            settings.confirm_close,
+                            &theme,
+                            |settings| settings.confirm_close = !settings.confirm_close,
+                        )),
+                    )
                     .child(self.render_section_title("Status Bar", &theme))
                     .child(render_status_bar_settings(&settings.status_bar, &theme))
                     .child(

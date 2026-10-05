@@ -519,14 +519,15 @@ impl Workspace {
                                 .child(display.title)
                                 .into_any_element(),
                         })
-                        .when(display.failed, |line| {
-                            line.child(
-                                div()
-                                    .flex_none()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(theme::to_hsla(theme.terminal.ansi[1])),
-                            )
+                        // A failed command outranks other activity.
+                        .when(display.failed || display.attention, |line| {
+                            line.child(div().flex_none().size(px(6.)).rounded_full().bg(
+                                if display.failed {
+                                    theme::to_hsla(theme.terminal.ansi[1])
+                                } else {
+                                    theme.text_accent
+                                },
+                            ))
                         })
                         .child(if display.pinned {
                             div()
@@ -544,7 +545,7 @@ impl Workspace {
                                 .group_hover(hover_group, |style| style.visible())
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                     cx.stop_propagation();
-                                    this.close(id, window, cx);
+                                    this.request_close(id, window, cx);
                                 }))
                                 .into_any_element()
                         }),
@@ -669,7 +670,7 @@ impl Workspace {
                     menu_item("menu-close", "x", "Close Tab", theme).on_click(cx.listener(
                         move |this, _: &ClickEvent, window, cx| {
                             this.close_context_menu(cx);
-                            this.close(id, window, cx);
+                            this.request_close(id, window, cx);
                         },
                     )),
                 ),
@@ -742,7 +743,7 @@ impl Workspace {
                     menu_item("menu-close-group", "x", "Close Group", theme).on_click(cx.listener(
                         move |this, _: &ClickEvent, window, cx| {
                             this.close_context_menu(cx);
-                            this.close_group(id, window, cx);
+                            this.request_close_group(id, window, cx);
                         },
                     )),
                 ),

@@ -1,5 +1,5 @@
 //! Shell integration: scripts that make shells emit semantic prompt marks
-//! (OSC 133), and parsing of the command marks they emit.
+//! (OSC 133).
 //!
 //! zsh is pointed at our `.zshenv` through `ZDOTDIR`; it restores the user's
 //! own `ZDOTDIR` and startup files before adding hooks. bash starts in POSIX
@@ -161,149 +161,9 @@ pub fn shell_command(integration: Option<&Path>) -> CommandBuilder {
     }
 }
 
-/// A command boundary reported by the shell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandMark {
-    /// OSC 133;C — a command started running.
-    Started,
-    /// OSC 133;D — the command finished, with its exit status if reported.
-    Finished(Option<i32>),
-}
-
-const PREFIX: &[u8] = b"\x1b]133;";
-/// Longest mark worth waiting for across reads.
-const MAX_PENDING: usize = 64;
-
-/// Finds command marks in PTY output, including marks split across reads.
-#[derive(Default)]
-pub struct MarkScanner {
-    pending: Vec<u8>,
-}
-
-impl MarkScanner {
-    pub fn scan(&mut self, bytes: &[u8]) -> Vec<CommandMark> {
-        let mut buffer = std::mem::take(&mut self.pending);
-        buffer.extend_from_slice(bytes);
-        let mut marks = Vec::new();
-        let mut index = 0;
-
-        while let Some(offset) = find(&buffer[index..], PREFIX) {
-            let start = index + offset;
-            let body_start = start + PREFIX.len();
-            match terminator(&buffer[body_start..]) {
-                Some((body_len, terminator_len)) => {
-                    if let Some(mark) = parse_mark(&buffer[body_start..body_start + body_len]) {
-                        marks.push(mark);
-                    }
-                    index = body_start + body_len + terminator_len;
-                }
-                None => {
-                    if buffer.len() - start <= MAX_PENDING {
-                        self.pending = buffer[start..].to_vec();
-                    }
-                    return marks;
-                }
-            }
-        }
-
-        // Keep a trailing partial prefix (e.g. a lone ESC) for the next read.
-        let tail_start = buffer.len().saturating_sub(PREFIX.len() - 1).max(index);
-        for split in tail_start..buffer.len() {
-            if PREFIX.starts_with(&buffer[split..]) {
-                self.pending = buffer[split..].to_vec();
-                break;
-            }
-        }
-        marks
-    }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// Length of the body and of its terminator (BEL or ESC \).
-fn terminator(bytes: &[u8]) -> Option<(usize, usize)> {
-    for (index, byte) in bytes.iter().enumerate() {
-        match byte {
-            0x07 => return Some((index, 1)),
-            0x1b => {
-                return match bytes.get(index + 1) {
-                    Some(b'\\') => Some((index, 2)),
-                    // A new escape before a terminator: drop the broken mark.
-                    Some(_) => Some((index, 0)),
-                    None => None,
-                };
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parse_mark(body: &[u8]) -> Option<CommandMark> {
-    let body = std::str::from_utf8(body).ok()?;
-    let mut parts = body.split(';');
-    match parts.next()? {
-        "C" => Some(CommandMark::Started),
-        "D" => Some(CommandMark::Finished(
-            parts.next().and_then(|status| status.trim().parse().ok()),
-        )),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_marks_with_both_terminators() {
-        let mut scanner = MarkScanner::default();
-        let marks = scanner.scan(b"out\x1b]133;A\x07$ \x1b]133;C\x1b\\ls\x1b]133;D;2\x07");
-        assert_eq!(
-            marks,
-            vec![CommandMark::Started, CommandMark::Finished(Some(2))]
-        );
-    }
-
-    #[test]
-    fn marks_split_across_reads_are_joined() {
-        let mut scanner = MarkScanner::default();
-        assert!(scanner.scan(b"text\x1b]13").is_empty());
-        assert!(scanner.scan(b"3;D;").is_empty());
-        assert_eq!(
-            scanner.scan(b"0\x07more"),
-            vec![CommandMark::Finished(Some(0))]
-        );
-    }
-
-    #[test]
-    fn lone_escape_at_end_is_kept() {
-        let mut scanner = MarkScanner::default();
-        assert!(scanner.scan(b"abc\x1b").is_empty());
-        assert_eq!(scanner.scan(b"]133;C\x07"), vec![CommandMark::Started]);
-    }
-
-    #[test]
-    fn finish_without_status_is_reported() {
-        let mut scanner = MarkScanner::default();
-        assert_eq!(
-            scanner.scan(b"\x1b]133;D\x07"),
-            vec![CommandMark::Finished(None)]
-        );
-    }
-
-    #[test]
-    fn unterminated_garbage_is_not_kept_forever() {
-        let mut scanner = MarkScanner::default();
-        let mut long = b"\x1b]133;".to_vec();
-        long.extend(std::iter::repeat_n(b'x', 200));
-        assert!(scanner.scan(&long).is_empty());
-        assert_eq!(scanner.scan(b"\x1b]133;C\x07"), vec![CommandMark::Started]);
-    }
 
     #[test]
     fn refuses_group_writable_directory() {

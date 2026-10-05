@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Duration,
+};
 
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, Context, Entity, FocusHandle, Focusable,
@@ -8,14 +12,16 @@ use gpui::{
 
 use crate::{
     components::{icon, icon_button, keybinding},
+    confirm::confirm_close,
+    notifications,
     pane_group::{PaneGroup, PaneGroupEvent},
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
     sidebar::sidebar_child_index,
-    status_bar::StatusItem,
+    status_bar::{StatusItem, format_duration},
     tabs::{Entry, GroupId, Row, TabColor, TabIcon, TabId, TabLayout, TabStyle},
-    terminal_view::TabMetadata,
+    terminal_view::{Attention, TabMetadata},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Theme},
 };
@@ -40,6 +46,8 @@ actions!(
 pub struct ActivateTab(pub usize);
 
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(500);
+/// Commands running at least this long notify when they finish.
+const LONG_COMMAND: Duration = Duration::from_secs(10);
 
 enum TabContent {
     Terminal(Entity<PaneGroup>),
@@ -101,6 +109,8 @@ pub(crate) struct TabDisplay {
     pub branch: Option<SharedString>,
     /// The last command in the focused pane exited with an error.
     pub failed: bool,
+    /// Something happened in this tab while it was in the background.
+    pub attention: bool,
 }
 
 /// The window contents: a titlebar, a collapsible sidebar of tabs and tab
@@ -118,6 +128,8 @@ pub struct Workspace {
     pub(crate) tab_search: Entity<TextInput>,
     focus_handle: FocusHandle,
     save_task: Option<Task<()>>,
+    /// Background tabs that rang the bell, notified, or finished a command.
+    attention: HashSet<TabId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -167,6 +179,7 @@ impl Workspace {
             tab_search,
             focus_handle: cx.focus_handle(),
             save_task: None,
+            attention: HashSet::new(),
             _subscriptions: subscriptions,
         };
         if let Some(state) = session::load() {
@@ -276,6 +289,9 @@ impl Workspace {
                         this.schedule_save(cx);
                     }
                     PaneGroupEvent::Exited => this.close(id, window, cx),
+                    PaneGroupEvent::Attention(attention) => {
+                        this.handle_attention(id, attention, window, cx)
+                    }
                 },
             );
         self.open_tabs.insert(
@@ -325,6 +341,7 @@ impl Workspace {
             group.collapsed = false;
         }
         self.active = Some(id);
+        self.attention.remove(&id);
         window.focus(&focus, cx);
         if let Some(index) = sidebar_child_index(&self.visible_rows(cx), id) {
             self.tab_scroll.scroll_to_item(index);
@@ -414,6 +431,7 @@ impl Workspace {
                     pinned: style.pinned,
                     directory: metadata.directory.clone(),
                     branch: metadata.branch.clone(),
+                    attention: self.attention.contains(&id),
                     failed: metadata.command_started.is_none()
                         && metadata
                             .last_command
@@ -428,9 +446,74 @@ impl Workspace {
                 directory: None,
                 branch: None,
                 failed: false,
+                attention: false,
             },
         };
         Some(display)
+    }
+
+    /// Activate the tab whose element id is `element_id`, as carried by a
+    /// notification.
+    pub(crate) fn activate_by_element_id(
+        &mut self,
+        element_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self
+            .layout
+            .ordered_tabs()
+            .into_iter()
+            .find(|id| id.element_id() == element_id)
+        {
+            self.activate(id, window, cx);
+        }
+    }
+
+    fn handle_attention(
+        &mut self,
+        id: TabId,
+        attention: &Attention,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let window_active = window.is_window_active();
+        if window_active && self.active == Some(id) {
+            return;
+        }
+        // Quick commands finishing are routine; only long ones are news.
+        if let Attention::CommandFinished(outcome) = attention
+            && outcome.duration < LONG_COMMAND
+        {
+            return;
+        }
+        self.attention.insert(id);
+        cx.notify();
+
+        if window_active || !SettingsStore::get(cx).notifications {
+            return;
+        }
+        let tab_title = self
+            .display(id, cx)
+            .map(|display| display.title.to_string())
+            .unwrap_or_default();
+        let (title, body) = match attention {
+            Attention::Bell => return,
+            Attention::Notification { title, body } => {
+                (title.clone().unwrap_or(tab_title), body.clone())
+            }
+            Attention::CommandFinished(outcome) => {
+                let duration = format_duration(outcome.duration);
+                let body = match outcome.exit_code {
+                    Some(code) if code != 0 => {
+                        format!("Failed with exit code {code} after {duration}")
+                    }
+                    _ => format!("Finished after {duration}"),
+                };
+                (tab_title, body)
+            }
+        };
+        notifications::show(id, title, body, cx);
     }
 
     pub(crate) fn update_style(
@@ -629,8 +712,74 @@ impl Workspace {
         if let Some(id) = self.active
             && !self.layout.style(id).pinned
         {
-            self.close(id, window, cx);
+            self.request_close(id, window, cx);
         }
+    }
+
+    /// Programs other than the shell running in any of `tabs`.
+    fn running_in(&self, tabs: &[TabId], cx: &App) -> Vec<SharedString> {
+        tabs.iter()
+            .filter_map(|id| match &self.open_tabs.get(id)?.content {
+                TabContent::Terminal(panes) => Some(panes.read(cx).running_programs(cx)),
+                TabContent::Settings(_) => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Close a tab the user asked to close, confirming if it is busy.
+    pub(crate) fn request_close(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let running = self.running_in(&[id], cx);
+        confirm_close(
+            running,
+            "Close this tab?",
+            window,
+            cx,
+            move |this, window, cx| {
+                this.close(id, window, cx);
+            },
+        );
+    }
+
+    pub(crate) fn request_close_group(
+        &mut self,
+        group: GroupId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tabs = self
+            .layout
+            .group(group)
+            .map(|group| group.tabs().to_vec())
+            .unwrap_or_default();
+        let running = self.running_in(&tabs, cx);
+        confirm_close(
+            running,
+            "Close this group?",
+            window,
+            cx,
+            move |this, window, cx| {
+                this.close_group(group, window, cx);
+            },
+        );
+    }
+
+    fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        let running = self.running_in(&self.layout.ordered_tabs(), cx);
+        confirm_close(running, "Quit?", window, cx, |_, _, cx| cx.quit());
+    }
+
+    /// Whether the window may close right away. When programs are running
+    /// this asks first and closes the window itself if the user agrees.
+    pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let running = self.running_in(&self.layout.ordered_tabs(), cx);
+        if running.is_empty() || !SettingsStore::get(cx).confirm_close {
+            return true;
+        }
+        confirm_close(running, "Close this window?", window, cx, |_, window, _| {
+            window.remove_window();
+        });
+        false
     }
 
     fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -850,6 +999,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::quit))
             .child(self.render_titlebar(&theme, cx))
             .child(
                 div()

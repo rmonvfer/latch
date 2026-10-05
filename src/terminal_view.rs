@@ -35,11 +35,12 @@ use crate::{
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
+    osc::{OscEvent, OscScanner},
     process_info,
     pty::{Pty, PtyDimensions},
     search::{self, SearchMatch},
     settings::SettingsStore,
-    shell_integration::{self, CommandMark, MarkScanner, ShellIntegration},
+    shell_integration::{self, ShellIntegration},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, TerminalColors},
 };
@@ -99,6 +100,20 @@ impl CommandOutcome {
 pub enum TerminalEvent {
     MetadataChanged,
     Exited,
+    Attention(Attention),
+}
+
+/// Something in a terminal that may deserve the user's attention.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Attention {
+    Bell,
+    /// A program asked for a desktop notification (OSC 9 or OSC 777).
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
+    /// A command tracked by shell integration finished.
+    CommandFinished(CommandOutcome),
 }
 
 /// A single shell session: PTY, libghostty terminal state, and the view that
@@ -124,7 +139,9 @@ pub struct TerminalView {
     link_hover: Option<HoveredLink>,
     /// Last pointer position relative to the terminal, for ⌘ presses.
     last_mouse: Option<gpui::Point<Pixels>>,
-    marks: MarkScanner,
+    osc: OscScanner,
+    /// Set by libghostty when the program rings the bell.
+    bell: Rc<Cell<bool>>,
     command_started: Option<Instant>,
     last_command: Option<CommandOutcome>,
 }
@@ -197,7 +214,8 @@ impl TerminalView {
             max_scrollback: SCROLLBACK_LINES,
         })?;
         configure_colors(&mut terminal, &cx.theme().terminal)?;
-        register_effects(&mut terminal, &pty, dimensions.clone())?;
+        let bell = Rc::new(Cell::new(false));
+        register_effects(&mut terminal, &pty, dimensions.clone(), bell.clone())?;
 
         let renderer = GridRenderer::new()?;
         let keys = KeyInput {
@@ -272,7 +290,8 @@ impl TerminalView {
                 search: None,
                 link_hover: None,
                 last_mouse: None,
-                marks: MarkScanner::default(),
+                osc: OscScanner::default(),
+                bell,
                 command_started: None,
                 last_command: None,
                 _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
@@ -304,11 +323,13 @@ impl TerminalView {
     fn process_output(&mut self, chunks: &[Vec<u8>], cx: &mut Context<Self>) {
         let mut command_changed = false;
         for chunk in chunks {
-            for mark in self.marks.scan(chunk) {
-                self.apply_mark(mark);
-                command_changed = true;
+            for event in self.osc.scan(chunk) {
+                command_changed |= self.apply_osc_event(event, cx);
             }
             self.terminal.vt_write(chunk);
+        }
+        if self.bell.replace(false) {
+            cx.emit(TerminalEvent::Attention(Attention::Bell));
         }
         if command_changed {
             self.refresh_metadata(cx);
@@ -316,18 +337,35 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn apply_mark(&mut self, mark: CommandMark) {
-        match mark {
-            CommandMark::Started => self.command_started = Some(Instant::now()),
-            CommandMark::Finished(exit_code) => {
+    /// Returns whether the command state changed.
+    fn apply_osc_event(&mut self, event: OscEvent, cx: &mut Context<Self>) -> bool {
+        match event {
+            OscEvent::CommandStarted => {
+                self.command_started = Some(Instant::now());
+                true
+            }
+            OscEvent::CommandFinished(exit_code) => {
                 // A finish without a start (e.g. the first prompt) has no
                 // command to report.
-                if let Some(started) = self.command_started.take() {
-                    self.last_command = Some(CommandOutcome {
-                        exit_code,
-                        duration: started.elapsed(),
-                    });
-                }
+                let Some(started) = self.command_started.take() else {
+                    return false;
+                };
+                let outcome = CommandOutcome {
+                    exit_code,
+                    duration: started.elapsed(),
+                };
+                self.last_command = Some(outcome);
+                cx.emit(TerminalEvent::Attention(Attention::CommandFinished(
+                    outcome,
+                )));
+                true
+            }
+            OscEvent::Notify { title, body } => {
+                cx.emit(TerminalEvent::Attention(Attention::Notification {
+                    title,
+                    body,
+                }));
+                false
             }
         }
     }
@@ -724,6 +762,48 @@ impl TerminalView {
             found.row.saturating_sub(rows / 2) as usize
         ));
         cx.notify();
+    }
+
+    /// The real destination of the hovered link, so text that merely looks
+    /// like a trusted URL can't hide where a click actually goes.
+    fn render_link_tooltip(
+        &self,
+        link: &HoveredLink,
+        metrics: CellMetrics,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let destination = match &link.target {
+            LinkTarget::Url(url) => url.clone(),
+            LinkTarget::Path(path) => process_info::shorten_home(path),
+        };
+        let left = metrics.padding + metrics.width * link.start_col as f32;
+        let rows = self.dimensions.get().rows;
+        // Below the link, or above it on the bottom rows.
+        let top = if link.row + 3 < rows {
+            metrics.padding + metrics.height * (link.row + 1) as f32 + px(4.)
+        } else {
+            metrics.padding + metrics.height * link.row as f32 - px(28.)
+        };
+
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .max_w(px(520.))
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.elevated_surface)
+            .shadow(elevated_shadow())
+            .font_family(theme::UI_FONT_FAMILY)
+            .text_size(theme::TEXT_SMALL)
+            .text_color(theme.text)
+            .truncate()
+            .child(SharedString::from(destination))
+            .into_any_element()
     }
 
     fn render_search_bar(&self, search: &SearchBar, cx: &mut Context<Self>) -> AnyElement {
@@ -1137,6 +1217,10 @@ impl Render for TerminalView {
             .search
             .as_ref()
             .map(|search| self.render_search_bar(search, cx));
+        let link_tooltip = self
+            .link_hover
+            .as_ref()
+            .map(|link| self.render_link_tooltip(link, metrics, cx));
 
         div()
             .id("terminal")
@@ -1181,6 +1265,7 @@ impl Render for TerminalView {
                 .size_full(),
             )
             .children(search_bar)
+            .children(link_tooltip)
     }
 }
 
@@ -1217,9 +1302,11 @@ fn register_effects(
     terminal: &mut Terminal<'static, 'static>,
     pty: &Pty,
     dimensions: Rc<Cell<PtyDimensions>>,
+    bell: Rc<Cell<bool>>,
 ) -> Result<()> {
     let replies = pty.input_sender();
     terminal
+        .on_bell(move |_terminal| bell.set(true))?
         .on_pty_write(move |_terminal, data| {
             let _ = replies.send(data.to_vec());
         })?

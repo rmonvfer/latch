@@ -5,14 +5,15 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 use anyhow::{Result, anyhow};
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Subscription, Window, actions,
-    canvas, div, prelude::*, px, relative,
+    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, SharedString, Subscription,
+    Window, actions, canvas, div, prelude::*, px, relative,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    confirm::confirm_close,
     pane_tree::{Axis, PaneNode, PaneTree, Split},
-    terminal_view::{TabMetadata, TerminalEvent, TerminalView},
+    terminal_view::{Attention, TabMetadata, TerminalEvent, TerminalView},
     theme::ActiveThemeExt,
     workspace::CloseTab,
 };
@@ -42,6 +43,7 @@ pub enum PaneGroupEvent {
     MetadataChanged,
     /// The last pane's shell exited.
     Exited,
+    Attention(Attention),
 }
 
 /// A saved pane arrangement.
@@ -161,6 +163,9 @@ impl PaneGroup {
                     }
                 }
                 TerminalEvent::Exited => group.remove_pane(view.clone(), window, cx),
+                TerminalEvent::Attention(attention) => {
+                    cx.emit(PaneGroupEvent::Attention(attention.clone()));
+                }
             }),
             cx.on_focus_in(&focus, window, {
                 let view = view.clone();
@@ -238,9 +243,37 @@ impl PaneGroup {
         self.split(Axis::Vertical, window, cx);
     }
 
+    /// Programs other than the shell running in any pane.
+    pub fn running_programs(&self, cx: &App) -> Vec<SharedString> {
+        self.tree
+            .leaves()
+            .iter()
+            .filter_map(|view| {
+                let metadata = view.read(cx).metadata();
+                metadata.running.then(|| metadata.process.clone()).flatten()
+            })
+            .collect()
+    }
+
     fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         if self.pane_count() > 1 {
-            self.remove_pane(self.active.clone(), window, cx);
+            let pane = self.active.clone();
+            let metadata = pane.read(cx).metadata();
+            let running = metadata
+                .running
+                .then(|| metadata.process.clone())
+                .flatten()
+                .into_iter()
+                .collect();
+            confirm_close(
+                running,
+                "Close this pane?",
+                window,
+                cx,
+                move |group, window, cx| {
+                    group.remove_pane(pane, window, cx);
+                },
+            );
         } else {
             // A lone pane closes the whole tab, which respects pinning.
             window.dispatch_action(Box::new(CloseTab), cx);
