@@ -13,6 +13,8 @@ pub enum OscEvent {
 }
 
 const INTRODUCER: &[u8] = b"\x1b]";
+/// Longest notification text kept; anything longer is cut.
+const MAX_NOTIFICATION_CHARS: usize = 240;
 /// Longest sequence worth holding across reads; longer ones are dropped.
 const MAX_PENDING: usize = 4096;
 
@@ -98,7 +100,7 @@ fn parse(body: &[u8]) -> Option<OscEvent> {
         "9" if !rest.starts_with("4;") && rest != "4" && !rest.is_empty() => {
             Some(OscEvent::Notify {
                 title: None,
-                body: rest.to_string(),
+                body: clean_text(rest),
             })
         }
         "777" => {
@@ -106,8 +108,8 @@ fn parse(body: &[u8]) -> Option<OscEvent> {
             if parts.next()? != "notify" {
                 return None;
             }
-            let title = parts.next().unwrap_or_default().to_string();
-            let body = parts.next().unwrap_or_default().to_string();
+            let title = clean_text(parts.next().unwrap_or_default());
+            let body = clean_text(parts.next().unwrap_or_default());
             Some(OscEvent::Notify {
                 title: (!title.is_empty()).then_some(title),
                 body,
@@ -115,6 +117,17 @@ fn parse(body: &[u8]) -> Option<OscEvent> {
         }
         _ => None,
     }
+}
+
+/// Notification text from a program: control characters removed, length
+/// capped.
+fn clean_text(text: &str) -> String {
+    let visible: Vec<char> = text.chars().filter(|ch| !ch.is_control()).collect();
+    let mut cleaned: String = visible.iter().take(MAX_NOTIFICATION_CHARS).collect();
+    if visible.len() > MAX_NOTIFICATION_CHARS {
+        cleaned.push('…');
+    }
+    cleaned.trim().to_string()
 }
 
 #[cfg(test)]
@@ -159,6 +172,21 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn notification_text_is_cleaned_and_capped() {
+        let mut scanner = OscScanner::default();
+        let mut sequence = b"\x1b]9;line\rbreak ".to_vec();
+        sequence.extend(std::iter::repeat_n(b'x', 400));
+        sequence.push(0x07);
+        let events = scanner.scan(&sequence);
+        let OscEvent::Notify { body, .. } = &events[0] else {
+            panic!("expected a notification");
+        };
+        assert!(body.starts_with("linebreak "));
+        assert!(body.chars().count() <= MAX_NOTIFICATION_CHARS + 1);
+        assert!(body.ends_with('…'));
     }
 
     #[test]

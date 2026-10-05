@@ -499,9 +499,12 @@ impl Workspace {
             .unwrap_or_default();
         let (title, body) = match attention {
             Attention::Bell => return,
-            Attention::Notification { title, body } => {
-                (title.clone().unwrap_or(tab_title), body.clone())
-            }
+            // Programs choose this text, so the title always names the tab
+            // it came from and their own title is shown as quoted content.
+            Attention::Notification { title, body } => match title {
+                Some(title) => (tab_title, format!("“{title}”: {body}")),
+                None => (tab_title, body.clone()),
+            },
             Attention::CommandFinished(outcome) => {
                 let duration = format_duration(outcome.duration);
                 let body = match outcome.exit_code {
