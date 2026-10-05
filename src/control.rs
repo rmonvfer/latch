@@ -10,8 +10,16 @@
 //!
 //! Callers are identified by a secret token each pane passes to its
 //! programs (`TERMINAL_CONTROL_TOKEN`), not by process names or ids, which
-//! a program can fake. Approval for a pane covers every program in it.
+//! a program can fake. Approval for a pane covers every program in it and
+//! lets them act on all tabs, which is what the approval dialog states.
 //! Callers without a valid token are approved per connection only.
+//!
+//! Trust model: the boundary defended is between the user and processes
+//! confined by a sandbox. An unconfined process of the same user can read
+//! a pane's token from its environment, but it can already do anything the
+//! user can, so the token grants it nothing new. Sandboxed processes
+//! generally cannot inspect other processes, so for them the token and the
+//! approval dialog hold.
 
 use std::{
     collections::HashMap,
