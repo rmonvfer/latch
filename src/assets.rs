@@ -6,7 +6,7 @@ use gpui::{App, AssetSource, SharedString};
 /// Icons and fonts compiled into the binary.
 pub struct Assets;
 
-const ICONS: [(&str, &[u8]); 26] = [
+const ICONS: [(&str, &[u8]); 30] = [
     (
         "icons/arrow-down.svg",
         include_bytes!("../assets/icons/arrow-down.svg"),
@@ -15,6 +15,7 @@ const ICONS: [(&str, &[u8]); 26] = [
         "icons/arrow-up.svg",
         include_bytes!("../assets/icons/arrow-up.svg"),
     ),
+    ("icons/bot.svg", include_bytes!("../assets/icons/bot.svg")),
     (
         "icons/check.svg",
         include_bytes!("../assets/icons/check.svg"),
@@ -26,6 +27,14 @@ const ICONS: [(&str, &[u8]); 26] = [
     (
         "icons/chevron-right.svg",
         include_bytes!("../assets/icons/chevron-right.svg"),
+    ),
+    (
+        "icons/circle-alert.svg",
+        include_bytes!("../assets/icons/circle-alert.svg"),
+    ),
+    (
+        "icons/circle-check.svg",
+        include_bytes!("../assets/icons/circle-check.svg"),
     ),
     ("icons/code.svg", include_bytes!("../assets/icons/code.svg")),
     (
@@ -51,6 +60,10 @@ const ICONS: [(&str, &[u8]); 26] = [
     (
         "icons/layers.svg",
         include_bytes!("../assets/icons/layers.svg"),
+    ),
+    (
+        "icons/loader-circle.svg",
+        include_bytes!("../assets/icons/loader-circle.svg"),
     ),
     (
         "icons/minus.svg",

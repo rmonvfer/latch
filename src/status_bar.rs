@@ -5,6 +5,7 @@ use gpui::{AnyElement, ClickEvent, Context, SharedString, div, prelude::*, px};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent_badge,
     components::{icon, status_divider, status_item},
     settings::SettingsStore,
     theme::{self, Theme},
@@ -256,6 +257,26 @@ impl Workspace {
                 .into_any_element(),
             StatusItem::Process => {
                 let metadata = metadata?;
+                if let Some(state) = metadata.agent {
+                    return Some(
+                        status_label()
+                            .min_w_0()
+                            .child(agent_badge::status_icon(state, theme::ICON_XSMALL, theme))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .child(state.agent.name()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(agent_badge::status_color(state.status, theme))
+                                    .child(agent_badge::status_label(state.status)),
+                            )
+                            .into_any_element(),
+                    );
+                }
                 let process = metadata.process?;
                 let running = metadata.running;
                 status_label()

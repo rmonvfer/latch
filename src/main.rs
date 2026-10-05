@@ -1,3 +1,5 @@
+mod agent_badge;
+mod agents;
 mod assets;
 mod components;
 mod confirm;

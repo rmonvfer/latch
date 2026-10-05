@@ -16,6 +16,70 @@ pub fn process_name(pid: i32) -> Option<String> {
     Some(String::from_utf8_lossy(&buffer[..len as usize]).into_owned())
 }
 
+/// The executable path and arguments of a running process.
+#[cfg(target_os = "macos")]
+pub fn process_args(pid: i32) -> Option<Vec<String>> {
+    let mut size: libc::size_t = 0;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: a null buffer asks sysctl for the required size only.
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size];
+    // SAFETY: `buffer` holds `size` writable bytes, as sysctl was told.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+    parse_procargs(&buffer)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_args(pid: i32) -> Option<Vec<String>> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
+}
+
+/// Decode `KERN_PROCARGS2`: argc, the executable path, padding, then the
+/// arguments, all NUL-separated. Returns the path followed by argv.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?) as usize;
+    let mut parts = buffer[4..]
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned());
+    let executable = parts.next()?;
+    let mut args = vec![executable];
+    args.extend(parts.take(argc));
+    Some(args)
+}
+
 /// The current working directory of a running process.
 #[cfg(target_os = "macos")]
 pub fn working_directory(pid: i32) -> Option<PathBuf> {
@@ -127,9 +191,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_procargs_layout() {
+        let mut raw = 2i32.to_ne_bytes().to_vec();
+        raw.extend_from_slice(b"/usr/local/bin/node\0\0\0node\0/opt/bin/claude\0HOME=/x\0");
+        assert_eq!(
+            parse_procargs(&raw).unwrap(),
+            vec!["/usr/local/bin/node", "node", "/opt/bin/claude"]
+        );
+    }
+
+    #[test]
     fn reads_own_process_details() {
         let pid = std::process::id() as i32;
         assert!(process_name(pid).is_some());
+        assert!(process_args(pid).is_some_and(|args| !args.is_empty()));
         assert_eq!(
             working_directory(pid),
             Some(std::env::current_dir().unwrap())

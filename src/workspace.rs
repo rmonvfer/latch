@@ -21,7 +21,7 @@ use crate::{
     sidebar::sidebar_child_index,
     status_bar::{StatusItem, format_duration},
     tabs::{Entry, GroupId, Row, TabColor, TabIcon, TabId, TabLayout, TabStyle},
-    terminal_view::{Attention, TabMetadata},
+    terminal_view::{AgentState, Attention, TabMetadata},
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Theme},
 };
@@ -111,6 +111,7 @@ pub(crate) struct TabDisplay {
     pub failed: bool,
     /// Something happened in this tab while it was in the background.
     pub attention: bool,
+    pub agent: Option<AgentState>,
 }
 
 /// The window contents: a titlebar, a collapsible sidebar of tabs and tab
@@ -432,6 +433,7 @@ impl Workspace {
                     directory: metadata.directory.clone(),
                     branch: metadata.branch.clone(),
                     attention: self.attention.contains(&id),
+                    agent: metadata.agent,
                     failed: metadata.command_started.is_none()
                         && metadata
                             .last_command
@@ -447,6 +449,7 @@ impl Workspace {
                 branch: None,
                 failed: false,
                 attention: false,
+                agent: None,
             },
         };
         Some(display)
@@ -505,6 +508,14 @@ impl Workspace {
                 Some(title) => (tab_title, format!("“{title}”: {body}")),
                 None => (tab_title, body.clone()),
             },
+            Attention::AgentWaiting { agent, needs_input } => {
+                let body = if *needs_input {
+                    format!("{} needs your input", agent.name())
+                } else {
+                    format!("{} is done", agent.name())
+                };
+                (tab_title, body)
+            }
             Attention::CommandFinished(outcome) => {
                 let duration = format_duration(outcome.duration);
                 let body = match outcome.exit_code {

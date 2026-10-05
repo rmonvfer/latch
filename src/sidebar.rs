@@ -9,12 +9,14 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent_badge,
     components::{
         DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
         menu_surface,
     },
     settings::{Settings, SettingsStore},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
+    terminal_view::AgentState,
     theme::{self, Theme},
     workspace::{MenuKind, Target, Workspace},
 };
@@ -412,7 +414,8 @@ impl Workspace {
             .directory
             .filter(|_| expanded && sidebar.show_directory);
         let branch = display.branch.filter(|_| expanded && sidebar.show_branch);
-        let has_details = directory.is_some() || branch.is_some();
+        let agent = display.agent.filter(|_| expanded);
+        let has_details = directory.is_some() || branch.is_some() || agent.is_some();
         let icon_color = if active { theme.text } else { theme.text_muted };
         let title_color = if active { theme.text } else { theme.text_muted };
         let in_group = group.is_some();
@@ -507,7 +510,14 @@ impl Workspace {
                         .items_center()
                         .gap(px(8.))
                         .h(px(22.))
-                        .child(icon(display.icon, theme::ICON_SMALL, icon_color))
+                        .child(match display.agent {
+                            Some(state) => {
+                                agent_badge::status_icon(state, theme::ICON_SMALL, theme)
+                            }
+                            None => {
+                                icon(display.icon, theme::ICON_SMALL, icon_color).into_any_element()
+                            }
+                        })
                         .child(match renaming {
                             Some(input) => div().flex_1().min_w_0().child(input).into_any_element(),
                             None => div()
@@ -551,7 +561,7 @@ impl Workspace {
                         }),
                 )
                 .when(has_details, |row| {
-                    row.child(tab_details(directory, branch, theme))
+                    row.child(tab_details(agent, directory, branch, theme))
                 }),
         )
     }
@@ -898,10 +908,12 @@ fn render_view_options_menu(config: &SidebarSettings, theme: &Theme) -> impl Int
 }
 
 fn tab_details(
+    agent: Option<AgentState>,
     directory: Option<SharedString>,
     branch: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
+    let has_agent = agent.is_some();
     let has_branch = branch.is_some();
     let separator_color = theme.text_muted.opacity(0.4);
     let muted = theme.text_muted;
@@ -915,6 +927,19 @@ fn tab_details(
         .pl(px(22.))
         .text_size(theme::TEXT_SMALL)
         .text_color(muted)
+        .children(agent.map(|state| {
+            div()
+                .flex_none()
+                .text_color(agent_badge::status_color(state.status, theme))
+                .child(SharedString::from(format!(
+                    "{} · {}",
+                    state.agent.name(),
+                    agent_badge::status_label(state.status)
+                )))
+        }))
+        .when(has_agent && (has_branch || directory.is_some()), |row| {
+            row.child(div().flex_none().text_color(separator_color).child("•"))
+        })
         .children(branch.map(|branch| {
             div()
                 .flex()

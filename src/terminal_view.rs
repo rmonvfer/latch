@@ -31,6 +31,7 @@ use libghostty_vt::{
 };
 
 use crate::{
+    agents::{self, Activity, Agent, AgentStatus},
     components::{elevated_shadow, icon, icon_button},
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
@@ -83,6 +84,14 @@ pub struct TabMetadata {
     pub command_started: Option<Instant>,
     /// How the most recent command ended, per shell integration.
     pub last_command: Option<CommandOutcome>,
+    /// The coding agent in the foreground, if any, and what it is doing.
+    pub agent: Option<AgentState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentState {
+    pub agent: Agent,
+    pub status: AgentStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,7 +123,15 @@ pub enum Attention {
     },
     /// A command tracked by shell integration finished.
     CommandFinished(CommandOutcome),
+    /// An agent that had been working went quiet.
+    AgentWaiting {
+        agent: Agent,
+        needs_input: bool,
+    },
 }
+
+/// An agent must work at least this long before going quiet is news.
+const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
 
 /// A single shell session: PTY, libghostty terminal state, and the view that
 /// paints it and turns GPUI input into VT sequences.
@@ -142,6 +159,9 @@ pub struct TerminalView {
     osc: OscScanner,
     /// Set by libghostty when the program rings the bell.
     bell: Rc<Cell<bool>>,
+    activity: Activity,
+    /// When the foreground agent started its current stretch of work.
+    working_since: Option<Instant>,
     command_started: Option<Instant>,
     last_command: Option<CommandOutcome>,
 }
@@ -292,6 +312,8 @@ impl TerminalView {
                 last_mouse: None,
                 osc: OscScanner::default(),
                 bell,
+                activity: Activity::default(),
+                working_since: None,
                 command_started: None,
                 last_command: None,
                 _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
@@ -328,7 +350,9 @@ impl TerminalView {
             }
             self.terminal.vt_write(chunk);
         }
+        self.activity.output(Instant::now());
         if self.bell.replace(false) {
+            self.activity.attention();
             cx.emit(TerminalEvent::Attention(Attention::Bell));
         }
         if command_changed {
@@ -361,6 +385,7 @@ impl TerminalView {
                 true
             }
             OscEvent::Notify { title, body } => {
+                self.activity.attention();
                 cx.emit(TerminalEvent::Attention(Attention::Notification {
                     title,
                     body,
@@ -415,9 +440,31 @@ impl TerminalView {
 
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
         let metadata = self.read_metadata();
+        self.track_agent_work(metadata.agent, cx);
         if metadata != self.metadata {
             self.metadata = metadata;
             cx.emit(TerminalEvent::MetadataChanged);
+        }
+    }
+
+    /// Announce when an agent that worked for a while stops producing
+    /// output, which means it finished or is waiting on the user.
+    fn track_agent_work(&mut self, agent: Option<AgentState>, cx: &mut Context<Self>) {
+        match agent {
+            Some(state) if state.status == AgentStatus::Working => {
+                self.working_since.get_or_insert_with(Instant::now);
+            }
+            Some(state) => {
+                if let Some(since) = self.working_since.take()
+                    && since.elapsed() >= AGENT_MIN_WORK
+                {
+                    cx.emit(TerminalEvent::Attention(Attention::AgentWaiting {
+                        agent: state.agent,
+                        needs_input: state.status == AgentStatus::NeedsInput,
+                    }));
+                }
+            }
+            None => self.working_since = None,
         }
     }
 
@@ -454,6 +501,14 @@ impl TerminalView {
             running,
             command_started: self.command_started,
             last_command: self.last_command,
+            agent: running
+                .then(|| foreground.and_then(process_info::process_args))
+                .flatten()
+                .and_then(|args| agents::detect(&args))
+                .map(|agent| AgentState {
+                    agent,
+                    status: self.activity.status(Instant::now()),
+                }),
         }
     }
 
@@ -495,6 +550,7 @@ impl TerminalView {
         }
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
         let _ = self.terminal.set_selection(None);
+        self.activity.user_input(Instant::now());
         self.pty.write(bytes);
         cx.notify();
     }
