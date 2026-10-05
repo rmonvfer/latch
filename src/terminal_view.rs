@@ -473,6 +473,7 @@ impl TerminalView {
                     if let Err(error) = configure_colors(&mut view.terminal, &colors) {
                         log::warn!("failed to apply theme: {error}");
                     }
+                    view.rebuild_block_rows(cx);
                     cx.notify();
                 }),
             }
@@ -533,7 +534,12 @@ impl TerminalView {
         for chunk in chunks {
             for piece in self.osc.scan(&chunk) {
                 match piece {
-                    Piece::Output(bytes) => self.terminal.vt_write(&bytes),
+                    Piece::Output(bytes) => {
+                        if let Some(blocks) = &mut self.blocks {
+                            blocks.record(&bytes);
+                        }
+                        self.terminal.vt_write(&bytes);
+                    }
                     Piece::Event(event) => command_changed |= self.apply_osc_event(event, cx),
                 }
             }
@@ -641,6 +647,29 @@ impl TerminalView {
             self.block_list.remeasure_items(last..items.len());
         }
         Some(items)
+    }
+
+    /// Rebuild finished blocks' rows for the pane's current width and
+    /// colors.
+    fn rebuild_block_rows(&mut self, cx: &mut Context<Self>) {
+        let Some(blocks) = &mut self.blocks else {
+            return;
+        };
+        let size = self.dimensions.get();
+        let colors = cx.theme().terminal.clone();
+        let rebuilt = blocks.rebuild_rows(|| {
+            let mut terminal = Terminal::new(Options {
+                cols: size.cols,
+                rows: size.rows,
+                max_scrollback: SCROLLBACK_LINES,
+            })?;
+            configure_colors(&mut terminal, &colors)?;
+            Ok(terminal)
+        });
+        if let Err(error) = rebuilt {
+            log::error!("failed to rebuild blocks: {error:#}");
+        }
+        self.block_list.remeasure();
     }
 
     /// Whether the pane shows its block list rather than a single terminal
@@ -837,7 +866,8 @@ impl TerminalView {
             cell_width: f32::from(metrics.width).round() as u16,
             cell_height: f32::from(metrics.height).round() as u16,
         };
-        if next == self.dimensions.get() {
+        let previous = self.dimensions.get();
+        if next == previous {
             return;
         }
         if let Err(error) = self.terminal.resize(
@@ -853,6 +883,9 @@ impl TerminalView {
         self.pty.resize(next);
         if let Some(blocks) = &mut self.blocks {
             blocks.terminal_resized();
+        }
+        if next.cols != previous.cols {
+            self.rebuild_block_rows(cx);
         }
         cx.notify();
     }

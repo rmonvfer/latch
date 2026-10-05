@@ -5,7 +5,9 @@
 //! exactly that command's output; the block captures rows from it. When
 //! the command finishes, its rows are captured once into an immutable
 //! snapshot and the terminal is replaced, which keeps memory bounded and
-//! makes painting finished blocks a cheap row list.
+//! makes painting finished blocks a cheap row list. Each block also keeps
+//! its raw output, within a budget, so its rows can be rebuilt when the
+//! pane's width or colors change.
 
 use std::{
     path::PathBuf,
@@ -25,6 +27,10 @@ use crate::{
 };
 
 pub type Rows = Rc<Vec<Rc<FrameRow>>>;
+
+/// Most raw output kept across all blocks for rebuilding their rows. Past
+/// this the oldest blocks give theirs up and keep their rows as captured.
+const OUTPUT_BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BlockContext {
@@ -69,6 +75,8 @@ pub struct Block {
     pub started: Instant,
     pub outcome: Option<Outcome>,
     pub output: Output,
+    /// Everything the command wrote, while it fits the budget.
+    raw: Option<Vec<u8>>,
 }
 
 impl Block {
@@ -221,6 +229,7 @@ impl BlockList {
             started: Instant::now(),
             outcome: None,
             output: Output::Live(Box::new(LiveOutput::new()?)),
+            raw: Some(Vec::new()),
         });
         if self.blocks.len() > self.limit {
             let excess = self.blocks.len() - self.limit;
@@ -253,6 +262,57 @@ impl BlockList {
         });
         let rows = block.rows(terminal)?;
         block.output = Output::Done(rows);
+        Ok(())
+    }
+
+    /// Keep `bytes` the running command wrote, for rebuilding its rows.
+    pub fn record(&mut self, bytes: &[u8]) {
+        let Some(raw) = self
+            .blocks
+            .last_mut()
+            .filter(|block| block.is_running())
+            .and_then(|block| block.raw.as_mut())
+        else {
+            return;
+        };
+        raw.extend_from_slice(bytes);
+        self.enforce_budget();
+    }
+
+    /// Drop the oldest blocks' raw output until the total fits the budget.
+    fn enforce_budget(&mut self) {
+        let mut total: usize = self
+            .blocks
+            .iter()
+            .filter_map(|block| block.raw.as_ref())
+            .map(Vec::len)
+            .sum();
+        for block in &mut self.blocks {
+            if total <= OUTPUT_BUDGET {
+                break;
+            }
+            if let Some(raw) = block.raw.take() {
+                total -= raw.len();
+            }
+        }
+    }
+
+    /// Rebuild finished blocks' rows by replaying their output into
+    /// terminals from `new_terminal`, after the pane's width or colors
+    /// changed. Those terminals must not be connected to the PTY, since
+    /// replayed queries would otherwise be answered again.
+    pub fn rebuild_rows(
+        &mut self,
+        mut new_terminal: impl FnMut() -> Result<Terminal<'static, 'static>>,
+    ) -> Result<()> {
+        for block in &mut self.blocks {
+            let (Output::Done(rows), Some(raw)) = (&mut block.output, &block.raw) else {
+                continue;
+            };
+            let mut terminal = new_terminal()?;
+            terminal.vt_write(raw);
+            *rows = LiveOutput::new()?.rows(&mut terminal)?;
+        }
         Ok(())
     }
 
@@ -349,6 +409,21 @@ mod tests {
             .collect();
         assert_eq!(commands, vec!["b", "c"]);
         assert!(list.blocks()[0].failed());
+    }
+
+    #[test]
+    fn finished_blocks_rewrap_at_a_new_width() {
+        let mut list = BlockList::new(10);
+        let mut output_terminal = terminal(20, 5);
+        list.start("echo".into()).unwrap();
+        let line = "x".repeat(30);
+        list.record(line.as_bytes());
+        output_terminal.vt_write(line.as_bytes());
+        list.finish(0, &mut output_terminal).unwrap();
+        assert_eq!(list.blocks()[0].finished_rows().unwrap().len(), 2);
+
+        list.rebuild_rows(|| Ok(terminal(10, 5))).unwrap();
+        assert_eq!(list.blocks()[0].finished_rows().unwrap().len(), 3);
     }
 
     #[test]
