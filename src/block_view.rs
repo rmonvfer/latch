@@ -15,6 +15,9 @@ use crate::{
     theme::{self, Theme},
 };
 
+/// Space between a block's content and the pane's sides, on top of the
+/// terminal padding. The pane's grid is narrowed to match.
+pub const HORIZONTAL_INSET: Pixels = px(12.);
 const HEADER_HEIGHT: f32 = 26.;
 const BLOCK_GAP: f32 = 8.;
 const FAILURE_EDGE: f32 = 2.;
@@ -116,7 +119,7 @@ fn render_item(
         + scrollback.iter().map(|page| page.len()).sum::<usize>()
         + live_frame.as_ref().map_or(0, |frame| frame.content_rows());
     let output_height = metrics.height * row_count as f32;
-    let padding = metrics.padding;
+    let padding = metrics.padding + HORIZONTAL_INSET;
 
     let output = canvas(
         |_, _, _| {},
@@ -152,7 +155,7 @@ fn render_item(
         .when(item.header.is_some(), |this| {
             this.border_t_1().border_color(palette.border)
         })
-        .when(item.header.is_none(), |this| this.pt(padding))
+        .when(item.header.is_none(), |this| this.pt(metrics.padding))
         .children(
             item.header
                 .as_ref()

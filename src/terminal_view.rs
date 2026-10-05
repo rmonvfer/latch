@@ -981,7 +981,7 @@ impl TerminalView {
             .flex()
             .flex_col()
             .gap_1p5()
-            .px(metrics.padding)
+            .px(metrics.padding + block_view::HORIZONTAL_INSET)
             .py_2()
             .border_t_1()
             .border_color(theme.border_variant)
@@ -1206,7 +1206,17 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.bounds = Some(bounds);
-        let (cols, rows) = metrics.grid_size(bounds);
+        // Blocks are inset from the sides; full-screen programs are not.
+        let grid_bounds = if self.shows_blocks() {
+            let inset = block_view::HORIZONTAL_INSET;
+            Bounds::new(
+                bounds.origin + gpui::point(inset, px(0.)),
+                gpui::size(bounds.size.width - inset * 2., bounds.size.height),
+            )
+        } else {
+            bounds
+        };
+        let (cols, rows) = metrics.grid_size(grid_bounds);
         let next = PtyDimensions {
             cols,
             rows,
