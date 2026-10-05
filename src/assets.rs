@@ -6,7 +6,7 @@ use gpui::{App, AssetSource, SharedString};
 /// Icons and fonts compiled into the binary.
 pub struct Assets;
 
-const ICONS: [(&str, &[u8]); 32] = [
+const ICONS: [(&str, &[u8]); 36] = [
     (
         "icons/arrow-down.svg",
         include_bytes!("../assets/icons/arrow-down.svg"),
@@ -43,6 +43,10 @@ const ICONS: [(&str, &[u8]); 32] = [
         include_bytes!("../assets/icons/database.svg"),
     ),
     (
+        "icons/file-pen-line.svg",
+        include_bytes!("../assets/icons/file-pen-line.svg"),
+    ),
+    (
         "icons/flask-conical.svg",
         include_bytes!("../assets/icons/flask-conical.svg"),
     ),
@@ -57,6 +61,10 @@ const ICONS: [(&str, &[u8]); 32] = [
     (
         "icons/globe.svg",
         include_bytes!("../assets/icons/globe.svg"),
+    ),
+    (
+        "icons/keyboard.svg",
+        include_bytes!("../assets/icons/keyboard.svg"),
     ),
     (
         "icons/layers.svg",
@@ -79,6 +87,10 @@ const ICONS: [(&str, &[u8]); 32] = [
         include_bytes!("../assets/icons/palette.svg"),
     ),
     (
+        "icons/panel-bottom.svg",
+        include_bytes!("../assets/icons/panel-bottom.svg"),
+    ),
+    (
         "icons/panel-left.svg",
         include_bytes!("../assets/icons/panel-left.svg"),
     ),
@@ -88,6 +100,10 @@ const ICONS: [(&str, &[u8]); 32] = [
     ),
     ("icons/pin.svg", include_bytes!("../assets/icons/pin.svg")),
     ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
+    (
+        "icons/refresh-cw.svg",
+        include_bytes!("../assets/icons/refresh-cw.svg"),
+    ),
     (
         "icons/rotate-ccw.svg",
         include_bytes!("../assets/icons/rotate-ccw.svg"),

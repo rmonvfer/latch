@@ -14,6 +14,36 @@ pub fn icon(name: &'static str, size: Pixels, color: Hsla) -> Svg {
         .text_color(color)
 }
 
+/// A bordered button with a label and an optional leading icon.
+pub fn button(
+    id: impl Into<ElementId>,
+    icon_name: Option<&'static str>,
+    label: impl Into<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let hover = theme.ghost_hover;
+    let active = theme.ghost_selected;
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .h(px(26.))
+        .px(px(10.))
+        .rounded(theme::RADIUS_SM)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.element_background)
+        .cursor_pointer()
+        .text_size(theme::TEXT_SMALL)
+        .text_color(theme.text)
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(active))
+        .children(icon_name.map(|name| icon(name, theme::ICON_SMALL, theme.text_muted)))
+        .child(label.into())
+}
+
 /// A square, borderless button holding one small icon.
 pub fn icon_button(id: impl Into<ElementId>, name: &'static str, theme: &Theme) -> Stateful<Div> {
     let hover = theme.ghost_hover;
