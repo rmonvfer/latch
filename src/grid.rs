@@ -99,6 +99,15 @@ pub struct Frame {
     backgrounds: Vec<BackgroundSpan>,
     texts: Vec<TextBatch>,
     cursor: Option<Cursor>,
+    link: Option<LinkUnderline>,
+}
+
+/// An underline marking the link under the pointer.
+struct LinkUnderline {
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+    color: Hsla,
 }
 
 /// Reusable libghostty render objects for one terminal.
@@ -161,6 +170,7 @@ impl GridRenderer {
             backgrounds: Vec::new(),
             texts: Vec::new(),
             cursor,
+            link: None,
         };
 
         let mut rows = self.rows.update(&snapshot)?;
@@ -307,6 +317,16 @@ fn push_background(spans: &mut Vec<BackgroundSpan>, row: u16, col: u16, cols: u1
 }
 
 impl Frame {
+    /// Underline columns `start_col..end_col` of viewport `row`.
+    pub fn set_link(&mut self, row: u16, start_col: u16, end_col: u16, color: Hsla) {
+        self.link = Some(LinkUnderline {
+            row,
+            start_col,
+            end_col,
+            color,
+        });
+    }
+
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
@@ -329,6 +349,20 @@ impl Frame {
                     size(metrics.width * span.cols as f32, metrics.height),
                 ),
                 span.color,
+            ));
+        }
+
+        if let Some(link) = &self.link {
+            let start = cell_origin(link.row, link.start_col);
+            window.paint_quad(fill(
+                Bounds::new(
+                    start + point(px(0.), metrics.height - px(2.)),
+                    size(
+                        metrics.width * (link.end_col - link.start_col) as f32,
+                        px(1.),
+                    ),
+                ),
+                link.color,
             ));
         }
 

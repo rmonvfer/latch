@@ -2,6 +2,7 @@ mod assets;
 mod components;
 mod grid;
 mod input;
+mod links;
 mod pane_group;
 mod pane_tree;
 mod process_info;

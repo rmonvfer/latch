@@ -9,15 +9,15 @@ use anyhow::Result;
 use gpui::{
     AnyElement, App, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
     EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, KeyUpEvent, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, div,
-    prelude::*, px,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, actions,
+    canvas, div, prelude::*, px,
 };
 use libghostty_vt::{
     Terminal,
     fmt::Format,
     key, mouse, paste,
-    screen::RowSemanticPrompt,
+    screen::{CellWide, RowSemanticPrompt},
     selection::{
         FormatOptions, Selection,
         gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
@@ -34,6 +34,7 @@ use crate::{
     components::{elevated_shadow, icon, icon_button},
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
+    links::{self, LinkTarget},
     process_info,
     pty::{Pty, PtyDimensions},
     search::{self, SearchMatch},
@@ -119,10 +120,26 @@ pub struct TerminalView {
     _settings_subscription: Subscription,
     _theme_subscription: Subscription,
     search: Option<SearchBar>,
+    /// The link under the pointer while ⌘ is held.
+    link_hover: Option<HoveredLink>,
+    /// Last pointer position relative to the terminal, for ⌘ presses.
+    last_mouse: Option<gpui::Point<Pixels>>,
     marks: MarkScanner,
     command_started: Option<Instant>,
     last_command: Option<CommandOutcome>,
 }
+
+/// A link in the viewport, in grid coordinates (end column exclusive).
+struct HoveredLink {
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+    target: LinkTarget,
+}
+
+/// Schemes an OSC 8 hyperlink may use; anything else is ignored rather
+/// than handed to the system to open.
+const HYPERLINK_SCHEMES: [&str; 5] = ["https://", "http://", "ftp://", "file://", "mailto:"];
 
 /// The find bar and its results.
 struct SearchBar {
@@ -253,6 +270,8 @@ impl TerminalView {
                     cx.notify();
                 }),
                 search: None,
+                link_hover: None,
+                last_mouse: None,
                 marks: MarkScanner::default(),
                 command_started: None,
                 last_command: None,
@@ -505,6 +524,109 @@ impl TerminalView {
         bytes
     }
 
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_link_hover(event.modifiers.platform, cx);
+    }
+
+    fn update_link_hover(&mut self, command_held: bool, cx: &mut Context<Self>) {
+        let hovered = match (command_held, self.last_mouse) {
+            (true, Some(local)) => self.link_under(local),
+            _ => None,
+        };
+        let changed = match (&hovered, &self.link_hover) {
+            (Some(new), Some(old)) => {
+                (new.row, new.start_col, new.end_col) != (old.row, old.start_col, old.end_col)
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.link_hover = hovered;
+            cx.notify();
+        }
+    }
+
+    /// The hyperlink, URL, or existing file path under a pointer position.
+    fn link_under(&self, local: gpui::Point<Pixels>) -> Option<HoveredLink> {
+        let Point::Viewport(PointCoordinate { x, y }) = self.viewport_point(local) else {
+            return None;
+        };
+        let row = y as u16;
+        let cols = self.dimensions.get().cols;
+        let cell = |col: u16| {
+            self.terminal
+                .grid_ref(Point::Viewport(PointCoordinate { x: col, y }))
+        };
+
+        // An explicit OSC 8 hyperlink wins over anything detected in text.
+        let uri_at = |col: u16| -> Option<String> {
+            let mut buffer = vec![0u8; 2048];
+            let len = cell(col).ok()?.hyperlink_uri(&mut buffer).ok()?;
+            (len > 0).then(|| String::from_utf8_lossy(&buffer[..len]).into_owned())
+        };
+        if let Some(uri) = uri_at(x) {
+            if !HYPERLINK_SCHEMES
+                .iter()
+                .any(|scheme| uri.starts_with(scheme))
+            {
+                return None;
+            }
+            let mut start_col = x;
+            while start_col > 0 && uri_at(start_col - 1).as_ref() == Some(&uri) {
+                start_col -= 1;
+            }
+            let mut end_col = x + 1;
+            while end_col < cols && uri_at(end_col).as_ref() == Some(&uri) {
+                end_col += 1;
+            }
+            return Some(HoveredLink {
+                row,
+                start_col,
+                end_col,
+                target: LinkTarget::Url(uri),
+            });
+        }
+
+        // Rebuild the row's text, remembering the column of each character.
+        let mut chars = Vec::with_capacity(cols as usize);
+        let mut columns = Vec::with_capacity(cols as usize);
+        let mut graphemes = ['\0'; 16];
+        for col in 0..cols {
+            let Ok(grid_ref) = cell(col) else {
+                continue;
+            };
+            if grid_ref
+                .cell()
+                .and_then(|cell| cell.wide())
+                .is_ok_and(|wide| matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead))
+            {
+                continue;
+            }
+            let count = grid_ref.graphemes(&mut graphemes).unwrap_or(0);
+            let ch = if count == 0 { ' ' } else { graphemes[0] };
+            chars.push(ch);
+            columns.push(col);
+        }
+        let index = columns.iter().rposition(|col| *col <= x)?;
+        let cwd = self.metadata.cwd.clone();
+        let found = links::link_at(&chars, index, cwd.as_deref(), |path| path.exists())?;
+        let last = found.end - 1;
+        let last_width = unicode_width::UnicodeWidthChar::width(chars[last])
+            .unwrap_or(1)
+            .max(1);
+        Some(HoveredLink {
+            row,
+            start_col: columns[found.start],
+            end_col: columns[last] + last_width as u16,
+            target: found.target,
+        })
+    }
+
     fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(search) = &self.search {
             let focus = search.input.focus_handle(cx);
@@ -731,6 +853,14 @@ impl TerminalView {
         let local = event.position - bounds.origin;
         let mods = to_mods(&event.modifiers);
 
+        if event.button == MouseButton::Left
+            && event.modifiers.platform
+            && let Some(link) = self.link_under(local)
+        {
+            links::open(&link.target, cx);
+            return;
+        }
+
         if event.button == MouseButton::Left && self.selection_allowed(&event.modifiers) {
             self.selection.selecting = true;
             let point = self.viewport_point(local);
@@ -805,6 +935,8 @@ impl TerminalView {
             return;
         };
         let local = event.position - bounds.origin;
+        self.last_mouse = Some(local);
+        self.update_link_hover(event.modifiers.platform, cx);
 
         if self.selection.selecting {
             let Some(metrics) = self.metrics else {
@@ -984,7 +1116,17 @@ impl Render for TerminalView {
             .get_or_insert_with(|| CellMetrics::measure(SettingsStore::get(cx), window));
         let focused = self.focus_handle.is_focused(window);
         let frame = match self.renderer.build_frame(&self.terminal, focused) {
-            Ok(frame) => Some(frame),
+            Ok(mut frame) => {
+                if let Some(link) = &self.link_hover {
+                    frame.set_link(
+                        link.row,
+                        link.start_col,
+                        link.end_col,
+                        cx.theme().text_accent,
+                    );
+                }
+                Some(frame)
+            }
             Err(error) => {
                 log::error!("failed to build terminal frame: {error}");
                 None
@@ -1002,7 +1144,12 @@ impl Render for TerminalView {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
-            .cursor(CursorStyle::IBeam)
+            .cursor(if self.link_hover.is_some() {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            })
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
