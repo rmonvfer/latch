@@ -37,9 +37,10 @@ use crate::{
     control,
     git::{self, DiffStats},
     grid::{CellMetrics, GridRenderer},
+    hooks::{Bootstrapped, Hook, Precmd},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
-    osc::{OscEvent, OscScanner},
+    osc::{OscEvent, OscScanner, Piece},
     output, process_info,
     pty::{Pty, PtyDimensions},
     search::{self, SearchMatch},
@@ -141,6 +142,8 @@ const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
 
 /// Environment variable telling programs which pane they run in.
 pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
+/// Environment variable carrying the id shell integration stamps on hooks.
+pub const SESSION_ID_VARIABLE: &str = "TERMINAL_SESSION_ID";
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How often uncommitted changes are recounted.
@@ -179,6 +182,10 @@ pub struct TerminalView {
     activity: Activity,
     /// A command to type once the shell shows its first prompt.
     pending_startup: Option<String>,
+    /// What shell integration reported when the shell finished starting.
+    shell: Option<Bootstrapped>,
+    /// The shell's state at its most recent prompt.
+    prompt: Option<Precmd>,
     pane_id: u64,
     /// Secret proving a control request comes from a program in this pane.
     control_token: String,
@@ -282,6 +289,9 @@ impl TerminalView {
         command.env(PANE_ID_VARIABLE, pane_id.to_string());
         let control_token = control::new_token()?;
         command.env(control::TOKEN_VARIABLE, &control_token);
+        // Shell integration stamps its hooks with this id; others are ignored.
+        let session_id = control::new_token()?;
+        command.env(SESSION_ID_VARIABLE, &session_id);
         control::configure_command(&mut command, cx);
         let (pty, output) = Pty::spawn(command, initial, cwd)?;
         let initial_cwd = pty.initial_cwd().map(Path::to_path_buf);
@@ -434,10 +444,12 @@ impl TerminalView {
                 search: None,
                 link_hover: None,
                 last_mouse: None,
-                osc: OscScanner::default(),
+                osc: OscScanner::new(session_id),
                 bell,
                 activity: Activity::default(),
                 pending_startup: startup.map(str::to_string),
+                shell: None,
+                prompt: None,
                 pane_id,
                 control_token,
                 diff: None,
@@ -507,10 +519,12 @@ impl TerminalView {
     fn process_output(&mut self, chunks: &mut output::OutputBatch<'_>, cx: &mut Context<Self>) {
         let mut command_changed = false;
         for chunk in chunks {
-            for event in self.osc.scan(&chunk) {
-                command_changed |= self.apply_osc_event(event, cx);
+            for piece in self.osc.scan(&chunk) {
+                match piece {
+                    Piece::Output(bytes) => self.terminal.vt_write(&bytes),
+                    Piece::Event(event) => command_changed |= self.apply_osc_event(event, cx),
+                }
             }
-            self.terminal.vt_write(&chunk);
         }
         self.activity.output(Instant::now());
         if self.bell.replace(false) {
@@ -522,9 +536,21 @@ impl TerminalView {
         }
     }
 
+    fn apply_hook(&mut self, hook: Hook) {
+        match hook {
+            Hook::Bootstrapped(bootstrapped) => self.shell = Some(bootstrapped),
+            Hook::Precmd(precmd) => self.prompt = Some(precmd),
+            Hook::Preexec { .. } | Hook::CommandFinished { .. } => {}
+        }
+    }
+
     /// Returns whether the command state changed.
     fn apply_osc_event(&mut self, event: OscEvent, cx: &mut Context<Self>) -> bool {
         match event {
+            OscEvent::Hook(hook) => {
+                self.apply_hook(hook);
+                false
+            }
             OscEvent::PromptStarted => {
                 self.send_startup_command(cx);
                 false

@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
 };
@@ -43,6 +43,7 @@ pub struct Pty {
     killer: Box<dyn ChildKiller + Send + Sync>,
     input: mpsc::Sender<Vec<u8>>,
     shell_pid: Option<i32>,
+    initial_cwd: Option<PathBuf>,
 }
 
 impl Pty {
@@ -61,13 +62,13 @@ impl Pty {
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        match cwd.filter(|cwd| cwd.is_dir()) {
-            Some(cwd) => command.cwd(cwd),
-            None => {
-                if let Some(home) = std::env::var_os("HOME") {
-                    command.cwd(home);
-                }
-            }
+        let initial_cwd = cwd
+            .filter(|cwd| cwd.is_dir())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = &initial_cwd {
+            command.cwd(cwd);
         }
 
         let mut child = pair
@@ -121,6 +122,7 @@ impl Pty {
                 killer,
                 input: input_tx,
                 shell_pid,
+                initial_cwd,
             },
             output_rx,
         ))
@@ -129,6 +131,11 @@ impl Pty {
     /// A cloneable handle for sending bytes to the shell from callbacks.
     pub fn input_sender(&self) -> mpsc::Sender<Vec<u8>> {
         self.input.clone()
+    }
+
+    /// The directory the shell started in.
+    pub fn initial_cwd(&self) -> Option<&Path> {
+        self.initial_cwd.as_deref()
     }
 
     pub fn shell_pid(&self) -> Option<i32> {

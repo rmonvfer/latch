@@ -8,6 +8,7 @@ mod confirm;
 mod control;
 mod git;
 mod grid;
+mod hooks;
 mod input;
 mod links;
 mod mcp;

@@ -68,7 +68,11 @@ mod tests {
 
     use libghostty_vt::{Terminal, terminal::Options};
 
-    use crate::{osc::OscScanner, pty::OUTPUT_CHUNK_BYTES, search};
+    use crate::{
+        osc::{OscScanner, Piece},
+        pty::OUTPUT_CHUNK_BYTES,
+        search,
+    };
 
     #[derive(Default)]
     struct YieldOnce(bool);
@@ -190,7 +194,7 @@ mod tests {
         let mut expected = create();
         expected.vt_write(bytes);
         let mut actual = create();
-        let mut scanner = OscScanner::default();
+        let mut scanner = OscScanner::new("session".into());
         let mut events = Vec::new();
         let (sender, receiver) = async_channel::bounded(bytes.len());
         for byte in bytes {
@@ -201,8 +205,12 @@ mod tests {
             receiver,
             |batch| {
                 for chunk in batch {
-                    events.extend(scanner.scan(&chunk));
-                    actual.vt_write(&chunk);
+                    for piece in scanner.scan(&chunk) {
+                        match piece {
+                            Piece::Output(bytes) => actual.vt_write(&bytes),
+                            Piece::Event(event) => events.push(event),
+                        }
+                    }
                 }
                 true
             },
@@ -215,6 +223,14 @@ mod tests {
             search::screen_text(&actual).unwrap(),
             search::screen_text(&expected).unwrap()
         );
-        assert_eq!(events, OscScanner::default().scan(bytes));
+        let contiguous: Vec<_> = OscScanner::new("session".into())
+            .scan(bytes)
+            .into_iter()
+            .filter_map(|piece| match piece {
+                Piece::Event(event) => Some(event),
+                Piece::Output(_) => None,
+            })
+            .collect();
+        assert_eq!(events, contiguous);
     }
 }
