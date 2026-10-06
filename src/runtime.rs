@@ -343,10 +343,10 @@ impl Rpc {
         );
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let mut client = Self {
-            stream,
-            token: read_token(paths)?,
-        };
+        let token = read_token(paths).context(
+            "the running session runtime is from an older build; stop it to start a current one",
+        )?;
+        let mut client = Self { stream, token };
         match client.request(Request::Ping)? {
             Response::Ready { version } if version == VERSION => Ok(client),
             Response::Ready { version } => {
