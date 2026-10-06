@@ -11,7 +11,8 @@ use gpui::{
 };
 
 use crate::{
-    agents::{AgentProfile, AgentStatus},
+    agent_events::AgentTurn,
+    agents::AgentProfile,
     components::{self, icon, icon_button, keybinding},
     confirm::confirm_close,
     git::{self, DiffStats},
@@ -1003,7 +1004,7 @@ impl Workspace {
                     directory: metadata.directory.clone(),
                     branch: metadata.branch.clone(),
                     attention: self.attention.contains(&id),
-                    agent: metadata.agent,
+                    agent: metadata.agent.clone(),
                     diff: metadata.diff,
                     failed: metadata.command_started.is_none()
                         && metadata
@@ -1220,6 +1221,25 @@ impl Workspace {
                     format!("{} is done", agent.name())
                 };
                 (tab_title, body)
+            }
+            // As Warp: the prompt, quoted, and what became of it.
+            Attention::AgentTurn {
+                agent,
+                turn,
+                prompt,
+                message,
+            } => {
+                let subject = match prompt {
+                    Some(prompt) => format!("“{prompt}”"),
+                    None => agent.name().to_string(),
+                };
+                let (outcome, default_body) = match turn {
+                    AgentTurn::Blocked => ("needs you", "Waiting for your input."),
+                    AgentTurn::Failed => ("failed", "The agent hit an error."),
+                    AgentTurn::Done | AgentTurn::InProgress => ("finished", "Task completed."),
+                };
+                let body = message.clone().unwrap_or_else(|| default_body.to_string());
+                (format!("{subject} {outcome}"), body)
             }
             Attention::CommandFinished(outcome) => {
                 let duration = format_duration(outcome.duration);
@@ -1615,7 +1635,8 @@ impl Workspace {
                             view.read(cx)
                                 .metadata()
                                 .agent
-                                .is_some_and(|agent| agent.status == AgentStatus::NeedsInput)
+                                .as_ref()
+                                .is_some_and(|agent| agent.turn == Some(AgentTurn::Blocked))
                         })
                     })
             })
@@ -1634,7 +1655,8 @@ impl Workspace {
                 view.read(cx)
                     .metadata()
                     .agent
-                    .is_some_and(|agent| agent.status == AgentStatus::NeedsInput)
+                    .as_ref()
+                    .is_some_and(|agent| agent.turn == Some(AgentTurn::Blocked))
             });
             if let Some(view) = waiting {
                 window.focus(&view.focus_handle(cx), cx);

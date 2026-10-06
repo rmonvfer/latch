@@ -11,8 +11,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent_badge,
-    agents::AgentStatus,
+    agent_badge, agent_events,
     components::{
         DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
         menu_surface,
@@ -21,7 +20,7 @@ use crate::{
     pane_group::{DraggedPane, Edge},
     settings::{Settings, SettingsStore},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
-    terminal_view::{AgentState, TerminalView},
+    terminal_view::TerminalView,
     theme::{self, Theme},
     workspace::{MenuKind, Target, Workspace},
 };
@@ -135,6 +134,8 @@ fn filter_rows(
 
 /// Indentation of tabs inside a group.
 const GROUP_INDENT: f32 = 14.;
+/// The box a tab row's icon sits in: an agent's brand circle fills it.
+const TAB_ICON_BOX: f32 = 18.;
 
 /// Payload while a tab is being dragged.
 #[derive(Clone)]
@@ -384,7 +385,6 @@ impl Workspace {
                             })),
                     ),
             )
-            .children(self.render_attention(theme, cx))
             .when(searching && rows.is_empty(), |sidebar| {
                 sidebar.child(
                     div()
@@ -605,81 +605,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_attention(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let tabs = self.needs_attention(cx);
-        if tabs.is_empty() {
-            return None;
-        }
-        let hover = theme.ghost_hover;
-        let rows = tabs
-            .into_iter()
-            .filter_map(|id| {
-                let display = self.display(id, cx)?;
-                let waiting = self.panes_of(id).is_some_and(|panes| {
-                    panes.read(cx).views().iter().any(|view| {
-                        view.read(cx)
-                            .metadata()
-                            .agent
-                            .is_some_and(|agent| agent.status == AgentStatus::NeedsInput)
-                    })
-                });
-                let reason = if waiting {
-                    "Needs input"
-                } else if display.exited {
-                    "Finished"
-                } else {
-                    "Activity"
-                };
-                Some(
-                    div()
-                        .id(("attention-tab", id.element_id()))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .px(px(10.))
-                        .py(px(5.))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(hover))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.activate_attention(id, window, cx);
-                        }))
-                        .child(icon("circle-alert", theme::ICON_SMALL, theme.text_accent))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(theme::TEXT_DEFAULT)
-                                .child(display.title),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(theme::TEXT_SMALL)
-                                .text_color(theme.text_muted)
-                                .child(reason),
-                        )
-                        .into_any_element(),
-                )
-            })
-            .collect::<Vec<_>>();
-        Some(
-            div()
-                .flex_none()
-                .border_b_1()
-                .border_color(theme.border_variant)
-                .child(menu_caption("Needs you", theme))
-                .child(
-                    div()
-                        .id("attention-list")
-                        .max_h(px(144.))
-                        .overflow_y_scroll()
-                        .children(rows),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn render_tab_row(
         &self,
         id: TabId,
@@ -710,11 +635,19 @@ impl Workspace {
             .directory
             .filter(|_| expanded && sidebar.show_directory);
         let branch = display.branch.filter(|_| expanded && sidebar.show_branch);
-        let agent = display.agent.filter(|_| expanded);
         let diff = display
             .diff
             .filter(|diff| expanded && sidebar.show_branch && diff.files > 0);
-        let has_details = directory.is_some() || branch.is_some() || agent.is_some();
+        let has_details = directory.is_some() || branch.is_some();
+        // An agent's tab reads as the prompt it works on, as in Warp, or
+        // else the title it set, without its spinner.
+        let title = match &display.agent {
+            Some(state) => state
+                .prompt
+                .clone()
+                .unwrap_or_else(|| agent_events::clean_title(&display.title).to_string().into()),
+            None => display.title.clone(),
+        };
         let icon_color = if active { theme.text } else { theme.text_muted };
         let title_color = if active { theme.text } else { theme.text_muted };
         let in_group = group.is_some();
@@ -832,14 +765,24 @@ impl Workspace {
                         .items_center()
                         .gap(px(8.))
                         .h(px(22.))
-                        .child(match display.agent {
-                            Some(state) => {
-                                agent_badge::status_icon(state, theme::ICON_SMALL, theme)
-                            }
-                            None => {
-                                icon(display.icon, theme::ICON_SMALL, icon_color).into_any_element()
-                            }
-                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(TAB_ICON_BOX))
+                                .child(match &display.agent {
+                                    Some(state) => agent_badge::agent_icon(
+                                        state,
+                                        px(TAB_ICON_BOX),
+                                        theme.surface,
+                                        theme,
+                                    ),
+                                    None => icon(display.icon, theme::ICON_SMALL, icon_color)
+                                        .into_any_element(),
+                                }),
+                        )
                         .child(match renaming {
                             Some(input) => div().flex_1().min_w_0().child(input).into_any_element(),
                             None => div()
@@ -848,7 +791,7 @@ impl Workspace {
                                 .truncate()
                                 .text_size(theme::TEXT_DEFAULT)
                                 .text_color(title_color)
-                                .child(display.title)
+                                .child(title)
                                 .into_any_element(),
                         })
                         .when(
@@ -871,7 +814,7 @@ impl Workspace {
                         )
                         // A failed command outranks other activity.
                         .when(display.failed || display.attention, |line| {
-                            line.child(div().flex_none().size(px(6.)).rounded_full().bg(
+                            line.child(div().flex_none().size(px(8.)).rounded_full().bg(
                                 if display.failed {
                                     theme::to_hsla(theme.terminal.ansi[1])
                                 } else {
@@ -903,7 +846,7 @@ impl Workspace {
                         }),
                 )
                 .when(has_details, |row| {
-                    row.child(tab_details(agent, directory, branch, diff, theme))
+                    row.child(tab_details(directory, branch, diff, theme))
                 }),
         )
     }
@@ -1475,13 +1418,11 @@ pub(crate) fn diff_label(diff: DiffStats, theme: &Theme) -> impl IntoElement {
 }
 
 fn tab_details(
-    agent: Option<AgentState>,
     directory: Option<SharedString>,
     branch: Option<SharedString>,
     diff: Option<DiffStats>,
     theme: &Theme,
 ) -> impl IntoElement {
-    let has_agent = agent.is_some();
     let has_branch = branch.is_some();
     let separator_color = theme.text_muted.opacity(0.4);
     let muted = theme.text_muted;
@@ -1491,23 +1432,10 @@ fn tab_details(
         .items_center()
         .gap(px(6.))
         .min_w_0()
-        // Align with the title, past the 14px icon and 8px gap.
-        .pl(px(22.))
+        // Align with the title, past the icon's box and the 8px gap.
+        .pl(px(TAB_ICON_BOX + 8.))
         .text_size(theme::TEXT_SMALL)
         .text_color(muted)
-        .children(agent.map(|state| {
-            div()
-                .flex_none()
-                .text_color(agent_badge::status_color(state.status, theme))
-                .child(SharedString::from(format!(
-                    "{} · {}",
-                    state.agent.name(),
-                    agent_badge::status_label(state.status)
-                )))
-        }))
-        .when(has_agent && (has_branch || directory.is_some()), |row| {
-            row.child(div().flex_none().text_color(separator_color).child("•"))
-        })
         .children(branch.map(|branch| {
             div()
                 .flex()

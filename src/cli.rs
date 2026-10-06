@@ -13,6 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::{
+    agent_events,
     agent_resume::{self, ResumableAgent},
     control::{self, NewTab, PaneTarget, Request, SplitDirection},
     mcp,
@@ -158,9 +159,10 @@ fn joined(words: Vec<String>) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
 }
 
-/// Report the session a hook announces to the pane it runs in. Hooks must
-/// never get in an agent's way, so every failure is silent.
-fn report_agent_session(agent: &str) {
+/// Report what a hook announces, a session or a turn's progress, to the
+/// pane it runs in. Hooks must never get in an agent's way, so every
+/// failure is silent.
+fn report_agent_hook(agent: &str) {
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return;
@@ -169,18 +171,26 @@ fn report_agent_session(agent: &str) {
     if std::env::var_os(control::TOKEN_VARIABLE).is_none() {
         return;
     }
-    let Some(session) = ResumableAgent::parse(agent).and_then(|agent| {
-        let payload = serde_json::from_str::<Value>(&input).ok()?;
-        agent_resume::session_from_hook(agent, &payload)
-    }) else {
+    let (Some(resumable), Ok(payload)) = (
+        ResumableAgent::parse(agent),
+        serde_json::from_str::<Value>(&input),
+    ) else {
         return;
     };
-    let _ = control::ControlClient::connect().and_then(|mut client| {
-        client.request(Request::ReportAgentSession {
+    let request = if let Some(session) = agent_resume::session_from_hook(resumable, &payload) {
+        Request::ReportAgentSession {
             agent: agent.to_string(),
             session_id: session.session_id,
-        })
-    });
+        }
+    } else if let Some(event) = agent_events::event_from_hook(&payload) {
+        Request::ReportAgentEvent {
+            agent: agent.to_string(),
+            event,
+        }
+    } else {
+        return;
+    };
+    let _ = control::ControlClient::connect().and_then(|mut client| client.request(request));
 }
 
 fn run(command: Command) -> Result<()> {
@@ -275,11 +285,11 @@ fn run(command: Command) -> Result<()> {
                 println!("updated {}", path.display());
             }
             println!(
-                "{} now reports its sessions; panes running it resume them after a restart.",
+                "{} now reports its sessions and turns: tabs show what it works on, and panes running it resume after a restart.",
                 agent.display_name()
             );
         }
-        Command::AgentHook { agent } => report_agent_session(&agent),
+        Command::AgentHook { agent } => report_agent_hook(&agent),
     }
     Ok(())
 }

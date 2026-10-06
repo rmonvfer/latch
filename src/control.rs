@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_badge,
+    agent_events::AgentEvent,
     agent_resume::{self, AgentSession, ResumableAgent},
     notifications,
     pane_tree::Axis,
@@ -145,6 +146,13 @@ pub enum Request {
         agent: String,
         session_id: String,
     },
+    /// A coding agent in the calling pane reported progress on its turn,
+    /// shown on the pane's tab. As with sessions, only the caller's own
+    /// pane is changed.
+    ReportAgentEvent {
+        agent: String,
+        event: AgentEvent,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -223,7 +231,12 @@ impl Request {
     /// Listing tabs reveals only titles and directories; everything else
     /// reads terminal contents or acts on the user's behalf.
     fn needs_approval(&self) -> bool {
-        !matches!(self, Request::ListTabs | Request::ReportAgentSession { .. })
+        !matches!(
+            self,
+            Request::ListTabs
+                | Request::ReportAgentSession { .. }
+                | Request::ReportAgentEvent { .. }
+        )
     }
 }
 
@@ -290,6 +303,29 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
                         "not a session reported by a running Claude Code or Codex".to_string(),
                     ),
                     (_, None) => Err("only programs inside a pane can report sessions".to_string()),
+                };
+                let _ = reply.send(result);
+                continue;
+            }
+            if let Request::ReportAgentEvent { agent, event } = &request {
+                // As with sessions, only the agent's own hooks may report.
+                let agent = ResumableAgent::parse(agent).filter(|agent| {
+                    caller
+                        .peer
+                        .is_some_and(|pid| agent_resume::reported_by(*agent, pid))
+                });
+                let result = match (agent, caller.token.clone()) {
+                    (Some(agent), Some(token)) => cx
+                        .update(|cx| {
+                            window.update(cx, |workspace, _, cx| {
+                                workspace.report_agent_event(&token, agent, event.clone(), cx)
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("the window is closed".to_string())),
+                    (None, _) => {
+                        Err("not an event reported by a running Claude Code or Codex".to_string())
+                    }
+                    (_, None) => Err("only programs inside a pane can report events".to_string()),
                 };
                 let _ = reply.send(result);
                 continue;
@@ -622,6 +658,26 @@ impl Workspace {
         }
     }
 
+    /// Show the turn progress a pane's agent reported on its tab.
+    fn report_agent_event(
+        &mut self,
+        token: &str,
+        agent: ResumableAgent,
+        event: AgentEvent,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let view = self
+            .layout
+            .ordered_tabs()
+            .into_iter()
+            .filter_map(|tab| self.panes_of(tab))
+            .flat_map(|panes| panes.read(cx).views())
+            .find(|view| view.read(cx).has_control_token(token))
+            .ok_or("no pane has that token")?;
+        view.update(cx, |view, cx| view.apply_agent_event(agent, event, cx));
+        Ok(json!({}))
+    }
+
     /// Remember the agent session a pane's program reported, so the pane
     /// resumes it after a restart.
     fn report_agent_session(
@@ -700,7 +756,9 @@ impl Workspace {
                 Ok(json!({ "tab": tab.element_id(), "pane": pane.read(cx).pane_id() }))
             }
             // Answered before approval, with the caller's token.
-            Request::ReportAgentSession { .. } => Err("reported without a caller".to_string()),
+            Request::ReportAgentSession { .. } | Request::ReportAgentEvent { .. } => {
+                Err("reported without a caller".to_string())
+            }
             Request::Notify {
                 target,
                 title,
@@ -804,7 +862,8 @@ impl Workspace {
                     "branch": display.branch.as_ref().map(ToString::to_string),
                     "agent": display.agent.map(|state| json!({
                         "name": state.agent.name(),
-                        "status": agent_badge::status_label(state.status),
+                        "status": state.turn.map(agent_badge::turn_label),
+                        "prompt": state.prompt.as_ref().map(ToString::to_string),
                     })),
                     "panes": panes,
                 }))

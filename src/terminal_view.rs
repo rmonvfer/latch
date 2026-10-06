@@ -22,8 +22,9 @@ use libghostty_vt::{
 };
 
 use crate::{
-    agent_resume::AgentSession,
-    agents::{Agent, AgentStatus},
+    agent_events::{AgentEvent, AgentTurn, TurnState},
+    agent_resume::{AgentSession, ResumableAgent},
+    agents::Agent,
     block_filter::{self, FilterOptions},
     block_view::{
         self, BlockAction, FilterBar, FilterChange, Item, ItemContent, OnBlockAction,
@@ -111,16 +112,19 @@ pub struct TabMetadata {
     pub command_started: Option<Instant>,
     /// How the most recent command ended, per shell integration.
     pub last_command: Option<CommandOutcome>,
-    /// The coding agent in the foreground, if any, and what it is doing.
+    /// The coding agent in the foreground, if any, and how its turn goes.
     pub agent: Option<AgentState>,
     /// Uncommitted changes in the shell's repository.
     pub diff: Option<DiffStats>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentState {
     pub agent: Agent,
-    pub status: AgentStatus,
+    /// Where its turn stands, known only from its hooks.
+    pub turn: Option<AgentTurn>,
+    /// The prompt it works on, from its hooks.
+    pub prompt: Option<SharedString>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,6 +160,14 @@ pub enum Attention {
     AgentWaiting {
         agent: Agent,
         needs_input: bool,
+    },
+    /// An agent's hooks reported its turn done, failed, or blocked on the
+    /// user.
+    AgentTurn {
+        agent: Agent,
+        turn: AgentTurn,
+        prompt: Option<String>,
+        message: Option<String>,
     },
 }
 
@@ -260,6 +272,8 @@ pub struct TerminalView {
     agent_session: Option<AgentSession>,
     /// Whether a coding agent was running at the last metadata refresh.
     agent_was_running: bool,
+    /// How the agent's current turn goes, as its hooks report it.
+    agent_turn: Option<(ResumableAgent, TurnState)>,
 }
 
 /// A link in the viewport, in grid coordinates (end column exclusive).
@@ -526,6 +540,40 @@ impl TerminalView {
         cx.emit(TerminalEvent::MetadataChanged);
     }
 
+    /// Take in what the agent's hook reported about its turn, and call for
+    /// attention when the turn ends or needs the user.
+    pub fn apply_agent_event(
+        &mut self,
+        agent: ResumableAgent,
+        event: AgentEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .agent_turn
+            .as_ref()
+            .is_none_or(|(reporting, _)| *reporting != agent)
+        {
+            self.agent_turn = Some((agent, TurnState::default()));
+        }
+        let Some((_, state)) = &mut self.agent_turn else {
+            return;
+        };
+        let changed = state.apply(event);
+        let attention = state
+            .turn
+            .filter(|turn| changed && *turn != AgentTurn::InProgress)
+            .map(|turn| Attention::AgentTurn {
+                agent: agent.running_as(),
+                turn,
+                prompt: state.prompt.clone(),
+                message: state.message.clone(),
+            });
+        self.refresh_metadata(cx);
+        if let Some(attention) = attention {
+            cx.emit(TerminalEvent::Attention(attention));
+        }
+    }
+
     pub fn agent_session(&self) -> Option<&AgentSession> {
         self.agent_session.as_ref()
     }
@@ -679,6 +727,7 @@ impl TerminalView {
                 completion: None,
                 agent_session: None,
                 agent_was_running: false,
+                agent_turn: None,
             }
         }))
     }
@@ -824,8 +873,14 @@ impl TerminalView {
                     exit_code: *exit_code,
                     duration: Duration::from_millis(*duration_ms),
                 }),
+                // An agent with hooks reports its own turns.
+                crate::runtime_protocol::Attention::AgentWaiting { .. }
+                    if self.agent_turn.is_some() =>
+                {
+                    return;
+                }
                 crate::runtime_protocol::Attention::AgentWaiting { needs_input, .. } => {
-                    match self.metadata.agent {
+                    match &self.metadata.agent {
                         Some(state) => Attention::AgentWaiting {
                             agent: state.agent,
                             needs_input: *needs_input,
@@ -2346,6 +2401,7 @@ impl TerminalView {
         let agent_running = metadata.agent.is_some();
         if self.agent_was_running && !agent_running {
             self.agent_session = None;
+            self.agent_turn = None;
         }
         self.agent_was_running = agent_running;
         if metadata != self.metadata {
@@ -2395,13 +2451,19 @@ impl TerminalView {
             ]
             .into_iter()
             .find(|agent| Some(agent.name()) == info.agent.as_deref())
-            .map(|agent| AgentState {
-                agent,
-                status: match info.status.as_str() {
-                    "working" => AgentStatus::Working,
-                    "needs_input" => AgentStatus::NeedsInput,
-                    _ => AgentStatus::Idle,
-                },
+            .map(|agent| {
+                let reported = self
+                    .agent_turn
+                    .as_ref()
+                    .filter(|(reporting, _)| reporting.running_as() == agent)
+                    .map(|(_, state)| state);
+                AgentState {
+                    agent,
+                    turn: reported.and_then(|state| state.turn),
+                    prompt: reported
+                        .and_then(|state| state.prompt.clone())
+                        .map(Into::into),
+                }
             }),
         }
     }

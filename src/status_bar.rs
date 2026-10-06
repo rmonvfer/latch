@@ -263,19 +263,24 @@ impl Workspace {
                     return Some(
                         status_label()
                             .min_w_0()
-                            .child(agent_badge::status_icon(state, theme::ICON_XSMALL, theme))
+                            .child(agent_badge::agent_icon(
+                                &state,
+                                px(14.),
+                                theme.status_bar,
+                                theme,
+                            ))
                             .child(
                                 div()
                                     .truncate()
                                     .text_color(theme.text)
                                     .child(state.agent.name()),
                             )
-                            .child(
+                            .children(state.turn.map(|turn| {
                                 div()
                                     .flex_none()
-                                    .text_color(agent_badge::status_color(state.status, theme))
-                                    .child(agent_badge::status_label(state.status)),
-                            )
+                                    .text_color(agent_badge::turn_color(turn, theme))
+                                    .child(agent_badge::turn_label(turn))
+                            }))
                             .into_any_element(),
                     );
                 }

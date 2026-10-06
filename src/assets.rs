@@ -6,7 +6,7 @@ use gpui::{App, AssetSource, SharedString};
 /// Icons and fonts compiled into the binary.
 pub struct Assets;
 
-const ICONS: [(&str, &[u8]); 42] = [
+const ICONS: [(&str, &[u8]); 49] = [
     (
         "icons/bookmark-filled.svg",
         include_bytes!("../assets/icons/bookmark-filled.svg"),
@@ -157,6 +157,34 @@ const ICONS: [(&str, &[u8]); 42] = [
         include_bytes!("../assets/icons/terminal.svg"),
     ),
     ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
+    (
+        "icons/triangle-alert.svg",
+        include_bytes!("../assets/icons/triangle-alert.svg"),
+    ),
+    (
+        "icons/stop-filled.svg",
+        include_bytes!("../assets/icons/stop-filled.svg"),
+    ),
+    (
+        "icons/brands/claude.svg",
+        include_bytes!("../assets/icons/brands/claude.svg"),
+    ),
+    (
+        "icons/brands/openai.svg",
+        include_bytes!("../assets/icons/brands/openai.svg"),
+    ),
+    (
+        "icons/brands/gemini.svg",
+        include_bytes!("../assets/icons/brands/gemini.svg"),
+    ),
+    (
+        "icons/brands/opencode.svg",
+        include_bytes!("../assets/icons/brands/opencode.svg"),
+    ),
+    (
+        "icons/brands/cursor.svg",
+        include_bytes!("../assets/icons/brands/cursor.svg"),
+    ),
 ];
 
 const FONTS: [&[u8]; 4] = [

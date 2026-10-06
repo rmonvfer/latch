@@ -2,7 +2,9 @@
 //! how to resume it, and the hooks that let agents report their sessions.
 //!
 //! Agents report their session through a `SessionStart` hook that runs
-//! `terminal agent-hook <agent>` with the hook's JSON on stdin. A restored
+//! `terminal agent-hook <agent>` with the hook's JSON on stdin; the same
+//! command, on the hooks `agent_events` lists, reports how each turn goes.
+//! A restored
 //! pane types the resume command into its fresh shell, so quitting the
 //! agent leaves a usable shell. The approach follows herdr
 //! (github.com/herdrdev/herdr, Apache-2.0).
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
+    agent_events::{CLAUDE_EVENTS, CODEX_EVENTS},
     agents::{self, Agent},
     process_info,
 };
@@ -144,10 +147,10 @@ fn hook_command(agent: ResumableAgent) -> Result<String> {
     ))
 }
 
-/// Add a `SessionStart` command hook to a hooks config (Claude's
+/// Add a command hook on `event` to a hooks config (Claude's
 /// `settings.json` and Codex's `hooks.json` share the shape), replacing an
 /// earlier one of ours and keeping every other hook.
-fn add_session_hook(config: &mut Value, command: &str) -> Result<()> {
+fn add_hook(config: &mut Value, event: &str, command: &str) -> Result<()> {
     let Some(root) = config.as_object_mut() else {
         bail!("the config is not a JSON object");
     };
@@ -157,11 +160,11 @@ fn add_session_hook(config: &mut Value, command: &str) -> Result<()> {
     let Some(hooks) = hooks.as_object_mut() else {
         bail!("the config's hooks are not an object");
     };
-    let session_start = hooks
-        .entry("SessionStart")
+    let event_hooks = hooks
+        .entry(event)
         .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(entries) = session_start.as_array_mut() else {
-        bail!("the config's SessionStart hooks are not a list");
+    let Some(entries) = event_hooks.as_array_mut() else {
+        bail!("the config's {event} hooks are not a list");
     };
     let ours = |hook: &Value| {
         hook.get("command")
@@ -265,8 +268,21 @@ fn home() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-/// Set up `agent` to report its sessions to this terminal, returning the
-/// files changed.
+/// Add our hook on every event `agent` reports through.
+fn add_hooks(config: &mut Value, agent: ResumableAgent, command: &str) -> Result<()> {
+    let events: &[&str] = match agent {
+        ResumableAgent::Claude => &CLAUDE_EVENTS,
+        ResumableAgent::Codex => &CODEX_EVENTS,
+    };
+    add_hook(config, "SessionStart", command)?;
+    for event in events {
+        add_hook(config, event, command)?;
+    }
+    Ok(())
+}
+
+/// Set up `agent` to report its sessions and turns to this terminal,
+/// returning the files changed.
 pub fn install(agent: ResumableAgent) -> Result<Vec<PathBuf>> {
     let command = hook_command(agent)?;
     match agent {
@@ -275,7 +291,7 @@ pub fn install(agent: ResumableAgent) -> Result<Vec<PathBuf>> {
             fs::create_dir_all(&dir)?;
             let settings = dir.join("settings.json");
             let mut config = read_json(&settings)?;
-            add_session_hook(&mut config, &command)?;
+            add_hooks(&mut config, agent, &command)?;
             replace_file(&settings, &(serde_json::to_string_pretty(&config)? + "\n"))?;
             Ok(vec![settings])
         }
@@ -286,7 +302,7 @@ pub fn install(agent: ResumableAgent) -> Result<Vec<PathBuf>> {
             }
             let hooks = dir.join("hooks.json");
             let mut config = read_json(&hooks)?;
-            add_session_hook(&mut config, &command)?;
+            add_hooks(&mut config, agent, &command)?;
             replace_file(&hooks, &(serde_json::to_string_pretty(&config)? + "\n"))?;
             let toml = dir.join("config.toml");
             let existing = fs::read_to_string(&toml).unwrap_or_default();
@@ -345,8 +361,18 @@ mod tests {
                 { "hooks": [{ "type": "command", "command": "'/old/terminal' agent-hook claude" }] }
             ]}
         });
-        add_session_hook(&mut config, "'/new/terminal' agent-hook claude").unwrap();
-        add_session_hook(&mut config, "'/new/terminal' agent-hook claude").unwrap();
+        add_hook(
+            &mut config,
+            "SessionStart",
+            "'/new/terminal' agent-hook claude",
+        )
+        .unwrap();
+        add_hook(
+            &mut config,
+            "SessionStart",
+            "'/new/terminal' agent-hook claude",
+        )
+        .unwrap();
         let entries = config["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["hooks"][0]["command"], "echo mine");
