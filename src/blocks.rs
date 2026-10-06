@@ -39,6 +39,8 @@ pub struct Block {
     pub started_at_ms: u64,
     /// Whether only the header shows.
     pub collapsed: bool,
+    /// Bookmarked to jump back to with Option-Up and Option-Down.
+    pub bookmarked: bool,
     rows: Vec<Rc<FrameRow>>,
     /// `rows` shared with the painter, rebuilt when rows arrive.
     shared: Rows,
@@ -55,6 +57,7 @@ impl Block {
             started: Instant::now(),
             started_at_ms: summary.started_at_ms,
             collapsed: false,
+            bookmarked: false,
             rows: Vec::new(),
             shared: Rows::default(),
         };
@@ -92,6 +95,7 @@ impl Block {
     }
 
     /// The block's output as plain text, one line per row.
+    #[cfg(test)]
     pub fn output_text(&self) -> String {
         self.rows
             .iter()

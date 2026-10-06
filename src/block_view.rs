@@ -11,8 +11,9 @@ use std::{
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, FontWeight, Hsla, ListOffset, ListState, Pixels, Point,
-    SharedString, Window, canvas, div, fill, list, point, prelude::*, px, size,
+    AnyElement, App, Bounds, ClickEvent, Entity, FontWeight, Hsla, ListOffset, ListState,
+    MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window, canvas, div, fill, list,
+    point, prelude::*, px, size,
 };
 use libghostty_vt::style::RgbColor;
 
@@ -23,6 +24,7 @@ use crate::{
     grid::{CellMetrics, Frame, paint_rows},
     process_info::shorten_home,
     runtime_protocol::BlockContext,
+    text_input::TextInput,
     theme::{self, Theme},
     tooltip::text_tooltip,
 };
@@ -43,6 +45,7 @@ const CONTEXT_SCALE: f32 = 0.9;
 const FAILURE_STRIPE: f32 = 5.;
 const SELECTION_BORDER: f32 = 2.;
 const TOOLBELT_BUTTON: f32 = 26.;
+const FILTER_BAR_WIDTH: f32 = 380.;
 
 /// What one list entry shows.
 pub enum ItemContent {
@@ -62,6 +65,11 @@ pub struct Item {
     selection: Option<BlockSelection>,
     /// Whether a hairline divides the block from what is above it.
     divider: bool,
+    bookmarked: bool,
+    /// The filter field, while the block's output is filtered.
+    filter: Option<Entity<TextInput>>,
+    /// Search matches in the block's rows.
+    matches: Vec<RowMatch>,
 }
 
 /// Where each visible block's output was last painted, for mapping the
@@ -124,16 +132,38 @@ impl PaintedOutputs {
     }
 }
 
-/// Something done to a block from its header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Something done to a block from its toolbelt, its menu, or a shortcut.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BlockAction {
     Select,
     ToggleCollapsed,
+    /// The command and its output.
+    CopyAll,
     CopyCommand,
     CopyOutput,
+    CopyDirectory,
+    CopyBranch,
     Rerun,
     /// Scroll so the block's header is at the top.
     ScrollToTop,
+    /// Scroll so the block's last row is at the bottom.
+    ScrollToBottom,
+    ToggleBookmark,
+    /// Show only the output lines matching a filter.
+    ToggleFilter,
+    /// Search the block's output.
+    FindInBlock,
+    /// Open the block's menu at this point.
+    OpenMenu(Point<Pixels>),
+}
+
+/// A search match in a block's rows, in grid columns (end exclusive).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowMatch {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+    pub current: bool,
 }
 
 /// Handles a block action for the block at an index.
@@ -168,7 +198,20 @@ impl Item {
             selected,
             selection: None,
             divider: true,
+            bookmarked: block.bookmarked,
+            filter: None,
+            matches: Vec::new(),
         }
+    }
+
+    pub fn with_filter(mut self, filter: Option<Entity<TextInput>>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    pub fn with_matches(mut self, matches: Vec<RowMatch>) -> Self {
+        self.matches = matches;
+        self
     }
 
     pub fn with_divider(mut self, divider: bool) -> Self {
@@ -315,6 +358,12 @@ fn header_height(metrics: CellMetrics) -> Pixels {
     metrics.height * (TOP_LINES + CONTEXT_SCALE + CONTEXT_TO_COMMAND_LINES + 1.)
 }
 
+/// How far below a block's top its output starts, for a block with a
+/// command and no filter bar.
+pub fn output_top(metrics: CellMetrics) -> Pixels {
+    header_height(metrics) + metrics.height * COMMAND_TO_OUTPUT_LINES
+}
+
 #[tracing::instrument(skip_all)]
 fn render_item(
     index: usize,
@@ -336,6 +385,7 @@ fn render_item(
     let output_height = metrics.height * row_count as f32;
     let padding = metrics.padding + HORIZONTAL_INSET;
     let selection = item.selection;
+    let matches = item.matches.clone();
 
     let output = canvas(
         |_, _, _| {},
@@ -356,6 +406,16 @@ fn render_item(
             }
             if let Some(frame) = &live_frame {
                 frame.paint_content(origin, metrics, window, cx);
+            }
+            for found in &matches {
+                let top = selection_origin.y + metrics.height * found.row as f32;
+                let left = selection_origin.x + metrics.width * found.start as f32;
+                let width = metrics.width * (found.end - found.start).max(1) as f32;
+                let opacity = if found.current { 0.6 } else { 0.25 };
+                window.paint_quad(fill(
+                    Bounds::new(point(left, top), size(width, metrics.height)),
+                    palette.accent.opacity(opacity),
+                ));
             }
             if let Some(selection) = selection {
                 let right = bounds.right() - padding;
@@ -401,6 +461,13 @@ fn render_item(
         .pb(metrics.height * BOTTOM_LINES)
         .when(item.header.is_none(), |this| this.pt(metrics.height * 0.5))
         .on_click(move |_: &ClickEvent, window, cx| select(BlockAction::Select, index, window, cx))
+        .on_mouse_down(MouseButton::Right, {
+            let on_action = on_action.clone();
+            move |event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                on_action(BlockAction::OpenMenu(event.position), index, window, cx);
+            }
+        })
         .children(item.header.as_ref().map(|header| {
             div()
                 .pt(metrics.height * TOP_LINES)
@@ -409,6 +476,11 @@ fn render_item(
                 })
                 .child(render_header_lines(index, header, metrics, palette))
         }))
+        .children(
+            item.filter
+                .clone()
+                .map(|input| render_filter_bar(input, metrics, palette)),
+        )
         .child(output)
         // The stripe and the selection border sit over the block, so they
         // never change its size.
@@ -432,9 +504,43 @@ fn render_item(
                     .border_color(palette.accent),
             )
         })
-        .children(item.header.as_ref().map(|header| {
-            render_toolbelt(index, header, item.collapsed, metrics, palette, on_action)
+        .children(item.header.as_ref().map(|_| {
+            render_toolbelt(
+                index,
+                item.bookmarked,
+                item.filter.is_some(),
+                metrics,
+                palette,
+                on_action,
+            )
         }))
+        .into_any_element()
+}
+
+/// The field that filters a block's output, under its command.
+fn render_filter_bar(
+    input: Entity<TextInput>,
+    metrics: CellMetrics,
+    palette: Palette,
+) -> AnyElement {
+    div()
+        .px(metrics.padding + HORIZONTAL_INSET)
+        .pb(metrics.height * COMMAND_TO_OUTPUT_LINES)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .w(px(FILTER_BAR_WIDTH))
+                .px(px(6.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(palette.outline)
+                .bg(palette.surface)
+                .child(icon("list-filter", px(12.), palette.muted))
+                .child(input),
+        )
         .into_any_element()
 }
 
@@ -483,17 +589,24 @@ fn render_header_lines(
         .into_any_element()
 }
 
-/// The block's actions, shown on hover at its top right.
+/// The block's actions at its top right: bookmark, filter, and the menu
+/// with everything else. They show on hover, and the bookmark and filter
+/// also while they are on.
 fn render_toolbelt(
     index: usize,
-    header: &Header,
-    collapsed: bool,
+    bookmarked: bool,
+    filtering: bool,
     metrics: CellMetrics,
     palette: Palette,
     on_action: OnBlockAction,
 ) -> AnyElement {
-    let button = |name: &'static str, label: &'static str, action: BlockAction| {
+    let button = |name: &'static str, label: &'static str, active: bool, action: BlockAction| {
         let on_action = on_action.clone();
+        let color = if active {
+            palette.accent
+        } else {
+            palette.muted
+        };
         div()
             .id((name, index))
             .flex()
@@ -503,17 +616,33 @@ fn render_toolbelt(
             .rounded(px(5.))
             .hover(move |this| this.bg(palette.surface_raised))
             .tooltip(text_tooltip(vec![label.into()]))
-            .child(icon(name, px(14.), palette.muted))
+            .child(icon(name, px(14.), color))
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 on_action(action, index, window, cx);
             })
     };
-    let (chevron, collapse_label) = if collapsed {
-        ("chevron-right", "Expand")
-    } else {
-        ("chevron-down", "Collapse")
+    let menu = {
+        let on_action = on_action.clone();
+        div()
+            .id(("block-menu", index))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(TOOLBELT_BUTTON))
+            .rounded(px(5.))
+            .hover(move |this| this.bg(palette.surface_raised))
+            .tooltip(text_tooltip(vec!["More actions".into()]))
+            .child(icon("ellipsis", px(14.), palette.muted))
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    on_action(BlockAction::OpenMenu(event.position), index, window, cx);
+                },
+            )
     };
+    let pinned = bookmarked || filtering;
     div()
         .absolute()
         .top(metrics.height * TOP_LINES * 0.5)
@@ -524,18 +653,22 @@ fn render_toolbelt(
         .p(px(4.))
         .rounded(px(4.))
         .bg(palette.surface)
-        .invisible()
-        .group_hover("block", |this| this.visible())
-        .child(button("terminal", "Copy command", BlockAction::CopyCommand))
-        .when(!header.running, |this| {
-            this.child(button("copy", "Copy output", BlockAction::CopyOutput))
-                .child(button("rotate-ccw", "Run again", BlockAction::Rerun))
+        .when(!pinned, |this| {
+            this.invisible().group_hover("block", |this| this.visible())
         })
         .child(button(
-            chevron,
-            collapse_label,
-            BlockAction::ToggleCollapsed,
+            "bookmark",
+            "Toggle bookmark",
+            bookmarked,
+            BlockAction::ToggleBookmark,
         ))
+        .child(button(
+            "list-filter",
+            "Toggle block filter",
+            filtering,
+            BlockAction::ToggleFilter,
+        ))
+        .child(menu)
         .into_any_element()
 }
 

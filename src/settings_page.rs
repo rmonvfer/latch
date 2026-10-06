@@ -1177,7 +1177,7 @@ struct Shortcut {
     action: &'static str,
 }
 
-const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 5] = [
+const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 6] = [
     (
         "Tabs",
         &[
@@ -1323,6 +1323,43 @@ const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 5] = [
             Shortcut {
                 keys: &[&["⌃", "D"]],
                 action: "Send end-of-file when empty",
+            },
+        ],
+    ),
+    (
+        "Blocks",
+        &[
+            Shortcut {
+                keys: &[&["⌃", "M"]],
+                action: "Open the block menu",
+            },
+            Shortcut {
+                keys: &[&["⌘", "⇧", "C"]],
+                action: "Copy the block's command and output",
+            },
+            Shortcut {
+                keys: &[&["⌥", "⌘", "⇧", "C"]],
+                action: "Copy the block's output",
+            },
+            Shortcut {
+                keys: &[&["⌘", "⇧", "F"]],
+                action: "Find within the block",
+            },
+            Shortcut {
+                keys: &[&["⌥", "⇧", "F"]],
+                action: "Filter the block's output",
+            },
+            Shortcut {
+                keys: &[&["⌘", "⇧", "B"]],
+                action: "Bookmark the block",
+            },
+            Shortcut {
+                keys: &[&["⌥", "↑"], &["⌥", "↓"]],
+                action: "Previous or next bookmarked block",
+            },
+            Shortcut {
+                keys: &[&["⌘", "⇧", "↑"], &["⌘", "⇧", "↓"]],
+                action: "Scroll to the block's top or bottom",
             },
         ],
     ),

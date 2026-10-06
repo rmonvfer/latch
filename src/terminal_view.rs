@@ -10,7 +10,8 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, FollowMode, KeyBinding, KeyDownEvent, KeyUpEvent,
     ListAlignment, ListState, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString,
-    Subscription, Task, WeakEntity, Window, actions, canvas, div, fill, prelude::*, px,
+    Subscription, Task, WeakEntity, Window, actions, anchored, canvas, deferred, div, fill,
+    prelude::*, px,
 };
 use libghostty_vt::{
     Terminal, key, mouse,
@@ -22,12 +23,12 @@ use libghostty_vt::{
 use crate::{
     agent_resume::AgentSession,
     agents::{Agent, AgentStatus},
-    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction, PaintedOutputs},
-    blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange},
+    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction, PaintedOutputs, RowMatch},
+    blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange, Rows},
     command_editor::{CommandEditor, CommandEditorEvent, Highlight},
     completion::{self, CompletionMenu},
-    components::{elevated_shadow, icon, icon_button},
-    control,
+    components::{self, elevated_shadow, icon, icon_button, keybinding},
+    control, editor_buffer,
     editor_menus::{self, HistoryMenu, HistorySearch},
     git::{self, DiffStats},
     grid::{CellMetrics, Frame, GridRenderer},
@@ -60,11 +61,23 @@ actions!(
         SearchNext,
         SearchPrevious,
         PreviousPrompt,
-        NextPrompt
+        NextPrompt,
+        CopyBlock,
+        CopyBlockOutput,
+        ToggleBlockBookmark,
+        PreviousBookmark,
+        NextBookmark,
+        ScrollToBlockTop,
+        ScrollToBlockBottom,
+        ToggleBlockFilter,
+        FindInBlock,
+        OpenBlockMenu
     ]
 );
 
 const SEARCH_CONTEXT: &str = "TerminalSearch";
+/// Key context of a pane showing blocks, where block shortcuts apply.
+const BLOCKS_CONTEXT: &str = "TerminalBlocks";
 
 const FALLBACK_TITLE: &str = "shell";
 
@@ -198,6 +211,9 @@ pub struct TerminalView {
     selecting_blocks: bool,
     /// Where the block list last painted each block's rows.
     painted_outputs: PaintedOutputs,
+    /// The block whose menu is open, and where.
+    block_menu: Option<(usize, gpui::Point<Pixels>)>,
+    block_filter: Option<BlockFilter>,
     /// Where commands are typed while the shell waits at its prompt.
     editor: Entity<CommandEditor>,
     _editor_subscription: Subscription,
@@ -249,6 +265,23 @@ struct SearchBar {
     input: Entity<TextInput>,
     matches: Vec<SearchMatch>,
     current: usize,
+    /// In a pane showing blocks, the search runs over the blocks instead.
+    blocks: Option<BlockSearch>,
+    _subscription: Subscription,
+}
+
+/// A search over blocks: all of them, or the one found within.
+struct BlockSearch {
+    /// The block searched within, by id; all blocks when `None`.
+    scope: Option<u64>,
+    /// Matches by block index, in order.
+    matches: Vec<(usize, RowMatch)>,
+}
+
+/// The filter on one block's output.
+struct BlockFilter {
+    block: u64,
+    input: Entity<TextInput>,
     _subscription: Subscription,
 }
 
@@ -516,6 +549,8 @@ impl TerminalView {
                 block_selection: None,
                 selecting_blocks: false,
                 painted_outputs: PaintedOutputs::default(),
+                block_menu: None,
+                block_filter: None,
                 _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
                 editor,
                 prompt: None,
@@ -836,8 +871,8 @@ impl TerminalView {
 
     fn on_block_action(&self, cx: &Context<Self>) -> OnBlockAction {
         let view = cx.entity().downgrade();
-        Rc::new(move |action, index, _window, cx| {
-            let _ = view.update(cx, |view, cx| view.block_action(action, index, cx));
+        Rc::new(move |action, index, window, cx| {
+            let _ = view.update(cx, |view, cx| view.block_action(action, index, window, cx));
         })
     }
 
@@ -860,34 +895,554 @@ impl TerminalView {
         }
     }
 
-    /// Carry out an action from a block's header.
-    fn block_action(&mut self, action: BlockAction, index: usize, cx: &mut Context<Self>) {
+    /// Carry out an action on the block at `index`.
+    fn block_action(
+        &mut self,
+        action: BlockAction,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(block) = self
             .blocks
-            .as_mut()
-            .and_then(|blocks| blocks.blocks_mut().get_mut(index))
+            .as_ref()
+            .and_then(|blocks| blocks.blocks().get(index))
         else {
             return;
         };
+        let id = block.id;
+        let command = block.command.clone();
+        let cwd = block.context.cwd.clone();
+        let branch = block.context.git_branch.clone();
+        if !matches!(action, BlockAction::OpenMenu(_)) {
+            self.block_menu = None;
+        }
         match action {
             BlockAction::Select => self.selected_block = Some(index),
-            BlockAction::ScrollToTop => self.block_list.scroll_to(block_view::block_start(index)),
+            BlockAction::OpenMenu(position) => {
+                self.selected_block = Some(index);
+                self.block_menu = Some((index, position));
+            }
             BlockAction::ToggleCollapsed => {
-                block.collapsed = !block.collapsed;
+                if let Some(block) = self.block_mut(index) {
+                    block.collapsed = !block.collapsed;
+                }
                 self.block_list.remeasure_items(index..index + 1);
             }
+            BlockAction::ToggleBookmark => {
+                if let Some(block) = self.block_mut(index) {
+                    block.bookmarked = !block.bookmarked;
+                }
+            }
+            BlockAction::CopyAll => {
+                let text = format!("{command}\n{}", self.block_output_text(index, cx));
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
             BlockAction::CopyCommand => {
-                cx.write_to_clipboard(ClipboardItem::new_string(block.command.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(command));
             }
             BlockAction::CopyOutput => {
-                cx.write_to_clipboard(ClipboardItem::new_string(block.output_text()));
+                cx.write_to_clipboard(ClipboardItem::new_string(self.block_output_text(index, cx)));
             }
-            BlockAction::Rerun => {
-                let command = block.command.clone();
-                self.run_command(&command, cx);
+            BlockAction::CopyDirectory => {
+                if let Some(cwd) = cwd {
+                    cx.write_to_clipboard(ClipboardItem::new_string(cwd.display().to_string()));
+                }
+            }
+            BlockAction::CopyBranch => {
+                if let Some(branch) = branch {
+                    cx.write_to_clipboard(ClipboardItem::new_string(branch));
+                }
+            }
+            BlockAction::Rerun => self.run_command(&command, cx),
+            BlockAction::ScrollToTop => self.block_list.scroll_to(block_view::block_start(index)),
+            BlockAction::ScrollToBottom => self.scroll_to_block_bottom(index),
+            BlockAction::ToggleFilter => self.toggle_block_filter(id, index, window, cx),
+            BlockAction::FindInBlock => {
+                self.selected_block = Some(index);
+                self.open_search(Some(id), window, cx);
             }
         }
         cx.notify();
+    }
+
+    fn block_mut(&mut self, index: usize) -> Option<&mut crate::blocks::Block> {
+        self.blocks.as_mut()?.blocks_mut().get_mut(index)
+    }
+
+    /// The block at which shortcuts act: the selected one, else the newest.
+    fn target_block(&self) -> Option<usize> {
+        let count = self.blocks.as_ref()?.blocks().len();
+        self.selected_block
+            .filter(|index| *index < count)
+            .or(count.checked_sub(1))
+    }
+
+    fn act_on_target_block(
+        &mut self,
+        action: BlockAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.target_block() {
+            Some(index) if self.shows_blocks() => self.block_action(action, index, window, cx),
+            _ => cx.propagate(),
+        }
+    }
+
+    fn copy_block(&mut self, _: &CopyBlock, window: &mut Window, cx: &mut Context<Self>) {
+        self.act_on_target_block(BlockAction::CopyAll, window, cx);
+    }
+
+    fn copy_block_output(
+        &mut self,
+        _: &CopyBlockOutput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::CopyOutput, window, cx);
+    }
+
+    fn toggle_block_bookmark(
+        &mut self,
+        _: &ToggleBlockBookmark,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::ToggleBookmark, window, cx);
+    }
+
+    fn scroll_to_block_top(
+        &mut self,
+        _: &ScrollToBlockTop,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::ScrollToTop, window, cx);
+    }
+
+    fn scroll_to_block_end(
+        &mut self,
+        _: &ScrollToBlockBottom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::ScrollToBottom, window, cx);
+    }
+
+    fn toggle_target_filter(
+        &mut self,
+        _: &ToggleBlockFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::ToggleFilter, window, cx);
+    }
+
+    fn find_in_target_block(
+        &mut self,
+        _: &FindInBlock,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::FindInBlock, window, cx);
+    }
+
+    fn open_target_menu(&mut self, _: &OpenBlockMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.target_block() else {
+            return;
+        };
+        // From the keyboard the menu opens by the block's top, or failing
+        // that the pane's.
+        let position = self
+            .block_list
+            .bounds_for_item(index)
+            .map(|bounds| bounds.origin + gpui::point(px(40.), px(24.)))
+            .or(self
+                .bounds
+                .map(|bounds| bounds.origin + gpui::point(px(40.), px(24.))))
+            .unwrap_or_default();
+        self.block_action(BlockAction::OpenMenu(position), index, window, cx);
+    }
+
+    fn previous_bookmark(&mut self, _: &PreviousBookmark, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_bookmark(false, cx);
+    }
+
+    fn next_bookmark(&mut self, _: &NextBookmark, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_bookmark(true, cx);
+    }
+
+    /// Select and scroll to the nearest bookmarked block before (or after)
+    /// the selected one.
+    fn jump_to_bookmark(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(blocks) = &self.blocks else {
+            return;
+        };
+        let bookmarked: Vec<usize> = blocks
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.bookmarked)
+            .map(|(index, _)| index)
+            .collect();
+        let from = self.selected_block;
+        let next = if forward {
+            bookmarked
+                .iter()
+                .copied()
+                .find(|index| from.is_none_or(|from| *index > from))
+        } else {
+            bookmarked
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| from.is_none_or(|from| *index < from))
+        };
+        if let Some(index) = next {
+            self.selected_block = Some(index);
+            self.block_list.scroll_to(block_view::block_start(index));
+            cx.notify();
+        }
+    }
+
+    /// Scroll so the last rows of the block at `index` sit at the bottom
+    /// of the list.
+    fn scroll_to_block_bottom(&mut self, index: usize) {
+        let viewport = self.block_list.viewport_bounds().size.height;
+        let height = self
+            .block_list
+            .bounds_for_item(index)
+            .map(|bounds| bounds.size.height)
+            .unwrap_or(viewport);
+        self.block_list.scroll_to(gpui::ListOffset {
+            item_ix: index,
+            offset_in_item: (height - viewport).max(px(0.)),
+        });
+    }
+
+    /// Filter the output of block `id` (at `index`), or stop filtering it.
+    fn toggle_block_filter(
+        &mut self,
+        id: u64,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .block_filter
+            .as_ref()
+            .is_some_and(|filter| filter.block == id)
+        {
+            self.close_block_filter(window, cx);
+            return;
+        }
+        let input = cx.new(|cx| TextInput::new("Filter output", cx));
+        let subscription =
+            cx.subscribe_in(
+                &input,
+                window,
+                move |view, _, event, window, cx| match event {
+                    TextInputEvent::Changed => {
+                        view.block_selection = None;
+                        view.block_list.remeasure_items(index..index + 1);
+                        view.refresh_matches(cx);
+                        cx.notify();
+                    }
+                    TextInputEvent::Confirmed => {}
+                    TextInputEvent::Cancelled => view.close_block_filter(window, cx),
+                },
+            );
+        window.focus(&input.focus_handle(cx), cx);
+        self.block_selection = None;
+        self.block_filter = Some(BlockFilter {
+            block: id,
+            input,
+            _subscription: subscription,
+        });
+        self.block_list.remeasure_items(index..index + 1);
+    }
+
+    fn close_block_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(filter) = self.block_filter.take() else {
+            return;
+        };
+        self.block_selection = None;
+        if let Some(index) = self.block_index(filter.block) {
+            self.block_list.remeasure_items(index..index + 1);
+        }
+        window.focus(&self.editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn block_index(&self, id: u64) -> Option<usize> {
+        self.blocks
+            .as_ref()?
+            .blocks()
+            .iter()
+            .position(|block| block.id == id)
+    }
+
+    /// The filter's query for block `id`, if it is filtered by one.
+    fn filter_query(&self, id: u64, cx: &App) -> Option<String> {
+        self.block_filter
+            .as_ref()
+            .filter(|filter| filter.block == id)
+            .map(|filter| filter.input.read(cx).text().to_lowercase())
+            .filter(|query| !query.is_empty())
+    }
+
+    /// A block's rows as shown: all of them, or those its filter keeps.
+    fn shown_rows(&self, block: &crate::blocks::Block, cx: &App) -> Rows {
+        let rows = block.rows();
+        match self.filter_query(block.id, cx) {
+            Some(query) => Rc::new(
+                rows.iter()
+                    .filter(|row| row.text().to_lowercase().contains(&query))
+                    .cloned()
+                    .collect(),
+            ),
+            None => rows,
+        }
+    }
+
+    /// The text of the block at `index` as shown, one line per row.
+    fn block_output_text(&self, index: usize, cx: &App) -> String {
+        self.block_row_texts(index, cx)
+            .iter()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Matches of `query` in the shown rows of block `scope`, or of every
+    /// block, ignoring case.
+    fn block_matches(&self, query: &str, scope: Option<u64>, cx: &App) -> Vec<(usize, RowMatch)> {
+        let Some(blocks) = &self.blocks else {
+            return Vec::new();
+        };
+        let query = query.to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for (index, block) in blocks.blocks().iter().enumerate() {
+            if scope.is_some_and(|scope| scope != block.id) {
+                continue;
+            }
+            for (row, text) in self.block_row_texts(index, cx).iter().enumerate() {
+                let lower = text.to_lowercase();
+                for (start, found) in lower.match_indices(&query) {
+                    let start_col = editor_buffer::columns(&lower[..start]);
+                    matches.push((
+                        index,
+                        RowMatch {
+                            row,
+                            start: start_col,
+                            end: start_col + editor_buffer::columns(found),
+                            current: false,
+                        },
+                    ));
+                }
+            }
+        }
+        matches
+    }
+
+    /// Scroll the current block match into view.
+    fn reveal_block_match(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &self.search else {
+            return;
+        };
+        let Some((index, found)) = search
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.matches.get(search.current))
+            .copied()
+        else {
+            return;
+        };
+        let Some(metrics) = self.metrics else {
+            return;
+        };
+        let has_header = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.blocks().get(index))
+            .is_some_and(|block| !block.command.is_empty());
+        let top = if has_header {
+            block_view::output_top(metrics)
+        } else {
+            metrics.height * 0.5
+        };
+        // Leave a few rows above the match for context.
+        let offset = top + metrics.height * found.row.saturating_sub(3) as f32;
+        self.block_list.scroll_to(gpui::ListOffset {
+            item_ix: index,
+            offset_in_item: offset,
+        });
+        cx.notify();
+    }
+
+    /// The menu of the block at `index`, at `position`.
+    fn render_block_menu(
+        &self,
+        index: usize,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let block = self.blocks.as_ref()?.blocks().get(index)?;
+        let theme = cx.theme().clone();
+        let filtered = self.filter_query(block.id, cx).is_some();
+        let has_command = !block.command.is_empty();
+        let has_cwd = block.context.cwd.is_some();
+        let has_branch = block.context.git_branch.is_some();
+        let bookmarked = block.bookmarked;
+        let collapsed = block.collapsed;
+        let running = block.is_running();
+        let item = |id: &'static str,
+                    icon_name: &'static str,
+                    label: &'static str,
+                    shortcut: Option<&'static str>,
+                    action: BlockAction| {
+            components::menu_item(id, icon_name, label, &theme)
+                .children(shortcut.map(|shortcut| {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .justify_end()
+                        .pl(px(16.))
+                        .child(keybinding(shortcut, &theme))
+                }))
+                .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
+                    view.block_action(action, index, window, cx);
+                }))
+        };
+        let copy_output_label = if filtered {
+            "Copy filtered output"
+        } else {
+            "Copy output"
+        };
+        let menu = components::menu_surface(&theme)
+            .id("block-menu")
+            .occlude()
+            .min_w(px(280.))
+            // Clicks in the menu are its own, not a click on the blocks.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down_out(cx.listener(|view, _, _, cx| {
+                view.block_menu = None;
+                cx.notify();
+            }))
+            .child(item(
+                "block-copy",
+                "copy",
+                "Copy",
+                Some("⌘⇧C"),
+                BlockAction::CopyAll,
+            ))
+            .when(has_command, |menu| {
+                menu.child(item(
+                    "block-copy-command",
+                    "terminal",
+                    "Copy command",
+                    None,
+                    BlockAction::CopyCommand,
+                ))
+            })
+            .child(item(
+                "block-copy-output",
+                "copy",
+                copy_output_label,
+                Some("⌥⌘⇧C"),
+                BlockAction::CopyOutput,
+            ))
+            .when(has_cwd, |menu| {
+                menu.child(item(
+                    "block-copy-cwd",
+                    "folder",
+                    "Copy working directory",
+                    None,
+                    BlockAction::CopyDirectory,
+                ))
+            })
+            .when(has_branch, |menu| {
+                menu.child(item(
+                    "block-copy-branch",
+                    "git-branch",
+                    "Copy git branch",
+                    None,
+                    BlockAction::CopyBranch,
+                ))
+            })
+            .child(components::menu_separator(&theme))
+            .child(item(
+                "block-find",
+                "search",
+                "Find within block",
+                Some("⌘⇧F"),
+                BlockAction::FindInBlock,
+            ))
+            .child(item(
+                "block-filter",
+                "list-filter",
+                "Toggle block filter",
+                Some("⌥⇧F"),
+                BlockAction::ToggleFilter,
+            ))
+            .child(item(
+                "block-bookmark",
+                "bookmark",
+                if bookmarked {
+                    "Remove bookmark"
+                } else {
+                    "Bookmark"
+                },
+                Some("⌘⇧B"),
+                BlockAction::ToggleBookmark,
+            ))
+            .child(components::menu_separator(&theme))
+            .child(item(
+                "block-top",
+                "arrow-up-to-line",
+                "Scroll to top of block",
+                Some("⌘⇧↑"),
+                BlockAction::ScrollToTop,
+            ))
+            .child(item(
+                "block-bottom",
+                "arrow-down-to-line",
+                "Scroll to bottom of block",
+                Some("⌘⇧↓"),
+                BlockAction::ScrollToBottom,
+            ))
+            .when(has_command, |menu| {
+                menu.child(components::menu_separator(&theme))
+                    .when(!running, |menu| {
+                        menu.child(item(
+                            "block-rerun",
+                            "rotate-ccw",
+                            "Run again",
+                            None,
+                            BlockAction::Rerun,
+                        ))
+                    })
+                    .child(item(
+                        "block-collapse",
+                        if collapsed {
+                            "chevron-right"
+                        } else {
+                            "chevron-down"
+                        },
+                        if collapsed { "Expand" } else { "Collapse" },
+                        None,
+                        BlockAction::ToggleCollapsed,
+                    ))
+            });
+        Some(
+            deferred(anchored().position(position).snap_to_window().child(menu))
+                .with_priority(1)
+                .into_any_element(),
+        )
     }
 
     /// Select the block before (or after) the selected one, or the newest,
@@ -1346,27 +1901,56 @@ impl TerminalView {
 
     /// The list items to show, when the pane shows blocks.
     #[tracing::instrument(skip_all)]
-    fn block_items(&mut self) -> Option<Vec<Item>> {
+    fn block_items(&mut self, cx: &App) -> Option<Vec<Item>> {
         if !self.shows_blocks() {
             return None;
         }
         let blocks = self.blocks.as_ref()?;
         let mut items = Vec::with_capacity(blocks.blocks().len());
+        let matches = self.search.as_ref().and_then(|search| {
+            search
+                .blocks
+                .as_ref()
+                .map(|blocks| (blocks, search.current))
+        });
         for block in blocks.blocks() {
+            let index = items.len();
+            let rows = self.shown_rows(block, cx);
             let content = if block.is_running() {
-                ItemContent::Running(vec![block.rows()])
+                ItemContent::Running(vec![rows])
             } else {
-                ItemContent::Finished(block.rows())
+                ItemContent::Finished(rows)
             };
-            let selected = self.selected_block == Some(items.len());
+            let selected = self.selected_block == Some(index);
             // Started at the top, the first block sits against the pane's
             // edge, where a divider would read as a second border; stacked
             // up from the input, it divides the blocks from the space above.
             let divider = !items.is_empty() || self.blocks_from_bottom;
+            let filter = self
+                .block_filter
+                .as_ref()
+                .filter(|filter| filter.block == block.id)
+                .map(|filter| filter.input.clone());
+            let block_matches = matches
+                .map(|(search, current)| {
+                    search
+                        .matches
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (at, _))| *at == index)
+                        .map(|(position, (_, found))| RowMatch {
+                            current: position == current,
+                            ..*found
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             items.push(
                 Item::block(block, content, selected)
                     .with_selection(self.block_selection)
-                    .with_divider(divider),
+                    .with_divider(divider)
+                    .with_filter(filter)
+                    .with_matches(block_matches),
             );
         }
         // A running block is drawn from the live terminal and grows with it.
@@ -1668,9 +2252,27 @@ impl TerminalView {
     }
 
     fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(search) = &self.search {
+        self.open_search(None, window, cx);
+    }
+
+    /// Open the find bar: over the screen, or in a pane showing blocks over
+    /// all blocks or only the one with id `scope`.
+    fn open_search(&mut self, scope: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        let blocks = self.shows_blocks().then(|| BlockSearch {
+            scope,
+            matches: Vec::new(),
+        });
+        if let Some(search) = &mut self.search {
+            let rescoped = blocks.as_ref().map(|blocks| blocks.scope)
+                != search.blocks.as_ref().map(|blocks| blocks.scope);
+            if rescoped {
+                search.blocks = blocks;
+            }
             let focus = search.input.focus_handle(cx);
             window.focus(&focus, cx);
+            if rescoped {
+                self.refresh_matches(cx);
+            }
             return;
         }
         let input = cx.new(|cx| TextInput::new("Find", cx));
@@ -1685,6 +2287,7 @@ impl TerminalView {
             input,
             matches: Vec::new(),
             current: 0,
+            blocks,
             _subscription: subscription,
         });
         cx.notify();
@@ -1705,6 +2308,19 @@ impl TerminalView {
         let query = search.input.read(cx).text().to_string();
         search.matches.clear();
         search.current = 0;
+        if let Some(scope) = search.blocks.as_ref().map(|blocks| blocks.scope) {
+            let matches = self.block_matches(&query, scope, cx);
+            if let Some(blocks) = self
+                .search
+                .as_mut()
+                .and_then(|search| search.blocks.as_mut())
+            {
+                blocks.matches = matches;
+            }
+            self.reveal_block_match(cx);
+            cx.notify();
+            return;
+        }
         self.send(Operation::ClearSelection, cx);
         self.send(Operation::Search { query }, cx);
         cx.notify();
@@ -1714,12 +2330,19 @@ impl TerminalView {
         let Some(search) = self.search.as_mut() else {
             return;
         };
-        let count = search.matches.len();
+        let count = match &search.blocks {
+            Some(blocks) => blocks.matches.len(),
+            None => search.matches.len(),
+        };
         if count == 0 {
             return;
         }
         search.current = (search.current as isize + delta).rem_euclid(count as isize) as usize;
-        self.reveal_current_match(cx);
+        if search.blocks.is_some() {
+            self.reveal_block_match(cx);
+        } else {
+            self.reveal_current_match(cx);
+        }
     }
 
     fn search_next(&mut self, _: &SearchNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -1797,7 +2420,10 @@ impl TerminalView {
 
     fn render_search_bar(&self, search: &SearchBar, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let count = search.matches.len();
+        let count = match &search.blocks {
+            Some(blocks) => blocks.matches.len(),
+            None => search.matches.len(),
+        };
         let has_query = !search.input.read(cx).text().is_empty();
         let status = if count > 0 {
             format!("{}/{}", search.current + 1, count)
@@ -1861,7 +2487,7 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.block_selection_text() {
+        if let Some(text) = self.block_selection_text(cx) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
@@ -1879,7 +2505,7 @@ impl TerminalView {
             return;
         };
         let text = self
-            .block_row_texts(point.block)
+            .block_row_texts(point.block, cx)
             .into_iter()
             .nth(point.row)
             .unwrap_or_default();
@@ -1899,7 +2525,7 @@ impl TerminalView {
 
     /// Each row of a block's output as text: its rows, and for a running
     /// block the live screen after them.
-    fn block_row_texts(&self, index: usize) -> Vec<String> {
+    fn block_row_texts(&self, index: usize, cx: &App) -> Vec<String> {
         let Some(block) = self
             .blocks
             .as_ref()
@@ -1907,7 +2533,11 @@ impl TerminalView {
         else {
             return Vec::new();
         };
-        let mut texts: Vec<String> = block.rows().iter().map(|row| row.text()).collect();
+        let mut texts: Vec<String> = self
+            .shown_rows(block, cx)
+            .iter()
+            .map(|row| row.text())
+            .collect();
         if block.is_running()
             && let Ok(frame) = self.renderer_frame_rows()
         {
@@ -1927,14 +2557,14 @@ impl TerminalView {
     }
 
     /// The text selected in the block list, if any.
-    fn block_selection_text(&self) -> Option<String> {
+    fn block_selection_text(&self, cx: &App) -> Option<String> {
         let selection = self
             .block_selection
             .filter(|selection| !selection.is_empty())?;
         let (start, end) = selection.range();
         let mut lines = Vec::new();
         for block in start.block..=end.block {
-            for (row, text) in self.block_row_texts(block).iter().enumerate() {
+            for (row, text) in self.block_row_texts(block, cx).iter().enumerate() {
                 if let Some((from, to)) = selection.columns_in(block, row) {
                     lines.push(blocks::slice_columns(text, from, to).trim_end().to_string());
                 }
@@ -2245,7 +2875,7 @@ impl Render for TerminalView {
         }
         let focused = self.focus_handle.is_focused(window);
         self.painted_outputs.clear();
-        let block_items = self.block_items();
+        let block_items = self.block_items(cx);
         let running = self
             .blocks
             .as_ref()
@@ -2295,9 +2925,24 @@ impl Render for TerminalView {
                 let editor_panel = self
                     .shows_editor()
                     .then(|| self.render_editor_panel(metrics, cx));
+                let block_menu = self
+                    .block_menu
+                    .and_then(|(index, position)| self.render_block_menu(index, position, cx));
                 let content = div()
                     .absolute()
                     .inset_0()
+                    .key_context(BLOCKS_CONTEXT)
+                    .on_action(cx.listener(Self::copy_block))
+                    .on_action(cx.listener(Self::copy_block_output))
+                    .on_action(cx.listener(Self::toggle_block_bookmark))
+                    .on_action(cx.listener(Self::previous_bookmark))
+                    .on_action(cx.listener(Self::next_bookmark))
+                    .on_action(cx.listener(Self::scroll_to_block_top))
+                    .on_action(cx.listener(Self::scroll_to_block_end))
+                    .on_action(cx.listener(Self::toggle_target_filter))
+                    .on_action(cx.listener(Self::find_in_target_block))
+                    .on_action(cx.listener(Self::open_target_menu))
+                    .children(block_menu)
                     .flex()
                     .flex_col()
                     .child(div().flex_1().min_h_0().child(list))
@@ -2474,6 +3119,17 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-g", SearchNext, Some("Terminal")),
         KeyBinding::new("cmd-shift-g", SearchPrevious, Some("Terminal")),
         KeyBinding::new("shift-enter", SearchPrevious, Some(SEARCH_CONTEXT)),
+        // Warp's block shortcuts, where blocks show.
+        KeyBinding::new("cmd-shift-c", CopyBlock, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("alt-cmd-shift-c", CopyBlockOutput, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("cmd-shift-b", ToggleBlockBookmark, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("alt-up", PreviousBookmark, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("alt-down", NextBookmark, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("cmd-shift-up", ScrollToBlockTop, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("cmd-shift-down", ScrollToBlockBottom, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("alt-shift-f", ToggleBlockFilter, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("cmd-shift-f", FindInBlock, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("ctrl-m", OpenBlockMenu, Some(BLOCKS_CONTEXT)),
     ]
 }
 
