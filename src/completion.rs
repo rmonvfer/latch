@@ -17,12 +17,17 @@ pub struct CompletionMenu {
     /// Indices into `matches` that fit what has been typed since.
     visible: Vec<usize>,
     selected: usize,
+    /// Bytes at the start of each visible completion that match what is
+    /// typed, for showing them in bold.
+    matched_len: usize,
 }
 
 impl CompletionMenu {
     pub fn new(anchor: String, prefix: String, matches: Vec<Completion>) -> Self {
         let visible = (0..matches.len()).collect();
+        let matched_len = prefix.len();
         Self {
+            matched_len,
             anchor,
             prefix,
             matches,
@@ -37,6 +42,10 @@ impl CompletionMenu {
             .iter()
             .enumerate()
             .map(|(index, &match_index)| (index, &self.matches[match_index]))
+    }
+
+    pub fn matched_len(&self) -> usize {
+        self.matched_len
     }
 
     pub fn selected(&self) -> usize {
@@ -70,6 +79,7 @@ impl CompletionMenu {
             return false;
         }
         let wanted = format!("{}{typed}", self.prefix).to_lowercase();
+        self.matched_len = self.prefix.len() + typed.len();
         self.visible = (0..self.matches.len())
             .filter(|&index| self.matches[index].word.to_lowercase().starts_with(&wanted))
             .collect();

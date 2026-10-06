@@ -27,6 +27,7 @@ use crate::{
     completion::{self, CompletionMenu},
     components::{elevated_shadow, icon, icon_button},
     control,
+    editor_menus::{self, HistoryMenu, HistorySearch},
     git::{self, DiffStats},
     grid::{CellMetrics, Frame, GridRenderer},
     highlight::{self, CommandIndex, TokenKind},
@@ -191,6 +192,8 @@ pub struct TerminalView {
     painted_outputs: PaintedOutputs,
     /// Where commands are typed while the shell waits at its prompt.
     editor: Entity<CommandEditor>,
+    /// Whether the editor had focus at the last render.
+    editor_focused: bool,
     _editor_subscription: Subscription,
     /// Context of the shell's prompt, once it has drawn one; commands are
     /// typed into it only then.
@@ -201,7 +204,10 @@ pub struct TerminalView {
     shell: Option<Bootstrapped>,
     history: History,
     /// Where Up and Down have moved through history, if they have.
-    history_position: Option<HistoryPosition>,
+    history_menu: Option<HistoryMenu>,
+    /// The editor change a history preview caused is still to be reported,
+    /// and must not close the menu.
+    previewing_history: bool,
     /// The open Ctrl-R search, if any.
     history_search: Option<HistorySearch>,
     /// Names the shell can run, once indexed.
@@ -466,12 +472,14 @@ impl TerminalView {
                 selecting_blocks: false,
                 painted_outputs: PaintedOutputs::default(),
                 _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
+                editor_focused: false,
                 editor,
                 prompt: None,
                 queued_command: None,
                 shell: None,
                 history: History::default(),
-                history_position: None,
+                history_menu: None,
+                previewing_history: false,
                 history_search: None,
                 commands: None,
                 pending_completion: None,
@@ -953,7 +961,9 @@ impl TerminalView {
 
     /// Tell the editor whether a menu takes its Up, Down, and Enter.
     fn sync_editor_menu(&mut self, cx: &mut Context<Self>) {
-        let open = self.completion.is_some() || self.history_search.is_some();
+        let open = self.completion.is_some()
+            || self.history_search.is_some()
+            || self.history_menu.is_some();
         self.editor
             .update(cx, |editor, _| editor.set_menu_open(open));
     }
@@ -983,36 +993,68 @@ impl TerminalView {
         .detach();
     }
 
-    /// Show the previous (or next) history entry in the editor, keeping
-    /// what was typed to come back to past the newest entry.
-    fn walk_history(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let len = self.history.len();
-        let next = match (&self.history_position, forward) {
-            (None, true) => return,
-            (None, false) => len.checked_sub(1),
-            (Some(position), false) => position.index.checked_sub(1),
-            (Some(position), true) => Some(position.index + 1),
-        };
-        let Some(index) = next else {
+    /// Move through the history menu, opening it on the first Up with the
+    /// entries that start with what was typed, and show the selected entry
+    /// in the editor. Moving down past the newest entry closes the menu and
+    /// brings back what was typed.
+    fn step_history_menu(&mut self, older: bool, cx: &mut Context<Self>) {
+        let Some(menu) = self.history_menu.as_mut() else {
+            if older {
+                let original = self.editor.read(cx).text().to_string();
+                let matches = self.history.starting_with(&original, HISTORY_MENU_ENTRIES);
+                if !matches.is_empty() {
+                    // The first Up shows the newest entry.
+                    self.history_menu = Some(HistoryMenu {
+                        original,
+                        matches,
+                        selected: 0,
+                    });
+                    self.preview_history(cx);
+                }
+            }
             return;
         };
-        let draft = match self.history_position.take() {
-            Some(position) => position.draft,
-            None => self.editor.read(cx).text().to_string(),
+        if older {
+            menu.selected = (menu.selected + 1).min(menu.matches.len() - 1);
+        } else if menu.selected == 0 {
+            self.close_history_menu(true, cx);
+            return;
+        } else {
+            menu.selected -= 1;
+        }
+        self.preview_history(cx);
+    }
+
+    /// Put the history menu's selection in the editor.
+    fn preview_history(&mut self, cx: &mut Context<Self>) {
+        let Some(command) = self
+            .history_menu
+            .as_ref()
+            .and_then(|menu| menu.matches.get(menu.selected))
+            .and_then(|&index| self.history.get(index))
+            .map(|entry| entry.command.clone())
+        else {
+            return;
         };
-        let text = match self.history.get(index) {
-            Some(entry) => {
-                self.history_position = Some(HistoryPosition {
-                    index,
-                    draft,
-                    applying: true,
-                });
-                entry.to_string()
-            }
-            None => draft,
-        };
+        self.previewing_history = true;
+        self.sync_editor_menu(cx);
         self.editor
-            .update(cx, |editor, cx| editor.set_text(text, cx));
+            .update(cx, |editor, cx| editor.set_text(command, cx));
+        cx.notify();
+    }
+
+    /// Close the history menu, bringing back what was typed if `restore`.
+    fn close_history_menu(&mut self, restore: bool, cx: &mut Context<Self>) {
+        let Some(menu) = self.history_menu.take() else {
+            return;
+        };
+        self.sync_editor_menu(cx);
+        if restore {
+            self.previewing_history = true;
+            self.editor
+                .update(cx, |editor, cx| editor.set_text(menu.original, cx));
+        }
+        cx.notify();
     }
 
     fn update_history_search(&mut self, cx: &mut Context<Self>) {
@@ -1020,12 +1062,7 @@ impl TerminalView {
             return;
         };
         let query = self.editor.read(cx).text();
-        search.matches = self
-            .history
-            .search(query, HISTORY_SEARCH_RESULTS)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        search.matches = self.history.search(query, HISTORY_SEARCH_RESULTS);
         search.selected = 0;
         cx.notify();
     }
@@ -1036,10 +1073,14 @@ impl TerminalView {
             return;
         };
         self.sync_editor_menu(cx);
-        if let Some(entry) = search.matches.get(search.selected) {
-            let entry = entry.clone();
+        if let Some(entry) = search
+            .matches
+            .get(search.selected)
+            .and_then(|&index| self.history.get(index))
+        {
+            let command = entry.command.clone();
             self.editor
-                .update(cx, |editor, cx| editor.set_text(entry, cx));
+                .update(cx, |editor, cx| editor.set_text(command, cx));
         }
         cx.notify();
     }
@@ -1050,7 +1091,7 @@ impl TerminalView {
         let suggestion = self
             .history
             .suggestion(&text)
-            .filter(|_| self.history_search.is_none())
+            .filter(|_| self.history_search.is_none() && self.history_menu.is_none())
             .map(str::to_string);
         let highlights = match &self.commands {
             Some(commands) => {
@@ -1099,63 +1140,58 @@ impl TerminalView {
             context.git_branch.clone_from(&self.branch);
         }
         let chips = block_view::context_chips(&context, self.diff, metrics, theme);
-        // Ctrl-R matches, best at the bottom, next to the editor.
-        let search = self.history_search.as_ref().map(|search| {
-            let rows = search
-                .matches
-                .iter()
-                .enumerate()
-                .rev()
-                .map(|(index, entry)| {
-                    let first_line = entry.lines().next().unwrap_or_default().to_string();
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .when(index == search.selected, |row| {
-                            row.bg(theme.ghost_selected).text_color(theme.text)
-                        })
-                        .child(first_line)
-                });
-            div()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .pb_1()
-                .font_family(theme::FONT_FAMILY)
-                .text_sm()
-                .text_color(theme.text_muted)
-                .when(search.matches.is_empty(), |list| {
-                    list.child(div().px_2().child("No matching commands"))
-                })
-                .children(rows)
-        });
-        let completions = self
-            .completion
-            .as_ref()
-            .map(|menu| render_completion_menu(menu, theme));
+        // A menu opens above the input, over the blocks.
+        let menu = if let Some(menu) = &self.completion {
+            Some(editor_menus::render_completions(menu, metrics, theme))
+        } else if let Some(menu) = &self.history_menu {
+            Some(editor_menus::render_history_menu(
+                menu,
+                &self.history,
+                metrics,
+                theme,
+            ))
+        } else {
+            self.history_search.as_ref().map(|search| {
+                editor_menus::render_history_search(
+                    search,
+                    &self.history,
+                    self.editor.read(cx).text(),
+                    metrics,
+                    theme,
+                )
+            })
+        };
+        let foreground = theme::to_hsla(theme.terminal.foreground);
+        let focused = self.editor_focused;
         div()
             .flex_none()
+            .relative()
+            .mx(px(6.))
+            .mb(px(6.))
             .flex()
             .flex_col()
-            .gap_1p5()
-            .px(metrics.padding + block_view::HORIZONTAL_INSET)
-            .py_2()
-            .border_t_1()
-            .border_color(theme.border_variant)
-            .children(completions)
-            .children(search)
+            .gap(px(10.))
+            .px(metrics.padding + block_view::HORIZONTAL_INSET - px(6.))
+            .pt(px(10.))
+            .pb(px(16.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(foreground.opacity(0.1))
+            .when(focused, |card| card.bg(foreground.opacity(0.03)))
+            .children(menu.map(|menu| {
+                div()
+                    .absolute()
+                    .bottom(gpui::relative(1.))
+                    .left_0()
+                    .pb(px(6.))
+                    .child(menu)
+            }))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .font_family(theme::UI_FONT_FAMILY)
+                    .gap(px(8.))
                     .children(chips),
             )
             .child(self.editor.clone())
@@ -1172,6 +1208,8 @@ impl TerminalView {
             CommandEditorEvent::Confirmed => {
                 if self.completion.is_some() {
                     self.accept_completion(cx);
+                } else if self.history_menu.is_some() {
+                    self.close_history_menu(false, cx);
                 } else {
                     self.pick_history_match(cx);
                 }
@@ -1189,10 +1227,7 @@ impl TerminalView {
                     cx.notify();
                 }
             }
-            CommandEditorEvent::Submitted(command) => {
-                self.history_position = None;
-                self.run_command(command, cx);
-            }
+            CommandEditorEvent::Submitted(command) => self.run_command(command, cx),
             CommandEditorEvent::EndOfFile => self.send(Operation::Input { bytes: vec![4] }, cx),
             CommandEditorEvent::HistoryPrevious if self.completion.is_some() => {
                 if let Some(menu) = &mut self.completion {
@@ -1212,17 +1247,18 @@ impl TerminalView {
                         (search.selected + 1).min(search.matches.len().saturating_sub(1));
                     cx.notify();
                 }
-                None => self.walk_history(false, cx),
+                None => self.step_history_menu(true, cx),
             },
             CommandEditorEvent::HistoryNext => match &mut self.history_search {
                 Some(search) => {
                     search.selected = search.selected.saturating_sub(1);
                     cx.notify();
                 }
-                None => self.walk_history(true, cx),
+                None => self.step_history_menu(false, cx),
             },
             CommandEditorEvent::SearchHistory => {
                 self.completion = None;
+                self.close_history_menu(false, cx);
                 if self.history_search.take().is_none() {
                     self.history_search = Some(HistorySearch::default());
                     self.update_history_search(cx);
@@ -1231,7 +1267,9 @@ impl TerminalView {
                 cx.notify();
             }
             CommandEditorEvent::Escaped => {
-                if self.completion.take().is_some() || self.history_search.take().is_some() {
+                if self.history_menu.is_some() {
+                    self.close_history_menu(true, cx);
+                } else if self.completion.take().is_some() || self.history_search.take().is_some() {
                     self.sync_editor_menu(cx);
                 } else {
                     self.selected_block = None;
@@ -1240,13 +1278,12 @@ impl TerminalView {
                 cx.notify();
             }
             CommandEditorEvent::Changed => {
-                if let Some(position) = &mut self.history_position {
-                    if position.applying {
-                        position.applying = false;
-                    } else {
-                        self.history_position = None;
-                    }
+                // Typing past a previewed entry keeps it and closes the menu.
+                if std::mem::take(&mut self.previewing_history) {
+                    self.decorate_editor(cx);
+                    return;
                 }
+                self.close_history_menu(false, cx);
                 self.update_history_search(cx);
                 self.refine_completions(cx);
                 self.decorate_editor(cx);
@@ -2114,6 +2151,7 @@ impl Render for TerminalView {
             window.focus(&self.focus_handle, cx);
         }
         let focused = self.focus_handle.is_focused(window);
+        self.editor_focused = editor_focus.is_focused(window);
         self.painted_outputs.clear();
         let block_items = self.block_items();
         let running = self
@@ -2280,74 +2318,6 @@ impl Render for TerminalView {
     }
 }
 
-/// The completion menu: a window of rows around the selection, each with
-/// its description.
-fn render_completion_menu(menu: &CompletionMenu, theme: &theme::Theme) -> impl IntoElement {
-    let count = menu.visible().count();
-    let first = menu
-        .selected()
-        .saturating_sub(COMPLETION_ROWS / 2)
-        .min(count.saturating_sub(COMPLETION_ROWS));
-    let rows = menu
-        .visible()
-        .skip(first)
-        .take(COMPLETION_ROWS)
-        .map(|(index, completion)| {
-            let selected = index == menu.selected();
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_2()
-                .py_0p5()
-                .rounded_sm()
-                .when(selected, |row| row.bg(theme.ghost_selected))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(if selected {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(completion.word.clone()),
-                )
-                .children(completion.description.clone().map(|description| {
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_xs()
-                        .font_family(theme::UI_FONT_FAMILY)
-                        .text_color(theme.text_placeholder)
-                        .child(description)
-                }))
-        });
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .pb_1()
-        .font_family(theme::FONT_FAMILY)
-        .text_sm()
-        .children(rows)
-        .when(count > COMPLETION_ROWS, |list| {
-            list.child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .font_family(theme::UI_FONT_FAMILY)
-                    .text_color(theme.text_placeholder)
-                    .child(format!("{} of {count}", menu.selected() + 1)),
-            )
-        })
-}
-
-/// Completions listed at once.
-const COMPLETION_ROWS: usize = 10;
-
 /// The longest start every word shares.
 fn common_prefix<'a>(mut words: impl Iterator<Item = &'a str>) -> String {
     let Some(first) = words.next() else {
@@ -2367,25 +2337,9 @@ fn common_prefix<'a>(mut words: impl Iterator<Item = &'a str>) -> String {
 }
 
 /// Matches listed by the Ctrl-R history search.
-const HISTORY_SEARCH_RESULTS: usize = 8;
-
-/// A place in history reached with Up and Down.
-struct HistoryPosition {
-    index: usize,
-    /// What was typed before walking history.
-    draft: String,
-    /// The editor change this position caused is still to be reported,
-    /// and must not end the walk.
-    applying: bool,
-}
-
-/// The Ctrl-R search: the editor's text is the query.
-#[derive(Default)]
-struct HistorySearch {
-    /// Best match first.
-    matches: Vec<String>,
-    selected: usize,
-}
+const HISTORY_SEARCH_RESULTS: usize = 50;
+/// Entries the history menu lists.
+const HISTORY_MENU_ENTRIES: usize = 200;
 
 /// How long a command runs before the editor hides and keys go to it.
 const EDITOR_GRACE: Duration = Duration::from_millis(50);

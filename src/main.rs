@@ -11,6 +11,7 @@ mod components;
 mod confirm;
 mod control;
 mod editor_buffer;
+mod editor_menus;
 mod git;
 mod grid;
 mod highlight;
