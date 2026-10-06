@@ -1,6 +1,8 @@
 //! The tab sidebar: its settings, search filtering, group headers, tab
 //! rows, drag and drop, and the menus for tabs, groups, and view options.
 
+use std::collections::HashSet;
+
 use gpui::{
     AnyElement, App, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Hsla, MouseButton,
     MouseDownEvent, SharedString, Window, anchored, deferred, div, prelude::*, px, relative,
@@ -53,20 +55,58 @@ impl Default for SidebarSettings {
     }
 }
 
-/// The sidebar rows matching `query`. With no query this is the normal
-/// layout; otherwise groups open up to show their matching tabs, and a group
-/// whose name matches shows all of its tabs.
-fn filter_rows(layout: &TabLayout, query: &str, text_of: impl Fn(TabId) -> String) -> Vec<Row> {
+fn matching_tabs(
+    layout: &TabLayout,
+    query: &str,
+    include: impl Fn(TabId) -> bool,
+    text_of: impl Fn(TabId) -> String,
+) -> Vec<TabId> {
     let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return layout.rows();
+    layout
+        .ordered_tabs()
+        .into_iter()
+        .filter(|id| {
+            include(*id)
+                && (query.is_empty()
+                    || layout
+                        .group_of(*id)
+                        .and_then(|group| layout.group(group))
+                        .is_some_and(|group| group.name.to_lowercase().contains(&query))
+                    || text_of(*id).to_lowercase().contains(&query))
+        })
+        .collect()
+}
+
+/// The included sidebar rows matching `query`. With no query groups respect
+/// their collapsed state; searching expands groups to show matching tabs, and
+/// a matching group name includes all of its eligible tabs.
+fn filter_rows(
+    layout: &TabLayout,
+    query: &str,
+    include: impl Fn(TabId) -> bool,
+    text_of: impl Fn(TabId) -> String,
+) -> Vec<Row> {
+    let searching = !query.trim().is_empty();
+    let matches: HashSet<TabId> = matching_tabs(layout, query, include, text_of)
+        .into_iter()
+        .collect();
+    if !searching {
+        return layout
+            .rows()
+            .into_iter()
+            .filter(|row| match row {
+                Row::Tab { id, .. } => matches.contains(id),
+                Row::Group(id) => layout.group(*id).is_some_and(|group| {
+                    group.tabs().is_empty() || group.tabs().iter().any(|id| matches.contains(id))
+                }),
+            })
+            .collect();
     }
-    let matches = |id: TabId| text_of(id).to_lowercase().contains(&query);
     let mut rows = Vec::new();
     for entry in layout.entries() {
         match *entry {
             Entry::Tab(id) => {
-                if matches(id) {
+                if matches.contains(&id) {
                     rows.push(Row::Tab { id, group: None });
                 }
             }
@@ -74,12 +114,11 @@ fn filter_rows(layout: &TabLayout, query: &str, text_of: impl Fn(TabId) -> Strin
                 let Some(group) = layout.group(group_id) else {
                     continue;
                 };
-                let name_matches = group.name.to_lowercase().contains(&query);
                 let tabs: Vec<TabId> = group
                     .tabs()
                     .iter()
                     .copied()
-                    .filter(|id| name_matches || matches(*id))
+                    .filter(|id| matches.contains(id))
                     .collect();
                 if !tabs.is_empty() {
                     rows.push(Row::Group(group_id));
@@ -182,6 +221,9 @@ impl Workspace {
                 if let Some(group) = self.layout.group_together(target, dragged, name)
                     && !was_grouped
                 {
+                    if self.is_tab_hidden(target) {
+                        self.activate(target, window, cx);
+                    }
                     self.layout_changed(cx);
                     self.start_rename(Target::Group(group), window, cx);
                     return;
@@ -231,20 +273,27 @@ impl Workspace {
             .map(|panes| panes.read(cx).active_view().clone())
     }
 
-    /// Rows currently shown, after applying the search query.
+    fn tab_search_text(&self, id: TabId, cx: &App) -> String {
+        self.display(id, cx)
+            .map(|display| {
+                [Some(display.title), display.directory, display.branch]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    }
+
+    /// Open tab rows currently shown, after applying the search query.
     pub(crate) fn visible_rows(&self, cx: &gpui::App) -> Vec<Row> {
         let query = self.tab_search.read(cx).text().to_string();
-        filter_rows(&self.layout, &query, |id| {
-            self.display(id, cx)
-                .map(|display| {
-                    [Some(display.title), display.directory, display.branch]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default()
-        })
+        filter_rows(
+            &self.layout,
+            &query,
+            |id| !self.is_tab_hidden(id),
+            |id| self.tab_search_text(id, cx),
+        )
     }
 
     pub(crate) fn render_sidebar(
@@ -435,7 +484,11 @@ impl Workspace {
             .map(|renaming| renaming.input.clone());
         let collapsed = group.collapsed;
         let label = SharedString::from(group.name.clone());
-        let count = group.tabs().len();
+        let count = group
+            .tabs()
+            .iter()
+            .filter(|id| !self.is_tab_hidden(**id))
+            .count();
 
         div()
             .id(("group", id.element_id()))
@@ -806,12 +859,12 @@ impl Workspace {
                                         .flex_none()
                                         .text_size(theme::TEXT_SMALL)
                                         .text_color(theme.text_placeholder)
-                                        .child(if display.exited {
+                                        .child(if display.hidden {
+                                            "Closed"
+                                        } else if display.exited {
                                             "Finished"
-                                        } else if !display.connected {
-                                            "Disconnected"
                                         } else {
-                                            "Hidden"
+                                            "Disconnected"
                                         }),
                                 )
                             },
@@ -990,7 +1043,7 @@ impl Workspace {
                         "menu-close",
                         "x",
                         if display.hidden {
-                            "Show Tab"
+                            "Reopen Tab"
                         } else {
                             "Close Tab"
                         },
@@ -1524,14 +1577,83 @@ mod tests {
     #[test]
     fn empty_query_returns_normal_rows() {
         let (layout, _) = named_layout(&["api", "web"]);
-        assert_eq!(filter_rows(&layout, "  ", text_of(&layout)), layout.rows());
+        assert_eq!(
+            filter_rows(&layout, "  ", |_| true, text_of(&layout)),
+            layout.rows()
+        );
+    }
+
+    #[test]
+    fn closed_tabs_leave_the_open_rows_and_reappear_when_reopened() {
+        let (mut layout, ids) = named_layout(&["api", "worker", "logs", "shell"]);
+        let group = layout.group_tab(ids[1], "Infra".into());
+        layout.move_tab(ids[2], TabDestination::IntoGroup(group));
+        let mut closed = HashSet::from([ids[0], ids[1], ids[2]]);
+        assert_eq!(
+            filter_rows(&layout, "", |id| !closed.contains(&id), text_of(&layout)),
+            vec![Row::Tab {
+                id: ids[3],
+                group: None
+            }],
+        );
+        assert_eq!(
+            matching_tabs(&layout, "", |id| closed.contains(&id), text_of(&layout)),
+            ids[..3],
+        );
+
+        closed.remove(&ids[1]);
+        assert_eq!(
+            filter_rows(&layout, "", |id| !closed.contains(&id), text_of(&layout)),
+            vec![
+                Row::Group(group),
+                Row::Tab {
+                    id: ids[1],
+                    group: Some(group)
+                },
+                Row::Tab {
+                    id: ids[3],
+                    group: None
+                },
+            ],
+        );
+        assert_eq!(layout.group_of(ids[1]), Some(group));
+        assert_eq!(layout.ordered_tabs(), ids);
+    }
+
+    #[test]
+    fn search_keeps_closed_matches_separate_even_inside_collapsed_groups() {
+        let (mut layout, ids) = named_layout(&["agent", "logs"]);
+        let group = layout.group_tab(ids[0], "Infra".into());
+        layout.move_tab(ids[1], TabDestination::IntoGroup(group));
+        layout.group_mut(group).unwrap().collapsed = true;
+        for query in ["", "AGENT", "infra"] {
+            assert_eq!(
+                matching_tabs(&layout, query, |id| id == ids[0], text_of(&layout)),
+                vec![ids[0]],
+            );
+        }
+        assert!(filter_rows(&layout, "agent", |id| id != ids[0], text_of(&layout)).is_empty());
+        assert_eq!(
+            filter_rows(&layout, "", |id| id != ids[0], text_of(&layout)),
+            vec![Row::Group(group)],
+        );
+        assert_eq!(
+            filter_rows(&layout, "infra", |id| id != ids[0], text_of(&layout)),
+            vec![
+                Row::Group(group),
+                Row::Tab {
+                    id: ids[1],
+                    group: Some(group)
+                }
+            ],
+        );
     }
 
     #[test]
     fn query_filters_case_insensitively() {
         let (layout, ids) = named_layout(&["API server", "web"]);
         assert_eq!(
-            filter_rows(&layout, "api", text_of(&layout)),
+            filter_rows(&layout, "api", |_| true, text_of(&layout)),
             vec![Row::Tab {
                 id: ids[0],
                 group: None
@@ -1545,7 +1667,7 @@ mod tests {
         let group = layout.group_tab(ids[0], "Infra".into());
         layout.group_mut(group).unwrap().collapsed = true;
         assert_eq!(
-            filter_rows(&layout, "db", text_of(&layout)),
+            filter_rows(&layout, "db", |_| true, text_of(&layout)),
             vec![
                 Row::Group(group),
                 Row::Tab {
@@ -1562,7 +1684,7 @@ mod tests {
         let group = layout.group_tab(ids[0], "Infra".into());
         layout.move_tab(ids[1], TabDestination::IntoGroup(group));
         assert_eq!(
-            filter_rows(&layout, "infra", text_of(&layout)),
+            filter_rows(&layout, "infra", |_| true, text_of(&layout)),
             vec![
                 Row::Group(group),
                 Row::Tab {
