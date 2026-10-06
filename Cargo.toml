@@ -26,6 +26,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 tracing-chrome = "0.7.2"
+regex = "1.13.1"
 
 [profile.dev]
 # Terminal rendering is per cell and per frame; unoptimized it is too slow

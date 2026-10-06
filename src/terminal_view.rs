@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
@@ -23,7 +24,11 @@ use libghostty_vt::{
 use crate::{
     agent_resume::AgentSession,
     agents::{Agent, AgentStatus},
-    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction, PaintedOutputs, RowMatch},
+    block_filter::{self, FilterOptions},
+    block_view::{
+        self, BlockAction, FilterBar, FilterChange, Item, ItemContent, OnBlockAction,
+        PaintedOutputs, RowMatch,
+    },
     blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange, Rows},
     command_editor::{CommandEditor, CommandEditorEvent, Highlight},
     completion::{self, CompletionMenu},
@@ -282,7 +287,73 @@ struct BlockSearch {
 struct BlockFilter {
     block: u64,
     input: Entity<TextInput>,
+    regex: bool,
+    case_sensitive: bool,
+    invert: bool,
+    /// Lines kept around each matching line.
+    context: usize,
+    /// The last filtering, reused while the rows and options stay the same.
+    cache: RefCell<Option<FilteredRows>>,
     _subscription: Subscription,
+}
+
+/// A block's rows as its filter leaves them.
+#[derive(Clone)]
+struct FilteredRows {
+    source: Rows,
+    options: FilterOptions,
+    rows: Rows,
+    /// Positions in `rows` before which rows were left out.
+    gaps: Vec<usize>,
+    matches: Vec<RowMatch>,
+    invalid: bool,
+}
+
+impl BlockFilter {
+    fn options(&self, cx: &App) -> FilterOptions {
+        FilterOptions {
+            query: self.input.read(cx).text().to_string(),
+            regex: self.regex,
+            case_sensitive: self.case_sensitive,
+            invert: self.invert,
+            context: self.context,
+        }
+    }
+
+    /// `rows` filtered by the current options.
+    fn apply(&self, rows: &Rows, cx: &App) -> FilteredRows {
+        let options = self.options(cx);
+        if let Some(cached) = self.cache.borrow().as_ref()
+            && Rc::ptr_eq(&cached.source, rows)
+            && cached.options == options
+        {
+            return cached.clone();
+        }
+        let texts: Vec<String> = rows.iter().map(|row| row.text()).collect();
+        let filtered = block_filter::filter(&texts, &options);
+        let result = FilteredRows {
+            source: rows.clone(),
+            rows: Rc::new(filtered.kept.iter().map(|&row| rows[row].clone()).collect()),
+            options,
+            gaps: filtered.gaps,
+            matches: filtered.matches,
+            invalid: filtered.invalid,
+        };
+        *self.cache.borrow_mut() = Some(result.clone());
+        result
+    }
+
+    fn change(&mut self, change: FilterChange) {
+        match change {
+            FilterChange::ToggleRegex => self.regex = !self.regex,
+            FilterChange::ToggleCaseSensitive => self.case_sensitive = !self.case_sensitive,
+            FilterChange::ToggleInvert => self.invert = !self.invert,
+            FilterChange::MoreContext => {
+                self.context = (self.context + 1).min(block_filter::MAX_CONTEXT);
+            }
+            FilterChange::LessContext => self.context = self.context.saturating_sub(1),
+        }
+    }
 }
 
 struct MouseInput {
@@ -958,6 +1029,18 @@ impl TerminalView {
             BlockAction::ScrollToTop => self.block_list.scroll_to(block_view::block_start(index)),
             BlockAction::ScrollToBottom => self.scroll_to_block_bottom(index),
             BlockAction::ToggleFilter => self.toggle_block_filter(id, index, window, cx),
+            BlockAction::Filter(change) => {
+                if let Some(filter) = self
+                    .block_filter
+                    .as_mut()
+                    .filter(|filter| filter.block == id)
+                {
+                    filter.change(change);
+                    self.block_selection = None;
+                    self.block_list.remeasure_items(index..index + 1);
+                    self.refresh_matches(cx);
+                }
+            }
             BlockAction::FindInBlock => {
                 self.selected_block = Some(index);
                 self.open_search(Some(id), window, cx);
@@ -1158,6 +1241,11 @@ impl TerminalView {
         self.block_filter = Some(BlockFilter {
             block: id,
             input,
+            regex: false,
+            case_sensitive: false,
+            invert: false,
+            context: 0,
+            cache: RefCell::new(None),
             _subscription: subscription,
         });
         self.block_list.remeasure_items(index..index + 1);
@@ -1185,23 +1273,22 @@ impl TerminalView {
 
     /// The filter's query for block `id`, if it is filtered by one.
     fn filter_query(&self, id: u64, cx: &App) -> Option<String> {
+        self.filter_of(id)
+            .map(|filter| filter.input.read(cx).text().to_string())
+            .filter(|query| !query.is_empty())
+    }
+
+    fn filter_of(&self, id: u64) -> Option<&BlockFilter> {
         self.block_filter
             .as_ref()
             .filter(|filter| filter.block == id)
-            .map(|filter| filter.input.read(cx).text().to_lowercase())
-            .filter(|query| !query.is_empty())
     }
 
     /// A block's rows as shown: all of them, or those its filter keeps.
     fn shown_rows(&self, block: &crate::blocks::Block, cx: &App) -> Rows {
         let rows = block.rows();
-        match self.filter_query(block.id, cx) {
-            Some(query) => Rc::new(
-                rows.iter()
-                    .filter(|row| row.text().to_lowercase().contains(&query))
-                    .cloned()
-                    .collect(),
-            ),
+        match self.filter_of(block.id) {
+            Some(filter) => filter.apply(&rows, cx).rows,
             None => rows,
         }
     }
@@ -1915,7 +2002,12 @@ impl TerminalView {
         });
         for block in blocks.blocks() {
             let index = items.len();
-            let rows = self.shown_rows(block, cx);
+            let filtered = self
+                .filter_of(block.id)
+                .map(|filter| (filter, filter.apply(&block.rows(), cx)));
+            let rows = filtered
+                .as_ref()
+                .map_or_else(|| block.rows(), |(_, view)| view.rows.clone());
             let content = if block.is_running() {
                 ItemContent::Running(vec![rows])
             } else {
@@ -1926,12 +2018,24 @@ impl TerminalView {
             // edge, where a divider would read as a second border; stacked
             // up from the input, it divides the blocks from the space above.
             let divider = !items.is_empty() || self.blocks_from_bottom;
-            let filter = self
-                .block_filter
-                .as_ref()
-                .filter(|filter| filter.block == block.id)
-                .map(|filter| filter.input.clone());
-            let block_matches = matches
+            let (filter, gaps, filter_matches) = match filtered {
+                Some((filter, view)) => (
+                    Some(FilterBar {
+                        input: filter.input.clone(),
+                        regex: filter.regex,
+                        case_sensitive: filter.case_sensitive,
+                        invert: filter.invert,
+                        context: filter.context,
+                        invalid: view.invalid,
+                        kept: view.rows.len(),
+                        total: view.source.len(),
+                    }),
+                    view.gaps,
+                    view.matches,
+                ),
+                None => (None, Vec::new(), Vec::new()),
+            };
+            let search_matches: Vec<RowMatch> = matches
                 .map(|(search, current)| {
                     search
                         .matches
@@ -1945,11 +2049,12 @@ impl TerminalView {
                         .collect()
                 })
                 .unwrap_or_default();
+            let block_matches = filter_matches.into_iter().chain(search_matches).collect();
             items.push(
                 Item::block(block, content, selected)
                     .with_selection(self.block_selection)
                     .with_divider(divider)
-                    .with_filter(filter)
+                    .with_filter(filter, gaps)
                     .with_matches(block_matches),
             );
         }

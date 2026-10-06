@@ -3,6 +3,7 @@ mod agent_resume;
 mod agents;
 mod app_menus;
 mod assets;
+mod block_filter;
 mod block_view;
 mod blocks;
 mod cli;

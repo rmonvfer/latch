@@ -5572,6 +5572,7 @@ dependencies = [
  "libghostty-vt",
  "log",
  "portable-pty",
+ "regex",
  "rmcp",
  "schemars",
  "serde",

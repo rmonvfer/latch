@@ -66,8 +66,10 @@ pub struct Item {
     /// Whether a hairline divides the block from what is above it.
     divider: bool,
     bookmarked: bool,
-    /// The filter field, while the block's output is filtered.
-    filter: Option<Entity<TextInput>>,
+    /// The filter bar, while the block's output is filtered.
+    filter: Option<FilterBar>,
+    /// Rows before which the filter left lines out, shown as a dashed line.
+    gaps: Vec<usize>,
     /// Search matches in the block's rows.
     matches: Vec<RowMatch>,
 }
@@ -155,6 +157,32 @@ pub enum BlockAction {
     FindInBlock,
     /// Open the block's menu at this point.
     OpenMenu(Point<Pixels>),
+    /// Change how the block's filter matches.
+    Filter(FilterChange),
+}
+
+/// A change to a block filter's options, from its bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterChange {
+    ToggleRegex,
+    ToggleCaseSensitive,
+    ToggleInvert,
+    MoreContext,
+    LessContext,
+}
+
+/// What a block's filter bar shows.
+#[derive(Clone)]
+pub struct FilterBar {
+    pub input: Entity<TextInput>,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub invert: bool,
+    pub context: usize,
+    /// The pattern does not parse.
+    pub invalid: bool,
+    pub kept: usize,
+    pub total: usize,
 }
 
 /// A search match in a block's rows, in grid columns (end exclusive).
@@ -200,12 +228,14 @@ impl Item {
             divider: true,
             bookmarked: block.bookmarked,
             filter: None,
+            gaps: Vec::new(),
             matches: Vec::new(),
         }
     }
 
-    pub fn with_filter(mut self, filter: Option<Entity<TextInput>>) -> Self {
+    pub fn with_filter(mut self, filter: Option<FilterBar>, gaps: Vec<usize>) -> Self {
         self.filter = filter;
+        self.gaps = gaps;
         self
     }
 
@@ -244,6 +274,9 @@ struct Palette {
     surface_raised: Hsla,
     accent: Hsla,
     error: Hsla,
+    /// Bookmarked blocks' marker: the terminal's blue, which shows in light
+    /// and dark themes alike.
+    bookmark: Hsla,
     selection: Hsla,
 }
 
@@ -271,6 +304,7 @@ impl Palette {
             surface_raised: mix(terminal.background, terminal.foreground, 0.1),
             accent: theme.text_accent,
             error: theme::to_hsla(terminal.ansi[1]),
+            bookmark: theme::to_hsla(terminal.ansi[4]),
             selection: theme.text_accent.opacity(0.3),
         }
     }
@@ -386,6 +420,7 @@ fn render_item(
     let padding = metrics.padding + HORIZONTAL_INSET;
     let selection = item.selection;
     let matches = item.matches.clone();
+    let gaps = item.gaps.clone();
 
     let output = canvas(
         |_, _, _| {},
@@ -406,6 +441,18 @@ fn render_item(
             }
             if let Some(frame) = &live_frame {
                 frame.paint_content(origin, metrics, window, cx);
+            }
+            // Where the filter left lines out, a dashed line, as in Warp.
+            for &gap in &gaps {
+                let y = selection_origin.y + metrics.height * gap as f32;
+                let mut x = selection_origin.x;
+                while x < bounds.right() - padding {
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y), size(px(4.), px(1.))),
+                        palette.outline.opacity(3.),
+                    ));
+                    x += px(8.);
+                }
             }
             for found in &matches {
                 let top = selection_origin.y + metrics.height * found.row as f32;
@@ -479,7 +526,7 @@ fn render_item(
         .children(
             item.filter
                 .clone()
-                .map(|input| render_filter_bar(input, metrics, palette)),
+                .map(|bar| render_filter_bar(index, bar, metrics, palette, on_action.clone())),
         )
         .child(output)
         // The stripe and the selection border sit over the block, so they
@@ -517,12 +564,48 @@ fn render_item(
         .into_any_element()
 }
 
-/// The field that filters a block's output, under its command.
+/// The bar that filters a block's output, under its command, as Warp's:
+/// the text, toggles for a regular expression, case, and inverting, the
+/// lines of context kept around each match, and how many lines show.
 fn render_filter_bar(
-    input: Entity<TextInput>,
+    index: usize,
+    bar: FilterBar,
     metrics: CellMetrics,
     palette: Palette,
+    on_action: OnBlockAction,
 ) -> AnyElement {
+    let toggle = |id: &'static str,
+                  label: &'static str,
+                  tip: &'static str,
+                  on: bool,
+                  change: FilterChange| {
+        let on_action = on_action.clone();
+        div()
+            .id((id, index))
+            .flex()
+            .items_center()
+            .justify_center()
+            .min_w(px(22.))
+            .h(px(18.))
+            .px(px(3.))
+            .rounded(px(3.))
+            .font_family(theme::FONT_FAMILY)
+            .text_size(px(11.))
+            .text_color(if on { palette.text } else { palette.muted })
+            .when(on, |this| this.bg(palette.accent.opacity(0.3)))
+            .hover(move |this| this.bg(palette.surface_raised))
+            .tooltip(text_tooltip(vec![tip.into()]))
+            .child(label)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                on_action(BlockAction::Filter(change), index, window, cx);
+            })
+    };
+    let border = if bar.invalid {
+        palette.error
+    } else {
+        palette.outline.opacity(2.)
+    };
     div()
         .px(metrics.padding + HORIZONTAL_INSET)
         .pb(metrics.height * COMMAND_TO_OUTPUT_LINES)
@@ -530,16 +613,73 @@ fn render_filter_bar(
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(4.))
                 .w(px(FILTER_BAR_WIDTH))
-                .px(px(6.))
-                .py(px(3.))
+                .pl(px(6.))
+                .pr(px(4.))
+                .py(px(2.))
                 .rounded(px(4.))
                 .border_1()
-                .border_color(palette.outline)
+                .border_color(border)
                 .bg(palette.surface)
+                .text_size(px(12.))
                 .child(icon("list-filter", px(12.), palette.muted))
-                .child(input),
+                .child(div().flex_1().min_w_0().child(bar.input.clone()))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.))
+                        .text_color(palette.muted)
+                        .child(format!("{}/{}", bar.kept, bar.total)),
+                )
+                .child(toggle(
+                    "filter-regex",
+                    ".*",
+                    "Regular expression",
+                    bar.regex,
+                    FilterChange::ToggleRegex,
+                ))
+                .child(toggle(
+                    "filter-case",
+                    "Aa",
+                    "Match case",
+                    bar.case_sensitive,
+                    FilterChange::ToggleCaseSensitive,
+                ))
+                .child(toggle(
+                    "filter-invert",
+                    "!",
+                    "Show lines that do not match",
+                    bar.invert,
+                    FilterChange::ToggleInvert,
+                ))
+                .child(toggle(
+                    "filter-less",
+                    "−",
+                    "Fewer lines of context",
+                    false,
+                    FilterChange::LessContext,
+                ))
+                .child(
+                    div()
+                        .id(("filter-context", index))
+                        .min_w(px(14.))
+                        .flex()
+                        .justify_center()
+                        .text_size(px(11.))
+                        .text_color(palette.muted)
+                        .tooltip(text_tooltip(vec![
+                            "Lines of context around each match".into(),
+                        ]))
+                        .child(bar.context.to_string()),
+                )
+                .child(toggle(
+                    "filter-more",
+                    "+",
+                    "More lines of context",
+                    false,
+                    FilterChange::MoreContext,
+                )),
         )
         .into_any_element()
 }
@@ -600,13 +740,8 @@ fn render_toolbelt(
     palette: Palette,
     on_action: OnBlockAction,
 ) -> AnyElement {
-    let button = |name: &'static str, label: &'static str, active: bool, action: BlockAction| {
+    let button = |name: &'static str, label: &'static str, color: Hsla, action: BlockAction| {
         let on_action = on_action.clone();
-        let color = if active {
-            palette.accent
-        } else {
-            palette.muted
-        };
         div()
             .id((name, index))
             .flex()
@@ -656,16 +791,29 @@ fn render_toolbelt(
         .when(!pinned, |this| {
             this.invisible().group_hover("block", |this| this.visible())
         })
-        .child(button(
-            "bookmark",
-            "Toggle bookmark",
-            bookmarked,
-            BlockAction::ToggleBookmark,
-        ))
+        .child(if bookmarked {
+            button(
+                "bookmark-filled",
+                "Remove bookmark",
+                palette.bookmark,
+                BlockAction::ToggleBookmark,
+            )
+        } else {
+            button(
+                "bookmark",
+                "Bookmark",
+                palette.muted,
+                BlockAction::ToggleBookmark,
+            )
+        })
         .child(button(
             "list-filter",
             "Toggle block filter",
-            filtering,
+            if filtering {
+                palette.accent
+            } else {
+                palette.muted
+            },
             BlockAction::ToggleFilter,
         ))
         .child(menu)
