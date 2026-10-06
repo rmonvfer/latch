@@ -60,8 +60,10 @@ impl Paths {
         self.directory.join("sessions.sock")
     }
 
-    fn token(&self) -> PathBuf {
-        self.directory.join("token")
+    /// The name of the keychain item holding the runtime's secret. The
+    /// name is not secret; the item is.
+    fn token_id(&self) -> PathBuf {
+        self.directory.join("token-id")
     }
 
     fn prepare(&self) -> Result<()> {
@@ -145,29 +147,129 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(bytes)
 }
 
+fn random_hex<const N: usize>() -> Result<String> {
+    Ok(random_bytes::<N>()?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn is_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_token_id(paths: &Paths) -> Result<String> {
+    let mut id = String::new();
+    private_file(&paths.token_id(), false)?
+        .take(33)
+        .read_to_string(&mut id)?;
+    ensure!(is_hex(&id, 32), "runtime authentication id is invalid");
+    Ok(id)
+}
+
 fn read_token(paths: &Paths) -> Result<String> {
-    let mut token = String::new();
-    private_file(&paths.token(), false)?
-        .take(65)
-        .read_to_string(&mut token)?;
+    let id = read_token_id(paths)?;
+    let token = secret_store::load(paths, &id)?;
     ensure!(
-        token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "runtime authentication file is invalid"
+        is_hex(&token, 64),
+        "runtime authentication secret is invalid"
     );
     Ok(token)
 }
 
+/// Make a secret for this run of the runtime, keep it where only this
+/// program can read it, and record which item holds it.
 fn write_token(paths: &Paths) -> Result<String> {
-    let token: String = random_bytes::<32>()?
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let mut file = private_file(&paths.token(), true)?;
+    // Opening the id file first refuses a planted symlink before anything
+    // is stored.
+    let mut file = private_file(&paths.token_id(), true)?;
+    let id = random_hex::<16>()?;
+    let token = random_hex::<32>()?;
+    secret_store::store(paths, &id, &token)?;
     file.set_len(0)?;
-    file.write_all(token.as_bytes())?;
+    file.write_all(id.as_bytes())?;
     file.sync_all()?;
     Ok(token)
 }
+
+/// Remove the running runtime's secret.
+fn forget_token(paths: &Paths) {
+    if let Ok(id) = read_token_id(paths) {
+        secret_store::delete(paths, &id);
+    }
+    let _ = fs::remove_file(paths.token_id());
+}
+
+/// The runtime's secret lives in the login keychain rather than a file:
+/// the item's access list trusts only the program that created it, so
+/// other programs running as the user, sandboxed agents among them, cannot
+/// read it without the user's approval.
+mod keychain {
+    use anyhow::{Context as _, Result};
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
+
+    use super::Paths;
+
+    const SERVICE: &str = "Terminal session runtime";
+
+    pub fn store(_paths: &Paths, id: &str, token: &str) -> Result<()> {
+        set_generic_password(SERVICE, id, token.as_bytes())
+            .context("failed to store the session runtime secret in the keychain")
+    }
+
+    pub fn load(_paths: &Paths, id: &str) -> Result<String> {
+        let bytes = get_generic_password(SERVICE, id)
+            .context("failed to read the session runtime secret from the keychain")?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    pub fn delete(_paths: &Paths, id: &str) {
+        let _ = delete_generic_password(SERVICE, id);
+    }
+}
+
+/// Tests keep the secret in a private file in the runtime directory, so
+/// they never touch the user's keychain.
+#[cfg(test)]
+mod test_secret_store {
+    use std::{
+        fs,
+        io::{Read, Write},
+        path::PathBuf,
+    };
+
+    use anyhow::Result;
+
+    use super::{Paths, private_file};
+
+    fn path(paths: &Paths, id: &str) -> PathBuf {
+        paths.directory.join(format!("secret-{id}"))
+    }
+
+    pub fn store(paths: &Paths, id: &str, token: &str) -> Result<()> {
+        let mut file = private_file(&path(paths, id), true)?;
+        file.set_len(0)?;
+        file.write_all(token.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn load(paths: &Paths, id: &str) -> Result<String> {
+        let mut token = String::new();
+        private_file(&path(paths, id), false)?.read_to_string(&mut token)?;
+        Ok(token)
+    }
+
+    pub fn delete(paths: &Paths, id: &str) {
+        let _ = fs::remove_file(path(paths, id));
+    }
+}
+
+#[cfg(not(test))]
+use keychain as secret_store;
+#[cfg(test)]
+use test_secret_store as secret_store;
 
 fn same_token(expected: &str, candidate: &str) -> bool {
     if expected.len() != candidate.len() {
@@ -620,6 +722,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.paths.socket());
+        forget_token(&self.paths);
     }
 }
 
@@ -1206,10 +1309,20 @@ mod tests {
         fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
         let target = paths.directory.join("target");
         fs::write(&target, "unrelated").unwrap();
-        std::os::unix::fs::symlink(&target, paths.token()).unwrap();
+        std::os::unix::fs::symlink(&target, paths.token_id()).unwrap();
         assert!(write_token(&paths).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "unrelated");
         fs::remove_dir_all(paths.directory).unwrap();
+    }
+
+    #[test]
+    fn the_keychain_keeps_and_forgets_a_secret() {
+        let paths = temporary_paths();
+        let id = random_hex::<16>().unwrap();
+        keychain::store(&paths, &id, "secret").unwrap();
+        assert_eq!(keychain::load(&paths, &id).unwrap(), "secret");
+        keychain::delete(&paths, &id);
+        assert!(keychain::load(&paths, &id).is_err());
     }
 
     #[test]
@@ -1241,7 +1354,7 @@ mod tests {
             0o600
         );
         assert_eq!(
-            fs::metadata(runtime.paths.token()).unwrap().mode() & 0o777,
+            fs::metadata(runtime.paths.token_id()).unwrap().mode() & 0o777,
             0o600
         );
         assert!(Server::bind(runtime.paths.clone()).is_err());
