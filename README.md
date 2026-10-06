@@ -65,3 +65,7 @@ Benchmarks are kept as ignored tests:
 ```sh
 cargo test --release benchmark -- --ignored --nocapture
 ```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
