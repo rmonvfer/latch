@@ -2,12 +2,12 @@
 //! on the terminal's cell grid in the terminal font, with selection,
 //! clipboard, and IME support.
 
-use std::ops::Range;
+use std::{ops::Range, time::Duration};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementInputHandler, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, Hsla, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, SharedString, TextRun, UTF16Selection,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, SharedString, Task, TextRun, UTF16Selection,
     UnderlineStyle, Window, actions, canvas, div, fill, point, prelude::*, px, size,
 };
 
@@ -66,6 +66,10 @@ pub struct Highlight {
     pub underline: Option<Hsla>,
 }
 
+/// How long the cursor stays in each phase of its blink.
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const CURSOR_WIDTH: f32 = 3.;
+
 /// Rows shown before the editor scrolls.
 const MAX_VISIBLE_ROWS: usize = 12;
 
@@ -112,6 +116,10 @@ pub struct CommandEditor {
     /// Whether a menu attached to the editor (completions, history search)
     /// takes Up, Down, and Enter.
     menu_open: bool,
+    /// Whether the blinking cursor is in its visible phase.
+    cursor_shown: bool,
+    /// Alternates the cursor while the editor has focus.
+    blink: Option<Task<()>>,
 }
 
 impl EventEmitter<CommandEditorEvent> for CommandEditor {}
@@ -137,6 +145,8 @@ impl CommandEditor {
             highlights: Vec::new(),
             suggestion: None,
             menu_open: false,
+            cursor_shown: true,
+            blink: None,
         }
     }
 
@@ -193,13 +203,33 @@ impl CommandEditor {
     }
 
     fn edited(&mut self, cx: &mut Context<Self>) {
+        self.restart_blink(cx);
         cx.emit(CommandEditorEvent::Changed);
         cx.notify();
     }
 
     fn moved(&mut self, cx: &mut Context<Self>) {
         self.marked_range = None;
+        self.restart_blink(cx);
         cx.notify();
+    }
+
+    /// Show the cursor and blink it from now on, as Warp does after every
+    /// keystroke.
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.cursor_shown = true;
+        self.blink = Some(cx.spawn(async move |editor, cx| {
+            loop {
+                cx.background_executor().timer(CURSOR_BLINK_INTERVAL).await;
+                let blinked = editor.update(cx, |editor, cx| {
+                    editor.cursor_shown = !editor.cursor_shown;
+                    cx.notify();
+                });
+                if blinked.is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     fn cols(&self) -> usize {
@@ -655,6 +685,15 @@ struct PaintRow {
 impl Render for CommandEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = CellMetrics::measure(SettingsStore::get(cx), window);
+        // The cursor blinks only while the editor has focus.
+        if self.focus_handle.is_focused(window) {
+            if self.blink.is_none() {
+                self.restart_blink(cx);
+            }
+        } else {
+            self.blink = None;
+            self.cursor_shown = true;
+        }
         self.metrics = Some(metrics);
         self.rows = editor_buffer::layout_rows(self.buffer.text(), self.cols());
         self.scroll_to_cursor();
@@ -712,7 +751,7 @@ impl Render for CommandEditor {
                 })
                 .collect()
         };
-        let cursor = (focused && selection.is_empty()).then(|| {
+        let cursor = (focused && selection.is_empty() && self.cursor_shown).then(|| {
             let (row, col) = editor_buffer::position_of(text, &self.rows, self.buffer.cursor());
             (row - self.scroll_row, col)
         });
@@ -841,10 +880,19 @@ impl Render for CommandEditor {
                             );
                         }
                         if let Some((row, col)) = cursor {
-                            window.paint_quad(fill(
-                                Bounds::new(cell(row, col), size(px(2.), metrics.height)),
-                                cursor_color,
-                            ));
+                            // Warp's beam: 3px wide with round ends, as tall
+                            // as the font times 1.2 at most, centred on the
+                            // line.
+                            let height = (metrics.font_size * 1.2).min(metrics.height);
+                            let origin =
+                                cell(row, col) + point(px(0.), (metrics.height - height) / 2.);
+                            window.paint_quad(
+                                fill(
+                                    Bounds::new(origin, size(px(CURSOR_WIDTH), height)),
+                                    cursor_color,
+                                )
+                                .corner_radii(px(CURSOR_WIDTH / 2.)),
+                            );
                         }
                         window.handle_input(
                             &focus_handle,
