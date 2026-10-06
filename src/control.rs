@@ -863,7 +863,6 @@ impl Workspace {
                     "agent": display.agent.map(|state| json!({
                         "name": state.agent.name(),
                         "status": state.turn.map(agent_badge::turn_label),
-                        "prompt": state.prompt.as_ref().map(ToString::to_string),
                     })),
                     "panes": panes,
                 }))
