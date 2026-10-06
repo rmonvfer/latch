@@ -93,7 +93,6 @@ impl SessionHandle {
 
 pub fn spawn(id: u64, launch: Launch) -> Result<SessionHandle> {
     validate_dimensions(launch.dimensions)?;
-    ensure!(!launch.argv.is_empty(), "a session requires a command");
     ensure!(
         launch
             .startup
@@ -206,8 +205,7 @@ struct Engine {
 
 impl Engine {
     fn new(id: u64, launch: Launch, shared: Arc<RwLock<SessionInfo>>) -> Result<Self> {
-        let mut command = CommandBuilder::new(&launch.argv[0]);
-        command.args(&launch.argv[1..]);
+        let mut command = CommandBuilder::from_argv(launch.argv.iter().map(Into::into).collect());
         command.env_clear();
         for (key, value) in &launch.env {
             command.env(key, value);
@@ -1150,9 +1148,10 @@ fn register_effects(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs};
 
     use super::*;
+    use crate::shell_integration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -1252,6 +1251,92 @@ mod tests {
             .apply(&mut mirror, snapshot)
             .unwrap();
         search::screen_text(&mirror).unwrap()
+    }
+
+    struct ShellHome(PathBuf);
+
+    impl Drop for ShellHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_default_login_shell(integration: bool) {
+        let home = ShellHome(std::env::temp_dir().join(format!(
+            "terminal-login-{}",
+            crate::runtime::new_session_id().unwrap()
+        )));
+        fs::create_dir(&home.0).unwrap();
+        fs::write(home.0.join(".zshenv"), "export TERMINAL_USER_ENV=loaded\n").unwrap();
+        fs::write(
+            home.0.join(".zprofile"),
+            "export TERMINAL_LOGIN_PROFILE=loaded\n",
+        )
+        .unwrap();
+        fs::write(
+            home.0.join(".zshrc"),
+            if integration {
+                "stty -echo\n"
+            } else {
+                "stty -echo\nprintf '\\033]133;A\\007'\n"
+            },
+        )
+        .unwrap();
+
+        let mut command = shell_integration::shell_command(None);
+        assert!(command.is_default_prog());
+        command.env_clear();
+        command.env("SHELL", "/bin/zsh");
+        command.env("HOME", &home.0);
+        command.env("PATH", "/usr/bin:/bin");
+        if integration {
+            let dir = home.0.join("integration");
+            fs::create_dir_all(dir.join("zsh")).unwrap();
+            fs::write(
+                dir.join("zsh/.zshenv"),
+                include_str!("../assets/shell-integration/zsh/.zshenv"),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("zsh/integration.zsh"),
+                include_str!("../assets/shell-integration/zsh/integration.zsh"),
+            )
+            .unwrap();
+            command.env("ZDOTDIR", dir.join("zsh"));
+            command.env("TERMINAL_SHELL_INTEGRATION_DIR", dir);
+        }
+        let mut request = launch("");
+        request.argv = command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        request.env = command
+            .iter_full_env_as_str()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        request.cwd = Some(home.0.clone());
+        request.startup = Some("printf 'DEFAULT:%s:%s:%s:%s\\n' \"$options[login]\" \"$options[interactive]\" \"$TERMINAL_LOGIN_PROFILE\" \"$TERMINAL_USER_ENV\"; exit 23".into());
+        let request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        let session = Session(spawn(51, request).unwrap());
+        wait_until(|| session.0.info().exited);
+        assert_eq!(session.0.info().exit_code, Some(23));
+        assert_eq!(
+            session.0.info().cwd.unwrap().canonicalize().unwrap(),
+            home.0.canonicalize().unwrap()
+        );
+        let text = session.text();
+        assert!(text.contains("DEFAULT:on:on:loaded:loaded"), "{text:?}");
+    }
+
+    #[test]
+    fn default_shell_launch_preserves_login_environment_and_startup() {
+        assert_default_login_shell(false);
+    }
+
+    #[test]
+    fn default_shell_launch_preserves_zsh_integration() {
+        assert_default_login_shell(true);
     }
 
     #[test]

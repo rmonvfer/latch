@@ -27,6 +27,7 @@ pub struct Colors {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Launch {
     pub id: u64,
+    /// An empty argument list selects the user's default login shell.
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
