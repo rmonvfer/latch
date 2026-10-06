@@ -109,6 +109,7 @@ mod tests {
             },
             mouse_tracking: false,
             scroll_offset: 0,
+            blocks: None,
         };
         display.apply(&mut terminal, &frame).unwrap();
         assert!(

@@ -69,7 +69,7 @@ fn default_sidebar_width() -> f32 {
     f32::from(theme::SIDEBAR_WIDTH)
 }
 
-fn session_path() -> PathBuf {
+pub fn session_path() -> PathBuf {
     SettingsStore::config_dir().join("session.json")
 }
 

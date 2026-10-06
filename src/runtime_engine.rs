@@ -15,13 +15,15 @@ use libghostty_vt::{
     Terminal,
     fmt::Format,
     key, mouse, paste,
-    render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator},
+    render::{
+        self, CellIterator, CursorVisualStyle, Dirty, RenderState, RowIteration, RowIterator,
+    },
     screen::{CellWide, RowSemanticPrompt},
     selection::{
         FormatOptions, Selection,
         gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     },
-    style::{RgbColor, Style, StyleColor, Underline},
+    style::{Palette, RgbColor, Style, StyleColor, Underline},
     terminal::{
         ColorScheme, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
         Options, Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport,
@@ -32,14 +34,16 @@ use portable_pty::CommandBuilder;
 
 use crate::{
     agents::{self, Activity, Agent, AgentStatus},
-    osc::{OscEvent, OscScanner},
+    hooks::{Bootstrapped, Hook},
+    osc::{OscEvent, OscScanner, Piece},
     process_info,
     pty::{MAX_INPUT_BYTES, Pty, PtyDimensions},
+    runtime_blocks::{self, Blocks as BlockLog},
     runtime_protocol::{
-        Attention, Colors, Cursor, Dimensions, Launch, Match, Operation, Request, Response,
-        SessionInfo, Snapshot,
+        Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions, Launch, Match,
+        Operation, Request, Response, SessionInfo, Snapshot,
     },
-    search,
+    search, shell_integration,
 };
 
 const SCROLLBACK_LINES: usize = 10_000;
@@ -52,6 +56,8 @@ const MAX_GRID_CELLS: usize = 64 * 1024;
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_MATCHES: usize = 20_000;
 const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
+/// Most command blocks a session keeps; older ones are dropped.
+const MAX_BLOCKS: usize = 1000;
 
 type Command = (Request, mpsc::SyncSender<Result<Response>>);
 
@@ -166,7 +172,20 @@ struct Metadata {
 }
 
 struct Engine {
+    /// The terminal receiving output: the shell's, or with command blocks
+    /// the running command's or the prompt's.
     terminal: Terminal<'static, 'static>,
+    colors: Colors,
+    /// Command blocks, once the shell's integration reports in and the
+    /// launch asked for them.
+    blocks: Option<BlockLog>,
+    command_blocks: bool,
+    shell: Option<Bootstrapped>,
+    shell_serial: u64,
+    prompt: Option<BlockContext>,
+    completions: Option<Completions>,
+    /// The terminal was swapped since the last snapshot, so every row is new.
+    terminal_replaced: bool,
     pty: Pty,
     output: async_channel::Receiver<Vec<u8>>,
     shared: Arc<RwLock<SessionInfo>>,
@@ -212,6 +231,9 @@ impl Engine {
         }
         command.env(crate::terminal_view::PANE_ID_VARIABLE, id.to_string());
         command.env(crate::control::TOKEN_VARIABLE, &launch.control_token);
+        // Lifecycle hooks carry this id; hooks with any other are ignored.
+        let session_id = crate::control::new_token()?;
+        command.env(shell_integration::SESSION_ID_VARIABLE, &session_id);
         let (pty, output) = Pty::spawn(
             command,
             pty_dimensions(launch.dimensions),
@@ -271,6 +293,14 @@ impl Engine {
         };
         Ok(Self {
             terminal,
+            colors: launch.colors,
+            blocks: None,
+            command_blocks: launch.command_blocks,
+            shell: None,
+            shell_serial: 0,
+            prompt: None,
+            completions: None,
+            terminal_replaced: false,
             pty,
             output,
             shared,
@@ -279,7 +309,7 @@ impl Engine {
             dark,
             bell,
             reply_error,
-            osc: OscScanner::default(),
+            osc: OscScanner::new(session_id),
             activity: Activity::default(),
             agent: None,
             working_since: None,
@@ -342,8 +372,19 @@ impl Engine {
     fn consume_output(&mut self) {
         let output = self.output.clone();
         for chunk in crate::output::OutputBatch::new(&output) {
-            for event in self.osc.scan(&chunk) {
+            for piece in self.osc.scan(&chunk) {
+                let event = match piece {
+                    Piece::Output(bytes) => {
+                        if let Some(blocks) = &mut self.blocks {
+                            blocks.record(&bytes);
+                        }
+                        self.terminal.vt_write(&bytes);
+                        continue;
+                    }
+                    Piece::Event(event) => event,
+                };
                 match event {
+                    OscEvent::Hook(hook) => self.apply_hook(hook),
                     OscEvent::PromptStarted => self.send_startup(),
                     OscEvent::CommandStarted => {
                         self.command_started = Some(Instant::now());
@@ -367,7 +408,6 @@ impl Engine {
                     }
                 }
             }
-            self.terminal.vt_write(&chunk);
             self.activity.output(Instant::now());
         }
         if self.bell.replace(false) {
@@ -380,6 +420,131 @@ impl Engine {
                 body: "Terminal input is busy; a protocol reply could not be delivered".into(),
             });
         }
+    }
+
+    fn apply_hook(&mut self, hook: Hook) {
+        let result = match hook {
+            Hook::Bootstrapped(shell) => {
+                self.shell = Some(shell);
+                self.shell_serial += 1;
+                self.enable_blocks()
+            }
+            Hook::Precmd(precmd) => {
+                if let Some(blocks) = &mut self.blocks {
+                    blocks.set_context(&precmd);
+                }
+                self.prompt = Some(BlockContext::from(&precmd));
+                Ok(())
+            }
+            Hook::Preexec { command } => match self.blocks.is_some() {
+                // The command's output goes to a terminal of its own.
+                true => self.replace_terminal().map(|()| {
+                    if let Some(blocks) = &mut self.blocks {
+                        blocks.start(command);
+                    }
+                }),
+                false => Ok(()),
+            },
+            Hook::CommandFinished { exit_code } => match &mut self.blocks {
+                Some(blocks) => blocks
+                    .finish(exit_code, &mut self.terminal)
+                    // The next prompt is drawn into a fresh terminal.
+                    .and_then(|()| self.replace_terminal()),
+                None => Ok(()),
+            },
+            Hook::Completions { prefix, matches } => {
+                let serial = self.completions.as_ref().map_or(0, |found| found.serial) + 1;
+                self.completions = Some(Completions {
+                    serial,
+                    prefix,
+                    matches,
+                });
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            self.attention(Attention::Notification {
+                title: Some("Command blocks".into()),
+                body: format!("{error:#}"),
+            });
+        }
+    }
+
+    /// Turn command blocks on when the launch asked for them, keeping what
+    /// the shell printed while starting as a block of its own.
+    fn enable_blocks(&mut self) -> Result<()> {
+        if !self.command_blocks || self.blocks.is_some() {
+            return Ok(());
+        }
+        let mut blocks = BlockLog::new(MAX_BLOCKS)?;
+        blocks.push_startup(&mut self.terminal)?;
+        self.blocks = Some(blocks);
+        // The prompt is drawn into a fresh terminal, hidden behind the
+        // window's own command editor.
+        self.replace_terminal()
+    }
+
+    /// Swap in a fresh terminal at the session's size and colors.
+    fn replace_terminal(&mut self) -> Result<()> {
+        let dimensions = self.dimensions.get();
+        let mut terminal = Terminal::new(Options {
+            cols: dimensions.cols,
+            rows: dimensions.rows,
+            max_scrollback: SCROLLBACK_LINES,
+        })?;
+        terminal.resize(
+            dimensions.cols,
+            dimensions.rows,
+            u32::from(dimensions.cell_width),
+            u32::from(dimensions.cell_height),
+        )?;
+        configure_colors(&mut terminal, &self.colors)?;
+        register_effects(
+            &mut terminal,
+            &self.pty,
+            Rc::clone(&self.dimensions),
+            Rc::clone(&self.dark),
+            Rc::clone(&self.bell),
+            Rc::clone(&self.reply_error),
+        )?;
+        self.terminal = terminal;
+        self.terminal_replaced = true;
+        Ok(())
+    }
+
+    /// Rebuild finished blocks' rows at the session's width and colors.
+    fn rebuild_blocks(&mut self) -> Result<()> {
+        let Some(blocks) = &mut self.blocks else {
+            return Ok(());
+        };
+        let dimensions = self.dimensions.get();
+        let colors = &self.colors;
+        blocks.rebuild_rows(|| {
+            let mut terminal = Terminal::new(Options {
+                cols: dimensions.cols,
+                rows: dimensions.rows,
+                max_scrollback: SCROLLBACK_LINES,
+            })?;
+            configure_colors(&mut terminal, colors)?;
+            Ok(terminal)
+        })
+    }
+
+    /// Write `text` into the shell's line editor after clearing it, then
+    /// `suffix`: Enter to run it, or the key that asks for completions.
+    fn type_into_shell(&mut self, text: String, suffix: &[u8]) -> Result<()> {
+        ensure!(
+            text.len() + 64 <= MAX_INPUT_BYTES,
+            "command exceeds 256 KiB"
+        );
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
+        let mut data = text.into_bytes();
+        let mut encoded = vec![0; data.len() + 32];
+        let len = paste::encode(&mut data, bracketed, &mut encoded)?;
+        let mut bytes = shell_integration::CLEAR_LINE_KEY.to_vec();
+        bytes.extend_from_slice(&encoded[..len]);
+        bytes.extend_from_slice(suffix);
+        self.write_input(&bytes)
     }
 
     fn attention(&mut self, message: Attention) {
@@ -625,8 +790,14 @@ impl Engine {
                     u32::from(dimensions.cell_width),
                     u32::from(dimensions.cell_height),
                 )?;
-                self.dimensions.set(dimensions);
+                let previous = self.dimensions.replace(dimensions);
                 self.pty.resize(pty_dimensions(dimensions));
+                if let Some(blocks) = &mut self.blocks {
+                    blocks.terminal_resized();
+                }
+                if previous.cols != dimensions.cols {
+                    self.rebuild_blocks()?;
+                }
             }
             Operation::Scroll { delta } => {
                 let delta = delta.clamp(-10_000, 10_000);
@@ -773,9 +944,33 @@ impl Engine {
             Operation::Colors { colors } => {
                 configure_colors(&mut self.terminal, &colors)?;
                 self.dark.set(colors.dark);
+                let changed = self.colors != colors;
+                self.colors = colors;
+                if changed {
+                    self.rebuild_blocks()?;
+                }
             }
+            Operation::RunCommand { command } => self.type_into_shell(command, b"\r")?,
+            Operation::Complete { text } => {
+                self.type_into_shell(text, shell_integration::COMPLETE_KEY)?
+            }
+            Operation::BlockRows { block, from } => {
+                let (version, rows) = self
+                    .blocks
+                    .as_ref()
+                    .and_then(|blocks| blocks.rows(block, from))
+                    .ok_or_else(|| anyhow!("no block {block}"))?;
+                return Ok(Response::BlockRows {
+                    block,
+                    version,
+                    from,
+                    rows,
+                });
+            }
+            Operation::Shell => return Ok(Response::Shell(Box::new(self.shell.clone()))),
             Operation::Read { lines } => {
-                let text = search::screen_text(&self.terminal)?;
+                let mut text = self.blocks.as_ref().map(BlockLog::text).unwrap_or_default();
+                text.push_str(&search::screen_text(&self.terminal)?);
                 let lines: Vec<&str> = text
                     .lines()
                     .map(str::trim_end)
@@ -859,10 +1054,27 @@ impl Engine {
 
     fn capture(&mut self) -> Result<Snapshot> {
         self.refresh_info();
+        let full_screen = runtime_blocks::is_full_screen(&self.terminal);
+        if let Some(blocks) = &mut self.blocks
+            && !full_screen
+        {
+            blocks.capture_scrollback(&mut self.terminal)?;
+        }
+        let blocks = self.blocks.as_ref().map(|blocks| {
+            Box::new(Blocks {
+                items: blocks.summaries(),
+                prompt: self.prompt.clone(),
+                shell_serial: self.shell_serial,
+                completions: self.completions.clone(),
+                full_screen,
+            })
+        });
+        let replaced = std::mem::take(&mut self.terminal_replaced);
         let frame = self.render.update(&self.terminal)?;
         let colors = frame.colors()?;
         let dimensions = self.dimensions.get();
-        let full = frame.dirty()? == Dirty::Full
+        let full = replaced
+            || frame.dirty()? == Dirty::Full
             || self.snapshot.as_ref().is_none_or(|snapshot| {
                 snapshot.dimensions != dimensions
                     || snapshot.background != rgb_bytes(colors.background)
@@ -907,83 +1119,20 @@ impl Engine {
                 row_index += 1;
                 continue;
             }
-            let selection = row.selection()?;
-            let mut cells = self.render_cells.update(row)?;
-            let mut encoded = String::from("\x1b[0m\x1b]8;;\x1b\\");
-            let mut previous_style = None;
-            let mut previous_link: Option<String> = None;
-            let mut column = 0u16;
-            while let Some(cell) = cells.next() {
-                let raw = cell.raw_cell()?;
-                let wide = raw.wide()?;
-                if wide == CellWide::SpacerTail {
-                    column += 1;
-                    continue;
-                }
-                let mut style = if cell.has_styling()? {
-                    cell.style()?
-                } else {
-                    Style::default()
-                };
-                let mut foreground = cell.fg_color()?.unwrap_or(colors.foreground);
-                let mut background = cell.bg_color()?.unwrap_or(colors.background);
-                if style.inverse {
-                    std::mem::swap(&mut foreground, &mut background);
-                    style.inverse = false;
-                }
-                if selection.is_some_and(|range| column >= range.start_x && column <= range.end_x) {
-                    std::mem::swap(&mut foreground, &mut background);
-                }
-                let underline = match style.underline_color {
-                    StyleColor::Rgb(color) => Some(color),
-                    StyleColor::Palette(index) => Some(palette.0[usize::from(index.0)]),
-                    StyleColor::None => None,
-                };
-                let signature = (style, foreground, background, underline);
-                if previous_style != Some(signature) {
-                    append_style(&mut encoded, style, foreground, background, underline);
-                    previous_style = Some(signature);
-                }
-                let link = if raw.has_hyperlink()? {
-                    self.terminal
-                        .grid_ref(Point::Viewport(PointCoordinate {
-                            x: column,
-                            y: row_index,
-                        }))
-                        .ok()
-                        .and_then(|grid| grid.hyperlink_uri(&mut link_buffer).ok())
-                        .filter(|length| *length > 0)
-                        .and_then(|length| std::str::from_utf8(&link_buffer[..length]).ok())
-                        .filter(|uri| safe_hyperlink(uri))
-                        .map(str::to_owned)
-                } else {
-                    None
-                };
-                if link != previous_link {
-                    encoded.push_str("\x1b]8;;");
-                    if let Some(link) = &link {
-                        encoded.push_str(link);
-                    }
-                    encoded.push_str("\x1b\\");
-                    previous_link = link;
-                }
-                if cell.graphemes_len()? > 0 && wide != CellWide::SpacerHead {
-                    cell.graphemes_utf8(&mut graphemes)?;
-                    for character in graphemes.chars() {
-                        if !character.is_control() {
-                            encoded.push(character);
-                        }
-                    }
-                } else {
-                    encoded.push(' ');
-                }
-                column += 1;
-                ensure!(
-                    encoded_bytes + encoded.len() <= MAX_TEXT_BYTES,
-                    "viewport is too large to display; reduce the window size"
-                );
-            }
-            encoded.push_str("\x1b]8;;\x1b\\\x1b[0m");
+            let encoded = encode_row(
+                row,
+                &mut self.render_cells,
+                &colors,
+                &palette,
+                &self.terminal,
+                row_index,
+                &mut graphemes,
+                &mut link_buffer,
+            )?;
+            ensure!(
+                encoded_bytes + encoded.len() <= MAX_TEXT_BYTES,
+                "viewport is too large to display; reduce the window size"
+            );
             encoded_bytes += encoded.len();
             row.set_dirty(false)?;
             encoded_rows.push(encoded);
@@ -1001,6 +1150,7 @@ impl Engine {
                 || snapshot.info != self.info
                 || snapshot.mouse_tracking != mouse_tracking
                 || snapshot.scroll_offset != scroll_offset
+                || snapshot.blocks != blocks
         });
         if changed {
             self.revision = self.revision.saturating_add(1);
@@ -1014,10 +1164,105 @@ impl Engine {
             background,
             mouse_tracking,
             scroll_offset,
+            blocks,
         };
         self.snapshot = Some(snapshot.clone());
         Ok(snapshot)
     }
+}
+
+/// One row of the terminal as self-contained styled VT text: explicit
+/// colors and attributes per run, hyperlinks limited to safe schemes, and
+/// no other escape sequences.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_row(
+    row: &RowIteration<'static, '_>,
+    render_cells: &mut CellIterator<'static>,
+    colors: &render::Colors,
+    palette: &Palette,
+    terminal: &Terminal<'static, 'static>,
+    row_index: u32,
+    graphemes: &mut String,
+    link_buffer: &mut [u8],
+) -> Result<String> {
+    let selection = row.selection()?;
+    let mut cells = render_cells.update(row)?;
+    let mut encoded = String::from("\x1b[0m\x1b]8;;\x1b\\");
+    let mut previous_style = None;
+    let mut previous_link: Option<String> = None;
+    let mut column = 0u16;
+    while let Some(cell) = cells.next() {
+        let raw = cell.raw_cell()?;
+        let wide = raw.wide()?;
+        if wide == CellWide::SpacerTail {
+            column += 1;
+            continue;
+        }
+        let mut style = if cell.has_styling()? {
+            cell.style()?
+        } else {
+            Style::default()
+        };
+        let mut foreground = cell.fg_color()?.unwrap_or(colors.foreground);
+        let mut background = cell.bg_color()?.unwrap_or(colors.background);
+        if style.inverse {
+            std::mem::swap(&mut foreground, &mut background);
+            style.inverse = false;
+        }
+        if selection.is_some_and(|range| column >= range.start_x && column <= range.end_x) {
+            std::mem::swap(&mut foreground, &mut background);
+        }
+        let underline = match style.underline_color {
+            StyleColor::Rgb(color) => Some(color),
+            StyleColor::Palette(index) => Some(palette.0[usize::from(index.0)]),
+            StyleColor::None => None,
+        };
+        let signature = (style, foreground, background, underline);
+        if previous_style != Some(signature) {
+            append_style(&mut encoded, style, foreground, background, underline);
+            previous_style = Some(signature);
+        }
+        let link = if raw.has_hyperlink()? {
+            terminal
+                .grid_ref(Point::Viewport(PointCoordinate {
+                    x: column,
+                    y: row_index,
+                }))
+                .ok()
+                .and_then(|grid| grid.hyperlink_uri(link_buffer).ok())
+                .filter(|length| *length > 0)
+                .and_then(|length| std::str::from_utf8(&link_buffer[..length]).ok())
+                .filter(|uri| safe_hyperlink(uri))
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        if link != previous_link {
+            encoded.push_str("\x1b]8;;");
+            if let Some(link) = &link {
+                encoded.push_str(link);
+            }
+            encoded.push_str("\x1b\\");
+            previous_link = link;
+        }
+        if cell.graphemes_len()? > 0 && wide != CellWide::SpacerHead {
+            cell.graphemes_utf8(graphemes)?;
+            for character in graphemes.chars() {
+                if !character.is_control() {
+                    encoded.push(character);
+                }
+            }
+        } else {
+            encoded.push(' ');
+        }
+        column += 1;
+        ensure!(
+            encoded.len() <= MAX_TEXT_BYTES,
+            "a row is too large to display"
+        );
+    }
+    encoded.push_str("\x1b]8;;\x1b\\\x1b[0m");
+    Ok(encoded)
 }
 
 fn safe_hyperlink(uri: &str) -> bool {
@@ -1176,6 +1421,7 @@ mod tests {
                 dark: true,
             },
             control_token: "test-control-capability".into(),
+            command_blocks: false,
         }
     }
 
@@ -1261,28 +1507,9 @@ mod tests {
         }
     }
 
-    fn assert_default_login_shell(integration: bool) {
-        let home = ShellHome(std::env::temp_dir().join(format!(
-            "terminal-login-{}",
-            crate::runtime::new_session_id().unwrap()
-        )));
-        fs::create_dir(&home.0).unwrap();
-        fs::write(home.0.join(".zshenv"), "export TERMINAL_USER_ENV=loaded\n").unwrap();
-        fs::write(
-            home.0.join(".zprofile"),
-            "export TERMINAL_LOGIN_PROFILE=loaded\n",
-        )
-        .unwrap();
-        fs::write(
-            home.0.join(".zshrc"),
-            if integration {
-                "stty -echo\n"
-            } else {
-                "stty -echo\nprintf '\\033]133;A\\007'\n"
-            },
-        )
-        .unwrap();
-
+    /// A launch of the default login shell (zsh) living in `home`, with the
+    /// app's shell integration if asked.
+    fn zsh_launch(home: &ShellHome, integration: bool) -> Launch {
         let mut command = shell_integration::shell_command(None);
         assert!(command.is_default_prog());
         command.env_clear();
@@ -1316,6 +1543,32 @@ mod tests {
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         request.cwd = Some(home.0.clone());
+        request
+    }
+
+    fn assert_default_login_shell(integration: bool) {
+        let home = ShellHome(std::env::temp_dir().join(format!(
+            "terminal-login-{}",
+            crate::runtime::new_session_id().unwrap()
+        )));
+        fs::create_dir(&home.0).unwrap();
+        fs::write(home.0.join(".zshenv"), "export TERMINAL_USER_ENV=loaded\n").unwrap();
+        fs::write(
+            home.0.join(".zprofile"),
+            "export TERMINAL_LOGIN_PROFILE=loaded\n",
+        )
+        .unwrap();
+        fs::write(
+            home.0.join(".zshrc"),
+            if integration {
+                "stty -echo\n"
+            } else {
+                "stty -echo\nprintf '\\033]133;A\\007'\n"
+            },
+        )
+        .unwrap();
+
+        let mut request = zsh_launch(&home, integration);
         request.startup = Some("printf 'DEFAULT:%s:%s:%s:%s\\n' \"$options[login]\" \"$options[interactive]\" \"$TERMINAL_LOGIN_PROFILE\" \"$TERMINAL_USER_ENV\"; exit 23".into());
         let request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         let session = Session(spawn(51, request).unwrap());
@@ -1337,6 +1590,53 @@ mod tests {
     #[test]
     fn default_shell_launch_preserves_zsh_integration() {
         assert_default_login_shell(true);
+    }
+
+    #[test]
+    fn command_blocks_hold_each_command_and_its_output() {
+        let home = ShellHome(std::env::temp_dir().join(format!(
+            "terminal-blocks-{}",
+            crate::runtime::new_session_id().unwrap()
+        )));
+        fs::create_dir(&home.0).unwrap();
+        fs::write(home.0.join(".zshrc"), "echo welcome\n").unwrap();
+        let mut request = zsh_launch(&home, true);
+        request.command_blocks = true;
+        let session = Session(spawn(52, request).unwrap());
+        let blocks = || session.snapshot().blocks;
+        wait_until(|| blocks().is_some_and(|blocks| blocks.prompt.is_some()));
+        session.operate(Operation::RunCommand {
+            command: "printf 'one\\ntwo\\n'; false".into(),
+        });
+        wait_until(|| {
+            blocks().is_some_and(|blocks| {
+                blocks
+                    .items
+                    .iter()
+                    .any(|item| item.command.starts_with("printf") && !item.running)
+            })
+        });
+        let reported = blocks().unwrap();
+        // Startup output is a block of its own, without a command.
+        assert_eq!(reported.items[0].command, "");
+        let block = reported.items.last().unwrap();
+        assert_eq!(block.exit_code, Some(1));
+        let Response::BlockRows { rows, .. } = session.operate(Operation::BlockRows {
+            block: block.id,
+            from: 0,
+        }) else {
+            panic!("expected block rows");
+        };
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                crate::runtime_blocks::plain_text(row)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(text, vec!["one", "two"]);
+        assert!(session.text().contains("$ printf"));
     }
 
     #[test]

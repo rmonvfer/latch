@@ -107,8 +107,9 @@ pub struct Frame {
     link: Option<LinkUnderline>,
 }
 
+/// One painted row of terminal cells, independent of where it is drawn.
 #[derive(Default, Debug, PartialEq)]
-struct FrameRow {
+pub struct FrameRow {
     backgrounds: Vec<BackgroundSpan>,
     texts: Vec<TextBatch>,
     wide_cells: Vec<u16>,
@@ -377,6 +378,141 @@ fn push_background(spans: &mut Vec<BackgroundSpan>, row: u16, col: u16, cols: u1
     });
 }
 
+impl FrameRow {
+    /// Whether the row shows nothing: no text and no colored cells.
+    pub fn is_blank(&self) -> bool {
+        self.texts.is_empty() && self.backgrounds.is_empty()
+    }
+
+    /// The row's characters, with spaces for empty cells before the last
+    /// character.
+    pub fn text(&self) -> String {
+        let mut batches: Vec<&TextBatch> = self.texts.iter().collect();
+        batches.sort_by_key(|batch| batch.col);
+        let mut text = String::new();
+        let mut col = 0;
+        for batch in batches {
+            if batch.col > col {
+                text.extend(std::iter::repeat_n(' ', (batch.col - col) as usize));
+            }
+            text.push_str(&batch.text);
+            col = batch.col + batch.cells;
+        }
+        text
+    }
+}
+
+impl GridRenderer {
+    /// The rows of the terminal's current viewport, without a cursor.
+    pub fn viewport_rows(
+        &mut self,
+        terminal: &Terminal<'static, 'static>,
+    ) -> Result<Rc<Vec<Rc<FrameRow>>>> {
+        Ok(Rc::clone(&self.build_frame(terminal, false)?.rows))
+    }
+}
+
+/// Paint `rows` top to bottom starting at `origin`, one cell height apart.
+pub fn paint_rows(
+    rows: &[Rc<FrameRow>],
+    origin: Point<Pixels>,
+    metrics: CellMetrics,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let cell_origin = |row: usize, col: u16| -> Point<Pixels> {
+        origin + point(metrics.width * col as f32, metrics.height * row as f32)
+    };
+    // Only rows inside the visible area are painted, so long outputs cost
+    // what fits on screen.
+    let visible = window.content_mask().bounds;
+    let first = ((visible.top() - origin.y) / metrics.height)
+        .floor()
+        .max(0.) as usize;
+    let end = ((visible.bottom() - origin.y) / metrics.height)
+        .ceil()
+        .max(0.) as usize;
+    let range = first.min(rows.len())..end.min(rows.len());
+    let visible_rows = || rows[range.clone()].iter().zip(range.clone());
+    for (row, index) in visible_rows() {
+        for span in &row.backgrounds {
+            window.paint_quad(fill(
+                Bounds::new(
+                    cell_origin(index, span.col),
+                    size(metrics.width * span.cols as f32, metrics.height),
+                ),
+                span.color,
+            ));
+        }
+    }
+    let text_system = window.text_system().clone();
+    for (row, index) in visible_rows() {
+        for batch in &row.texts {
+            paint_batch(
+                batch,
+                cell_origin(index, batch.col),
+                metrics,
+                &text_system,
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+fn paint_batch(
+    batch: &TextBatch,
+    origin: Point<Pixels>,
+    metrics: CellMetrics,
+    text_system: &gpui::WindowTextSystem,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let style = batch.style;
+    let font = theme::terminal_font(
+        if style.bold {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        },
+        if style.italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        },
+    );
+    let run = TextRun {
+        len: batch.text.len(),
+        font,
+        color: style.color,
+        background_color: None,
+        underline: match style.underline {
+            Underline::None => None,
+            underline => Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(style.color),
+                wavy: underline == Underline::Curly,
+            }),
+        },
+        strikethrough: style.strikethrough.then_some(StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(style.color),
+        }),
+    };
+    let force_width = if batch.wide {
+        None
+    } else {
+        Some(metrics.width)
+    };
+    let line = text_system.shape_line(
+        SharedString::from(batch.text.clone()),
+        metrics.font_size,
+        &[run],
+        force_width,
+    );
+    let _ = line.paint(origin, metrics.height, TextAlign::Left, None, window, cx);
+}
+
 impl Frame {
     fn new(background: Hsla, rows: Rc<Vec<Rc<FrameRow>>>, mut cursor: Option<Cursor>) -> Self {
         if let Some(cursor) = &mut cursor {
@@ -410,21 +546,55 @@ impl Frame {
         cx: &mut App,
     ) {
         window.paint_quad(fill(bounds, self.background));
+        self.paint_content(
+            bounds.origin + point(metrics.padding, metrics.padding),
+            metrics,
+            window,
+            cx,
+        );
+    }
 
-        let origin = bounds.origin + point(metrics.padding, metrics.padding);
+    /// Rows down to the last one with content or the cursor, whichever is
+    /// lower; the blank rows below them are not worth showing.
+    pub fn content_rows(&self) -> usize {
+        let text = self
+            .rows
+            .iter()
+            .rposition(|row| !row.is_blank())
+            .map_or(0, |index| index + 1);
+        let cursor = self
+            .cursor
+            .as_ref()
+            .map_or(0, |cursor| cursor.row as usize + 1);
+        text.max(cursor)
+    }
+
+    /// Paint the cells with the top-left cell at `origin`, without the
+    /// background.
+    pub fn paint_content(
+        &self,
+        origin: Point<Pixels>,
+        metrics: CellMetrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let cell_origin = |row: u16, col: u16| -> Point<Pixels> {
             origin + point(metrics.width * col as f32, metrics.height * row as f32)
         };
 
-        for span in self.rows.iter().flat_map(|row| &row.backgrounds) {
-            let start = cell_origin(span.row, span.col);
-            window.paint_quad(fill(
-                Bounds::new(
-                    start,
-                    size(metrics.width * span.cols as f32, metrics.height),
-                ),
-                span.color,
-            ));
+        // Text is painted after the link underline and cursor below, so
+        // backgrounds go first and glyphs last.
+        for (index, row) in self.rows.iter().enumerate() {
+            for span in &row.backgrounds {
+                let start = cell_origin(index as u16, span.col);
+                window.paint_quad(fill(
+                    Bounds::new(
+                        start,
+                        size(metrics.width * span.cols as f32, metrics.height),
+                    ),
+                    span.color,
+                ));
+            }
         }
 
         if let Some(link) = &self.link {
@@ -471,57 +641,17 @@ impl Frame {
         }
 
         let text_system = window.text_system().clone();
-        for batch in self.rows.iter().flat_map(|row| &row.texts) {
-            let style = batch.style;
-            let font = theme::terminal_font(
-                if style.bold {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                },
-                if style.italic {
-                    FontStyle::Italic
-                } else {
-                    FontStyle::Normal
-                },
-            );
-            let run = TextRun {
-                len: batch.text.len(),
-                font,
-                color: style.color,
-                background_color: None,
-                underline: match style.underline {
-                    Underline::None => None,
-                    underline => Some(UnderlineStyle {
-                        thickness: px(1.),
-                        color: Some(style.color),
-                        wavy: underline == Underline::Curly,
-                    }),
-                },
-                strikethrough: style.strikethrough.then_some(StrikethroughStyle {
-                    thickness: px(1.),
-                    color: Some(style.color),
-                }),
-            };
-            let force_width = if batch.wide {
-                None
-            } else {
-                Some(metrics.width)
-            };
-            let line = text_system.shape_line(
-                SharedString::from(batch.text.clone()),
-                metrics.font_size,
-                &[run],
-                force_width,
-            );
-            let _ = line.paint(
-                cell_origin(batch.row, batch.col),
-                metrics.height,
-                TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
+        for (index, row) in self.rows.iter().enumerate() {
+            for batch in &row.texts {
+                paint_batch(
+                    batch,
+                    cell_origin(index as u16, batch.col),
+                    metrics,
+                    &text_system,
+                    window,
+                    cx,
+                );
+            }
         }
     }
 }

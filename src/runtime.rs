@@ -27,11 +27,13 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    control, process_info,
+    control,
+    hooks::Bootstrapped,
+    process_info,
     runtime_engine::{self, SessionHandle},
     runtime_protocol::{
-        Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request, Response, SessionInfo,
-        Snapshot, VERSION,
+        Blocks, Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request, Response,
+        SessionInfo, Snapshot, VERSION,
     },
     settings::SettingsStore,
 };
@@ -846,8 +848,21 @@ fn write_frame(stream: &mut impl Write, value: &impl Serialize) -> Result<()> {
 
 pub enum ClientEvent {
     Frame(Box<Snapshot>),
+    /// Rows of a command block from `from` on, at `version`; rows from an
+    /// earlier version are replaced.
+    BlockRows {
+        block: u64,
+        version: u64,
+        from: usize,
+        rows: Vec<String>,
+    },
+    /// What the shell reported about itself.
+    Shell(Box<Option<Bootstrapped>>),
     Text(String),
-    Matches { query: String, matches: Vec<Match> },
+    Matches {
+        query: String,
+        matches: Vec<Match>,
+    },
     Disconnected(String),
     Error(String),
 }
@@ -981,6 +996,7 @@ fn client_loop(
     let mut poll_at = Instant::now();
     let mut retry_at = Instant::now();
     let mut reported_error = None;
+    let mut block_state = BlockFetchState::default();
     while !stopped.load(Ordering::Acquire) && !events.is_closed() {
         if refresh.swap(false, Ordering::AcqRel) {
             retry_at = Instant::now();
@@ -1086,6 +1102,18 @@ fn client_loop(
         if let Some(client) = connection.as_mut() {
             match client.request(Request::Poll { session, revision }) {
                 Ok(Response::Snapshot(snapshot)) => {
+                    if let Some(blocks) = &snapshot.blocks
+                        && !fetch_block_updates(
+                            client,
+                            session,
+                            blocks,
+                            &mut block_state,
+                            events,
+                            stopped,
+                        )
+                    {
+                        return;
+                    }
                     let next_revision = snapshot.revision;
                     if events
                         .try_send(ClientEvent::Frame(Box::new(snapshot)))
@@ -1124,6 +1152,81 @@ fn client_loop(
         }
         poll_at = Instant::now() + POLL_INTERVAL;
     }
+}
+
+/// What a view has been sent of a session's blocks.
+#[derive(Default)]
+struct BlockFetchState {
+    shell_serial: u64,
+    /// Version and number of rows sent, per block.
+    rows: HashMap<u64, (u64, usize)>,
+}
+
+/// Send the view block rows and shell details a snapshot announces that it
+/// does not have yet. Returns false once the view is gone.
+fn fetch_block_updates(
+    client: &mut Rpc,
+    session: u64,
+    blocks: &Blocks,
+    state: &mut BlockFetchState,
+    events: &async_channel::Sender<ClientEvent>,
+    stopped: &AtomicBool,
+) -> bool {
+    if blocks.shell_serial != state.shell_serial
+        && let Ok(Response::Shell(shell)) = client.request(Request::Operate {
+            session,
+            operation: Operation::Shell,
+        })
+    {
+        state.shell_serial = blocks.shell_serial;
+        if !deliver(events, ClientEvent::Shell(shell), stopped) {
+            return false;
+        }
+    }
+    state
+        .rows
+        .retain(|id, _| blocks.items.iter().any(|item| item.id == *id));
+    for item in &blocks.items {
+        let sent = state.rows.entry(item.id).or_insert((item.version, 0));
+        if sent.0 != item.version {
+            *sent = (item.version, 0);
+        }
+        while sent.1 < item.rows {
+            let Ok(Response::BlockRows {
+                version,
+                from,
+                rows,
+                ..
+            }) = client.request(Request::Operate {
+                session,
+                operation: Operation::BlockRows {
+                    block: item.id,
+                    from: sent.1,
+                },
+            })
+            else {
+                break;
+            };
+            // The block changed since the snapshot; the next one says how.
+            if version != item.version || rows.is_empty() {
+                break;
+            }
+            sent.1 = from + rows.len();
+            if !deliver(
+                events,
+                ClientEvent::BlockRows {
+                    block: item.id,
+                    version,
+                    from,
+                    rows,
+                },
+                stopped,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1261,6 +1364,7 @@ mod tests {
                 dark: true,
             },
             control_token: "test-control-capability".into(),
+            command_blocks: false,
         }
     }
 

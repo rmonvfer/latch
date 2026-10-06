@@ -4,7 +4,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+use crate::hooks::{Bootstrapped, Completion};
+
+pub const VERSION: u32 = 2;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +38,9 @@ pub struct Launch {
     pub colors: Colors,
     /// Capability used by the existing GUI control API, never the runtime socket.
     pub control_token: String,
+    /// Show each command as a block once the shell's integration reports in.
+    #[serde(default)]
+    pub command_blocks: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +92,53 @@ pub struct Cursor {
     pub color: [u8; 3],
 }
 
+/// Where a command ran: the prompt's directory and Python environments.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockContext {
+    pub cwd: Option<PathBuf>,
+    pub virtualenv: Option<String>,
+    pub conda_env: Option<String>,
+}
+
+/// One command block. Its rows are fetched separately, since they change
+/// far less often than the screen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockSummary {
+    pub id: u64,
+    /// Changes when the block's rows are rebuilt, such as after a resize.
+    pub version: u64,
+    pub command: String,
+    pub context: BlockContext,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub running: bool,
+    /// Rows available: all of a finished block's output, or the rows of a
+    /// running command that scrolled off its terminal, whose live screen is
+    /// the snapshot.
+    pub rows: usize,
+}
+
+/// Completions the shell reported for text typed before the completion key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Completions {
+    pub serial: u64,
+    pub prefix: String,
+    pub matches: Vec<Completion>,
+}
+
+/// The session's command blocks and shell state, once blocks are on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocks {
+    pub items: Vec<BlockSummary>,
+    /// Context of the shell's current prompt, once it has drawn one.
+    pub prompt: Option<BlockContext>,
+    /// Changes when the shell reports its aliases, functions, and history.
+    pub shell_serial: u64,
+    pub completions: Option<Completions>,
+    /// A program has switched the screen to the alternate buffer.
+    pub full_screen: bool,
+}
+
 /// A complete viewport, independent of parser history and missed updates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -99,6 +151,7 @@ pub struct Snapshot {
     pub cursor: Cursor,
     pub mouse_tracking: bool,
     pub scroll_offset: usize,
+    pub blocks: Option<Box<Blocks>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +239,21 @@ pub enum Operation {
         lines: usize,
     },
     Stop,
+    /// Clear the shell's line editor, type `command` into it, and run it.
+    RunCommand {
+        command: String,
+    },
+    /// Ask the shell for completions of `text`.
+    Complete {
+        text: String,
+    },
+    /// Encoded rows of a block from `from` on, if it is still at `version`.
+    BlockRows {
+        block: u64,
+        from: usize,
+    },
+    /// What the shell reported about itself.
+    Shell,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -203,14 +271,26 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Response {
-    Ready { version: u32 },
+    Ready {
+        version: u32,
+    },
     Created(SessionInfo),
     Sessions(Vec<SessionInfo>),
     Snapshot(Snapshot),
     Unchanged,
     Done,
     Text(String),
-    Matches { query: String, matches: Vec<Match> },
+    Matches {
+        query: String,
+        matches: Vec<Match>,
+    },
+    BlockRows {
+        block: u64,
+        version: u64,
+        from: usize,
+        rows: Vec<String>,
+    },
+    Shell(Box<Option<Bootstrapped>>),
     Error(String),
 }
 

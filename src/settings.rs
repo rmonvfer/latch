@@ -46,6 +46,9 @@ pub struct Settings {
     /// Serve the control socket used by the `terminal` command and the MCP
     /// server. Applies at launch.
     pub control_api: bool,
+    /// Show each command and its output as a block, with an input editor,
+    /// in shells with integration. Applies to new terminals.
+    pub command_blocks: bool,
 }
 
 impl Default for Settings {
@@ -63,6 +66,7 @@ impl Default for Settings {
             agent_profiles: agents::default_profiles(),
             agent_worktrees: false,
             control_api: true,
+            command_blocks: true,
         }
     }
 }

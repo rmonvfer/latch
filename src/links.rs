@@ -208,7 +208,9 @@ fn is_safe_to_open(path: &Path) -> bool {
         && extension.is_some_and(|extension| OPENABLE_EXTENSIONS.contains(&extension.as_str()))
 }
 
-fn is_network_location(path: &Path) -> bool {
+/// Whether `path` is on a network share, where merely checking it exists
+/// can mount the share.
+pub fn is_network_location(path: &Path) -> bool {
     let text = path.to_string_lossy();
     text.starts_with("//") || text.starts_with("/net/") || text.starts_with("/Network/")
 }

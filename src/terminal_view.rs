@@ -1,15 +1,16 @@
 use std::{
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, KeyUpEvent, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, actions,
-    canvas, div, prelude::*, px,
+    EventEmitter, FocusHandle, Focusable, FollowMode, KeyBinding, KeyDownEvent, KeyUpEvent,
+    ListAlignment, ListState, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString,
+    Subscription, Task, WeakEntity, Window, actions, canvas, div, fill, prelude::*, px,
 };
 use libghostty_vt::{
     Terminal, key, mouse,
@@ -20,16 +21,25 @@ use libghostty_vt::{
 
 use crate::{
     agents::{Agent, AgentStatus},
+    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction},
+    blocks::{BlockList, ListChange},
+    command_editor::{CommandEditor, CommandEditorEvent},
+    completion::{self, CompletionMenu},
     components::{elevated_shadow, icon, icon_button},
     control,
     git::{self, DiffStats},
-    grid::{CellMetrics, GridRenderer},
+    grid::{CellMetrics, Frame, GridRenderer},
+    highlight::{self, CommandIndex, TokenKind},
+    history::{self, History},
+    hooks::{Bootstrapped, Completion},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
     process_info,
     runtime::{self, ClientEvent, SessionClient},
     runtime_display::DisplayState,
-    runtime_protocol::{Colors, Dimensions, Launch, Operation, SessionInfo, Snapshot},
+    runtime_protocol::{
+        BlockContext, Blocks, Colors, Dimensions, Launch, Operation, SessionInfo, Snapshot,
+    },
     search::SearchMatch,
     settings::SettingsStore,
     shell_integration::{self, ShellIntegration},
@@ -162,6 +172,38 @@ pub struct TerminalView {
     diff: Option<DiffStats>,
     branch: Option<String>,
     command_started: Option<Instant>,
+    /// The session's command blocks, once the runtime reports them.
+    blocks: Option<BlockList>,
+    /// A program has the alternate screen, so it gets the whole pane.
+    full_screen: bool,
+    /// Scroll and layout state of the block list, one item per block.
+    block_list: ListState,
+    /// The block picked by clicking or with ⌘↑ and ⌘↓.
+    selected_block: Option<usize>,
+    /// Where commands are typed while the shell waits at its prompt.
+    editor: Entity<CommandEditor>,
+    _editor_subscription: Subscription,
+    /// Context of the shell's prompt, once it has drawn one; commands are
+    /// typed into it only then.
+    prompt: Option<BlockContext>,
+    /// A command submitted before the shell was ready.
+    queued_command: Option<String>,
+    /// What the shell reported about itself.
+    shell: Option<Bootstrapped>,
+    history: History,
+    /// Where Up and Down have moved through history, if they have.
+    history_position: Option<HistoryPosition>,
+    /// The open Ctrl-R search, if any.
+    history_search: Option<HistorySearch>,
+    /// Names the shell can run, once indexed.
+    commands: Option<Rc<CommandIndex>>,
+    /// Text before the cursor that completions were asked for, while the
+    /// shell works them out.
+    pending_completion: Option<String>,
+    /// The newest completions taken from the runtime.
+    completion_serial: u64,
+    /// Completions shown over the editor.
+    completion: Option<CompletionMenu>,
 }
 
 /// A link in the viewport, in grid coordinates (end column exclusive).
@@ -234,6 +276,7 @@ impl TerminalView {
             dimensions,
             colors: runtime_colors(cx),
             control_token,
+            command_blocks: SettingsStore::get(cx).command_blocks,
         };
         let view = Self::from_session(
             SessionInfo {
@@ -308,6 +351,7 @@ impl TerminalView {
             }
         };
         Ok(cx.new(|cx| {
+            let editor = cx.new(|cx| CommandEditor::new("Run a command", cx));
             let output_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 while let Ok(event) = events.recv().await {
                     if this.update(cx, |view, cx| view.receive(event, cx)).is_err() {
@@ -399,6 +443,26 @@ impl TerminalView {
                 diff: None,
                 branch: None,
                 command_started: None,
+                blocks: None,
+                full_screen: false,
+                block_list: {
+                    let state = ListState::new(0, ListAlignment::Top, px(400.));
+                    state.set_follow_mode(FollowMode::Tail);
+                    state
+                },
+                selected_block: None,
+                _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
+                editor,
+                prompt: None,
+                queued_command: None,
+                shell: None,
+                history: History::default(),
+                history_position: None,
+                history_search: None,
+                commands: None,
+                pending_completion: None,
+                completion_serial: 0,
+                completion: None,
             }
         }))
     }
@@ -446,6 +510,26 @@ impl TerminalView {
     fn receive(&mut self, event: ClientEvent, cx: &mut Context<Self>) {
         match event {
             ClientEvent::Frame(frame) => self.apply_frame(*frame, cx),
+            ClientEvent::BlockRows {
+                block,
+                version,
+                from,
+                rows,
+            } => {
+                if let Some(blocks) = &mut self.blocks {
+                    match blocks.apply_rows(block, version, from, &rows, self.dimensions.cols) {
+                        Ok(Some(index)) => self.block_list.remeasure_items(index..index + 1),
+                        Ok(None) => {}
+                        Err(error) => log::error!("failed to show a block's rows: {error:#}"),
+                    }
+                }
+            }
+            ClientEvent::Shell(shell) => {
+                if let Some(shell) = *shell {
+                    self.index_shell(shell.clone(), cx);
+                    self.shell = Some(shell);
+                }
+            }
             ClientEvent::Text(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             ClientEvent::Matches { query, matches } => {
                 if let Some(search) = &mut self.search
@@ -489,6 +573,7 @@ impl TerminalView {
         self.connected = true;
         self.connection_error = None;
         self.mouse_tracking = frame.mouse_tracking;
+        self.apply_blocks(frame.blocks.map(|blocks| *blocks), cx);
         self.control_token.clone_from(&frame.info.control_token);
         self.command_started = match frame.info.command_elapsed_ms {
             Some(elapsed) => {
@@ -561,6 +646,59 @@ impl TerminalView {
         }
     }
 
+    /// Follow the runtime's command blocks: the list, the prompt, and the
+    /// shell's completions.
+    fn apply_blocks(&mut self, reported: Option<Blocks>, cx: &mut Context<Self>) {
+        let Some(reported) = reported else {
+            self.blocks = None;
+            self.full_screen = false;
+            return;
+        };
+        self.full_screen = reported.full_screen;
+        let blocks = self.blocks.get_or_insert_with(BlockList::default);
+        match blocks.sync(&reported.items) {
+            ListChange::Unchanged => {}
+            ListChange::Shifted { dropped, added } => {
+                if dropped > 0 {
+                    self.block_list.splice(0..dropped, 0);
+                    self.selected_block = self
+                        .selected_block
+                        .and_then(|index| index.checked_sub(dropped));
+                }
+                let count = self.block_list.item_count();
+                self.block_list.splice(count..count, added);
+                if added > 0 {
+                    // The editor gives way to a new command once it has run
+                    // long enough to be more than a flicker.
+                    cx.spawn(async move |view, cx| {
+                        cx.background_executor().timer(EDITOR_GRACE).await;
+                        let _ = view.update(cx, |_, cx| cx.notify());
+                    })
+                    .detach();
+                }
+            }
+            ListChange::Reset => {
+                self.block_list.reset(blocks.blocks().len());
+                self.selected_block = None;
+            }
+        }
+        let became_ready = self.prompt.is_none() && reported.prompt.is_some();
+        self.prompt = reported.prompt;
+        if became_ready && let Some(command) = self.queued_command.take() {
+            self.run_command(&command, cx);
+        }
+        if let Some(found) = reported.completions
+            && found.serial > self.completion_serial
+        {
+            self.completion_serial = found.serial;
+            if let Some(anchor) = self.pending_completion.take()
+                && self.editor.read(cx).text_before_cursor() == anchor
+            {
+                self.show_completions(anchor, found.prefix, found.matches, cx);
+            }
+        }
+    }
+
     /// Whether `token` is this pane's control token, compared in constant
     /// time.
     pub fn has_control_token(&self, token: &str) -> bool {
@@ -608,11 +746,513 @@ impl TerminalView {
     }
 
     fn previous_prompt(&mut self, _: &PreviousPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        self.send(Operation::Prompt { forward: false }, cx);
+        if self.shows_blocks() {
+            self.select_adjacent_block(false, cx);
+        } else {
+            self.send(Operation::Prompt { forward: false }, cx);
+        }
     }
 
     fn next_prompt(&mut self, _: &NextPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        self.send(Operation::Prompt { forward: true }, cx);
+        if self.shows_blocks() {
+            self.select_adjacent_block(true, cx);
+        } else {
+            self.send(Operation::Prompt { forward: true }, cx);
+        }
+    }
+
+    fn on_block_action(&self, cx: &Context<Self>) -> OnBlockAction {
+        let view = cx.entity().downgrade();
+        Rc::new(move |action, index, _window, cx| {
+            let _ = view.update(cx, |view, cx| view.block_action(action, index, cx));
+        })
+    }
+
+    /// Run `command` in the shell, now or once it is ready, and remember it.
+    fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if command.trim().is_empty() {
+            return;
+        }
+        self.selected_block = None;
+        self.history.push(command);
+        if self.prompt.is_some() {
+            self.send(
+                Operation::RunCommand {
+                    command: command.to_string(),
+                },
+                cx,
+            );
+        } else {
+            self.queued_command = Some(command.to_string());
+        }
+    }
+
+    /// Carry out an action from a block's header.
+    fn block_action(&mut self, action: BlockAction, index: usize, cx: &mut Context<Self>) {
+        let Some(block) = self
+            .blocks
+            .as_mut()
+            .and_then(|blocks| blocks.blocks_mut().get_mut(index))
+        else {
+            return;
+        };
+        match action {
+            BlockAction::Select => self.selected_block = Some(index),
+            BlockAction::ToggleCollapsed => {
+                block.collapsed = !block.collapsed;
+                self.block_list.remeasure_items(index..index + 1);
+            }
+            BlockAction::CopyCommand => {
+                cx.write_to_clipboard(ClipboardItem::new_string(block.command.clone()));
+            }
+            BlockAction::CopyOutput => {
+                cx.write_to_clipboard(ClipboardItem::new_string(block.output_text()));
+            }
+            BlockAction::Rerun => {
+                let command = block.command.clone();
+                self.run_command(&command, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Select the block before (or after) the selected one, or the newest,
+    /// and scroll to it.
+    fn select_adjacent_block(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(count) = self.blocks.as_ref().map(|blocks| blocks.blocks().len()) else {
+            return;
+        };
+        let next = match (self.selected_block, forward) {
+            (None, false) => count.checked_sub(1),
+            (None, true) => None,
+            (Some(index), false) => Some(index.saturating_sub(1)),
+            (Some(index), true) => (index + 1 < count).then_some(index + 1),
+        };
+        self.selected_block = next;
+        if let Some(index) = next {
+            self.block_list.scroll_to_reveal_item(index);
+        }
+        cx.notify();
+    }
+
+    /// Ask for completions of the word before the cursor: from zsh's own
+    /// completion system when it is idle at its prompt, otherwise from
+    /// command names and paths.
+    fn request_completions(&mut self, cx: &mut Context<Self>) {
+        let before = self.editor.read(cx).text_before_cursor().to_string();
+        let shell_idle = self.prompt.is_some()
+            && self
+                .blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.running().is_none());
+        let zsh = self
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.shell == "zsh");
+        if zsh && shell_idle {
+            self.pending_completion = Some(before.clone());
+            self.send(Operation::Complete { text: before }, cx);
+            return;
+        }
+        let cwd = self.prompt.as_ref().and_then(|prompt| prompt.cwd.clone());
+        let (prefix, matches) =
+            completion::local_completions(&before, self.commands.as_deref(), cwd.as_deref());
+        self.show_completions(before, prefix, matches, cx);
+    }
+
+    /// Complete at once when there is one match; otherwise extend the word
+    /// by what every match shares and list them.
+    fn show_completions(
+        &mut self,
+        anchor: String,
+        prefix: String,
+        matches: Vec<Completion>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut menu = CompletionMenu::new(anchor.clone(), prefix.clone(), matches);
+        match menu.visible().count() {
+            0 => return,
+            1 => {
+                if let Some((len, text)) = menu.apply(&anchor) {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.replace_before_cursor(len, &text, cx)
+                    });
+                }
+                return;
+            }
+            _ => {}
+        }
+        let shared = common_prefix(
+            menu.visible()
+                .map(|(_, completion)| completion.word.as_str()),
+        );
+        if shared.len() > prefix.len() && anchor.ends_with(&prefix) {
+            let before = format!("{}{shared}", &anchor[..anchor.len() - prefix.len()]);
+            self.editor.update(cx, |editor, cx| {
+                editor.replace_before_cursor(prefix.len(), &shared, cx)
+            });
+            menu.refine(&before);
+        }
+        self.completion = Some(menu);
+        self.history_search = None;
+        self.sync_editor_menu(cx);
+        cx.notify();
+    }
+
+    fn refine_completions(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.completion else {
+            return;
+        };
+        let before = self.editor.read(cx).text_before_cursor().to_string();
+        if !menu.refine(&before) || menu.is_empty() {
+            self.completion = None;
+            self.sync_editor_menu(cx);
+        }
+        cx.notify();
+    }
+
+    fn accept_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.completion.take() else {
+            return;
+        };
+        let before = self.editor.read(cx).text_before_cursor().to_string();
+        self.sync_editor_menu(cx);
+        if let Some((len, text)) = menu.apply(&before) {
+            self.editor.update(cx, |editor, cx| {
+                editor.replace_before_cursor(len, &text, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    /// Tell the editor whether a menu takes its Up, Down, and Enter.
+    fn sync_editor_menu(&mut self, cx: &mut Context<Self>) {
+        let open = self.completion.is_some() || self.history_search.is_some();
+        self.editor
+            .update(cx, |editor, _| editor.set_menu_open(open));
+    }
+
+    /// Load the shell's history and index the commands it can run, off
+    /// the main thread.
+    fn index_shell(&mut self, shell: Bootstrapped, cx: &mut Context<Self>) {
+        let work = cx.background_executor().spawn(async move {
+            let history = shell.histfile.as_deref().map(|path| {
+                history::load(path, &shell.shell).unwrap_or_else(|error| {
+                    log::warn!("failed to read {}: {error:#}", path.display());
+                    History::default()
+                })
+            });
+            (history, CommandIndex::new(&shell))
+        });
+        cx.spawn(async move |view, cx| {
+            let (history, commands) = work.await;
+            let _ = view.update(cx, |view, cx| {
+                if let Some(history) = history {
+                    view.history.prepend(history);
+                }
+                view.commands = Some(Rc::new(commands));
+                view.decorate_editor(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Show the previous (or next) history entry in the editor, keeping
+    /// what was typed to come back to past the newest entry.
+    fn walk_history(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let len = self.history.len();
+        let next = match (&self.history_position, forward) {
+            (None, true) => return,
+            (None, false) => len.checked_sub(1),
+            (Some(position), false) => position.index.checked_sub(1),
+            (Some(position), true) => Some(position.index + 1),
+        };
+        let Some(index) = next else {
+            return;
+        };
+        let draft = match self.history_position.take() {
+            Some(position) => position.draft,
+            None => self.editor.read(cx).text().to_string(),
+        };
+        let text = match self.history.get(index) {
+            Some(entry) => {
+                self.history_position = Some(HistoryPosition {
+                    index,
+                    draft,
+                    applying: true,
+                });
+                entry.to_string()
+            }
+            None => draft,
+        };
+        self.editor
+            .update(cx, |editor, cx| editor.set_text(text, cx));
+    }
+
+    fn update_history_search(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.history_search else {
+            return;
+        };
+        let query = self.editor.read(cx).text();
+        search.matches = self
+            .history
+            .search(query, HISTORY_SEARCH_RESULTS)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        search.selected = 0;
+        cx.notify();
+    }
+
+    /// Put the selected search match in the editor.
+    fn pick_history_match(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.history_search.take() else {
+            return;
+        };
+        self.sync_editor_menu(cx);
+        if let Some(entry) = search.matches.get(search.selected) {
+            let entry = entry.clone();
+            self.editor
+                .update(cx, |editor, cx| editor.set_text(entry, cx));
+        }
+        cx.notify();
+    }
+
+    /// Refresh the editor's highlighting and history suggestion.
+    fn decorate_editor(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text().to_string();
+        let suggestion = self
+            .history
+            .suggestion(&text)
+            .filter(|_| self.history_search.is_none())
+            .map(str::to_string);
+        let highlights = match &self.commands {
+            Some(commands) => {
+                let colors = &cx.theme().terminal;
+                let cwd = self
+                    .prompt
+                    .as_ref()
+                    .and_then(|prompt| prompt.cwd.as_deref());
+                highlight::highlight(&text, commands, cwd)
+                    .into_iter()
+                    .map(|token| {
+                        let color = match token.kind {
+                            TokenKind::Command => colors.ansi[2],
+                            TokenKind::UnknownCommand => colors.ansi[1],
+                            TokenKind::Flag => colors.ansi[6],
+                            TokenKind::String => colors.ansi[3],
+                            TokenKind::Operator => colors.ansi[5],
+                        };
+                        (token.range, theme::to_hsla(color))
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.set_suggestion(suggestion, cx);
+            editor.set_highlights(highlights, cx);
+        });
+    }
+
+    /// The editor with the shell's context above it.
+    fn render_editor_panel(&self, metrics: CellMetrics, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let context = self.prompt.clone().unwrap_or_default();
+        let chips = block_view::context_chips(&context, self.branch.as_deref(), theme);
+        // Ctrl-R matches, best at the bottom, next to the editor.
+        let search = self.history_search.as_ref().map(|search| {
+            let rows = search
+                .matches
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, entry)| {
+                    let first_line = entry.lines().next().unwrap_or_default().to_string();
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .when(index == search.selected, |row| {
+                            row.bg(theme.ghost_selected).text_color(theme.text)
+                        })
+                        .child(first_line)
+                });
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .pb_1()
+                .font_family(theme::FONT_FAMILY)
+                .text_sm()
+                .text_color(theme.text_muted)
+                .when(search.matches.is_empty(), |list| {
+                    list.child(div().px_2().child("No matching commands"))
+                })
+                .children(rows)
+        });
+        let completions = self
+            .completion
+            .as_ref()
+            .map(|menu| render_completion_menu(menu, theme));
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .px(metrics.padding + block_view::HORIZONTAL_INSET)
+            .py_2()
+            .border_t_1()
+            .border_color(theme.border_variant)
+            .children(completions)
+            .children(search)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .font_family(theme::UI_FONT_FAMILY)
+                    .children(chips),
+            )
+            .child(self.editor.clone())
+            .into_any_element()
+    }
+
+    fn on_editor_event(
+        &mut self,
+        _: Entity<CommandEditor>,
+        event: &CommandEditorEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            CommandEditorEvent::Confirmed => {
+                if self.completion.is_some() {
+                    self.accept_completion(cx);
+                } else {
+                    self.pick_history_match(cx);
+                }
+            }
+            CommandEditorEvent::Complete => match &mut self.completion {
+                Some(menu) => {
+                    menu.select_next();
+                    cx.notify();
+                }
+                None => self.request_completions(cx),
+            },
+            CommandEditorEvent::CompletePrevious => {
+                if let Some(menu) = &mut self.completion {
+                    menu.select_previous();
+                    cx.notify();
+                }
+            }
+            CommandEditorEvent::Submitted(command) => {
+                self.history_position = None;
+                self.run_command(command, cx);
+            }
+            CommandEditorEvent::EndOfFile => self.send(Operation::Input { bytes: vec![4] }, cx),
+            CommandEditorEvent::HistoryPrevious if self.completion.is_some() => {
+                if let Some(menu) = &mut self.completion {
+                    menu.select_previous();
+                }
+                cx.notify();
+            }
+            CommandEditorEvent::HistoryNext if self.completion.is_some() => {
+                if let Some(menu) = &mut self.completion {
+                    menu.select_next();
+                }
+                cx.notify();
+            }
+            CommandEditorEvent::HistoryPrevious => match &mut self.history_search {
+                Some(search) => {
+                    search.selected =
+                        (search.selected + 1).min(search.matches.len().saturating_sub(1));
+                    cx.notify();
+                }
+                None => self.walk_history(false, cx),
+            },
+            CommandEditorEvent::HistoryNext => match &mut self.history_search {
+                Some(search) => {
+                    search.selected = search.selected.saturating_sub(1);
+                    cx.notify();
+                }
+                None => self.walk_history(true, cx),
+            },
+            CommandEditorEvent::SearchHistory => {
+                self.completion = None;
+                if self.history_search.take().is_none() {
+                    self.history_search = Some(HistorySearch::default());
+                    self.update_history_search(cx);
+                }
+                self.sync_editor_menu(cx);
+                cx.notify();
+            }
+            CommandEditorEvent::Escaped => {
+                if self.completion.take().is_some() || self.history_search.take().is_some() {
+                    self.sync_editor_menu(cx);
+                } else {
+                    self.selected_block = None;
+                }
+                cx.notify();
+            }
+            CommandEditorEvent::Changed => {
+                if let Some(position) = &mut self.history_position {
+                    if position.applying {
+                        position.applying = false;
+                    } else {
+                        self.history_position = None;
+                    }
+                }
+                self.update_history_search(cx);
+                self.refine_completions(cx);
+                self.decorate_editor(cx);
+            }
+        }
+    }
+
+    /// Whether the editor is shown: in block mode, unless a command has
+    /// been running past the grace period and takes the keyboard.
+    fn shows_editor(&self) -> bool {
+        self.shows_blocks()
+            && self
+                .blocks
+                .as_ref()
+                .and_then(BlockList::running)
+                .is_none_or(|block| block.started.elapsed() < EDITOR_GRACE)
+    }
+
+    /// The list items to show, when the pane shows blocks.
+    fn block_items(&mut self) -> Option<Vec<Item>> {
+        if !self.shows_blocks() {
+            return None;
+        }
+        let blocks = self.blocks.as_ref()?;
+        let mut items = Vec::with_capacity(blocks.blocks().len());
+        for block in blocks.blocks() {
+            let content = if block.is_running() {
+                ItemContent::Running(vec![block.rows()])
+            } else {
+                ItemContent::Finished(block.rows())
+            };
+            let selected = self.selected_block == Some(items.len());
+            items.push(Item::block(block, content, selected));
+        }
+        // A running block is drawn from the live terminal and grows with it.
+        if blocks.running().is_some() {
+            let last = items.len() - 1;
+            self.block_list.remeasure_items(last..items.len());
+        }
+        Some(items)
+    }
+
+    /// Whether the pane shows its block list rather than a single terminal
+    /// screen, which full-screen programs still get.
+    fn shows_blocks(&self) -> bool {
+        self.blocks.is_some() && !self.full_screen
     }
 
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
@@ -683,7 +1323,17 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.bounds = Some(bounds);
-        let (cols, rows) = metrics.grid_size(bounds);
+        // Blocks are inset from the sides; full-screen programs are not.
+        let grid_bounds = if self.shows_blocks() {
+            let inset = block_view::HORIZONTAL_INSET;
+            Bounds::new(
+                bounds.origin + gpui::point(inset, px(0.)),
+                gpui::size(bounds.size.width - inset * 2., bounds.size.height),
+            )
+        } else {
+            bounds
+        };
+        let (cols, rows) = metrics.grid_size(grid_bounds);
         let next = Dimensions {
             cols,
             rows,
@@ -1073,7 +1723,14 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.shows_editor() {
+            window.focus(&self.editor.focus_handle(cx), cx);
+            return;
+        }
         window.focus(&self.focus_handle, cx);
+        if self.shows_blocks() {
+            return;
+        }
         let Some(bounds) = self.bounds else {
             return;
         };
@@ -1117,6 +1774,9 @@ impl TerminalView {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.shows_blocks() {
+            return;
+        }
         let Some(bounds) = self.bounds else {
             return;
         };
@@ -1155,6 +1815,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.shows_blocks() {
+            return;
+        }
         let Some(bounds) = self.bounds else {
             return;
         };
@@ -1203,6 +1866,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The block list scrolls itself.
+        if self.shows_blocks() {
+            return;
+        }
         let Some(metrics) = self.metrics else {
             return;
         };
@@ -1295,7 +1962,18 @@ impl Render for TerminalView {
         let metrics = *self
             .metrics
             .get_or_insert_with(|| CellMetrics::measure(SettingsStore::get(cx), window));
+        // Keys go to the editor while it shows and to the terminal
+        // otherwise, wherever the pane's focus was put.
+        let editor_focus = self.editor.focus_handle(cx);
+        if self.shows_editor() {
+            if self.focus_handle.is_focused(window) {
+                window.focus(&editor_focus, cx);
+            }
+        } else if editor_focus.is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
         let focused = self.focus_handle.is_focused(window);
+        let block_items = self.block_items();
         let frame = match self.renderer.build_frame(&self.terminal, focused) {
             Ok(mut frame) => {
                 if let Some(link) = &self.link_hover {
@@ -1312,6 +1990,36 @@ impl Render for TerminalView {
                 log::error!("failed to build terminal frame: {error}");
                 None
             }
+        };
+        // With blocks, the canvas only sizes the terminal and paints the
+        // background; the list paints the content.
+        let (screen, block_content) = match (block_items, frame) {
+            (Some(items), frame) => {
+                let background = frame
+                    .as_ref()
+                    .map_or(cx.theme().terminal_background(), |frame| frame.background);
+                let list = block_view::render_list(
+                    &self.block_list,
+                    Rc::new(items),
+                    frame.map(Rc::new),
+                    metrics,
+                    cx.theme(),
+                    self.on_block_action(cx),
+                );
+                let editor_panel = self
+                    .shows_editor()
+                    .then(|| self.render_editor_panel(metrics, cx));
+                let content = div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(list))
+                    .children(editor_panel)
+                    .into_any_element();
+                (Screen::Blocks(background), Some(content))
+            }
+            (None, frame) => (Screen::Terminal(frame), None),
         };
         let view = cx.entity();
         let search_bar = self
@@ -1357,14 +2065,16 @@ impl Render for TerminalView {
                     move |bounds, _window, cx| {
                         view.update(cx, |view, cx| view.fit_to_bounds(bounds, metrics, cx));
                     },
-                    move |bounds, (), window, cx| {
-                        if let Some(frame) = frame {
-                            frame.paint(bounds, metrics, window, cx);
-                        }
+                    move |bounds, (), window, cx| match screen {
+                        Screen::Terminal(Some(frame)) => frame.paint(bounds, metrics, window, cx),
+                        Screen::Terminal(None) => {}
+                        Screen::Blocks(background) => window.paint_quad(fill(bounds, background)),
                     },
                 )
+                .absolute()
                 .size_full(),
             )
+            .children(block_content)
             .when(
                 !self.connected
                     || self.info.exited
@@ -1412,6 +2122,124 @@ impl Render for TerminalView {
             .children(search_bar)
             .children(link_tooltip)
     }
+}
+
+/// The completion menu: a window of rows around the selection, each with
+/// its description.
+fn render_completion_menu(menu: &CompletionMenu, theme: &theme::Theme) -> impl IntoElement {
+    let count = menu.visible().count();
+    let first = menu
+        .selected()
+        .saturating_sub(COMPLETION_ROWS / 2)
+        .min(count.saturating_sub(COMPLETION_ROWS));
+    let rows = menu
+        .visible()
+        .skip(first)
+        .take(COMPLETION_ROWS)
+        .map(|(index, completion)| {
+            let selected = index == menu.selected();
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .when(selected, |row| row.bg(theme.ghost_selected))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(completion.word.clone()),
+                )
+                .children(completion.description.clone().map(|description| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .font_family(theme::UI_FONT_FAMILY)
+                        .text_color(theme.text_placeholder)
+                        .child(description)
+                }))
+        });
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .pb_1()
+        .font_family(theme::FONT_FAMILY)
+        .text_sm()
+        .children(rows)
+        .when(count > COMPLETION_ROWS, |list| {
+            list.child(
+                div()
+                    .px_2()
+                    .text_xs()
+                    .font_family(theme::UI_FONT_FAMILY)
+                    .text_color(theme.text_placeholder)
+                    .child(format!("{} of {count}", menu.selected() + 1)),
+            )
+        })
+}
+
+/// Completions listed at once.
+const COMPLETION_ROWS: usize = 10;
+
+/// The longest start every word shares.
+fn common_prefix<'a>(mut words: impl Iterator<Item = &'a str>) -> String {
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut shared = first.len();
+    for word in words {
+        shared = first
+            .char_indices()
+            .zip(word.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((index, ch), _)| index + ch.len_utf8())
+            .min(shared);
+    }
+    first[..shared].to_string()
+}
+
+/// Matches listed by the Ctrl-R history search.
+const HISTORY_SEARCH_RESULTS: usize = 8;
+
+/// A place in history reached with Up and Down.
+struct HistoryPosition {
+    index: usize,
+    /// What was typed before walking history.
+    draft: String,
+    /// The editor change this position caused is still to be reported,
+    /// and must not end the walk.
+    applying: bool,
+}
+
+/// The Ctrl-R search: the editor's text is the query.
+#[derive(Default)]
+struct HistorySearch {
+    /// Best match first.
+    matches: Vec<String>,
+    selected: usize,
+}
+
+/// How long a command runs before the editor hides and keys go to it.
+const EDITOR_GRACE: Duration = Duration::from_millis(50);
+
+/// What the pane's canvas paints.
+enum Screen {
+    /// A single terminal screen.
+    Terminal(Option<Frame>),
+    /// The background behind the block list, in this color.
+    Blocks(gpui::Hsla),
 }
 
 /// Key bindings for the find bar.
