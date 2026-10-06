@@ -1928,6 +1928,9 @@ impl TerminalView {
         }
         if self.shows_blocks() {
             if event.button == MouseButton::Left {
+                // A click anywhere deselects the block; a click on a block
+                // selects it again when the click completes.
+                self.selected_block = None;
                 self.start_block_selection(event, cx);
             }
             return;

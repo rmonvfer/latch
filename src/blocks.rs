@@ -184,7 +184,8 @@ pub fn word_columns(text: &str, col: usize) -> (usize, usize) {
         .iter()
         .position(|(start, end, _)| (*start..*end).contains(&col))
     else {
-        return (col, col + 1);
+        // Past the end of the row (a click beyond its text).
+        return (col, col.saturating_add(1));
     };
     if cells[hit].2 {
         return (cells[hit].0, cells[hit].1);
@@ -379,6 +380,7 @@ mod tests {
         assert_eq!(slice_columns("short", 10, 20), "");
         assert_eq!(word_columns("git commit --amend", 6), (4, 10));
         assert_eq!(word_columns("a  b", 1), (1, 2));
+        assert_eq!(word_columns("ab", usize::MAX), (usize::MAX, usize::MAX));
     }
 
     #[test]
