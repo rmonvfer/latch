@@ -60,6 +60,8 @@ pub struct Item {
     selected: bool,
     /// Text selected across blocks, painted where it covers this block.
     selection: Option<BlockSelection>,
+    /// Whether a hairline divides the block from what is above it.
+    divider: bool,
 }
 
 /// Where each visible block's output was last painted, for mapping the
@@ -165,7 +167,13 @@ impl Item {
             collapsed: block.collapsed,
             selected,
             selection: None,
+            divider: true,
         }
+    }
+
+    pub fn with_divider(mut self, divider: bool) -> Self {
+        self.divider = divider;
+        self
     }
 
     pub fn with_selection(mut self, selection: Option<BlockSelection>) -> Self {
@@ -382,9 +390,7 @@ fn render_item(
         .flex()
         .flex_col()
         .w_full()
-        // The first block has nothing above it to divide from; a line there
-        // would read as a second border.
-        .when(index > 0, |this| {
+        .when(item.divider, |this| {
             this.border_t_1().border_color(palette.outline)
         })
         .when(failed, |this| this.bg(palette.error.opacity(0.1)))

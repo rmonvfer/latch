@@ -1357,7 +1357,15 @@ impl TerminalView {
                 ItemContent::Finished(block.rows())
             };
             let selected = self.selected_block == Some(items.len());
-            items.push(Item::block(block, content, selected).with_selection(self.block_selection));
+            // Started at the top, the first block sits against the pane's
+            // edge, where a divider would read as a second border; stacked
+            // up from the input, it divides the blocks from the space above.
+            let divider = !items.is_empty() || self.blocks_from_bottom;
+            items.push(
+                Item::block(block, content, selected)
+                    .with_selection(self.block_selection)
+                    .with_divider(divider),
+            );
         }
         // A running block is drawn from the live terminal and grows with it.
         if blocks.running().is_some() {
