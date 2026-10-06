@@ -1192,6 +1192,7 @@ impl Workspace {
                 .position(|id| *id == active)
         });
         SessionState {
+            version: session::SESSION_VERSION,
             entries,
             active,
             sidebar_open: self.sidebar_open,
