@@ -46,7 +46,12 @@ use crate::{
     search, shell_integration,
 };
 
-const SCROLLBACK_LINES: usize = 10_000;
+/// Scrollback kept per terminal. libghostty measures it in bytes of its
+/// page storage, not lines: this keeps roughly 17,000 rows at 200 columns.
+/// Pages are allocated as output arrives, so it is a ceiling, not a cost.
+const SCROLLBACK_BYTES: usize = 32 * 1024 * 1024;
+/// Most lines `read_output` returns.
+const MAX_READ_LINES: usize = 10_000;
 const COMMAND_CAPACITY: usize = 32;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_INTERVAL: Duration = Duration::from_millis(2);
@@ -59,6 +64,9 @@ const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
 /// How long the width or colors must stay put before finished blocks are
 /// rebuilt for them.
 const REBUILD_DELAY: Duration = Duration::from_millis(250);
+/// How long one slice of rebuilding blocks may take before the session
+/// serves its terminal again.
+const REBUILD_SLICE: Duration = Duration::from_millis(8);
 /// Most command blocks a session keeps; older ones are dropped.
 const MAX_BLOCKS: usize = 1000;
 
@@ -255,7 +263,7 @@ impl Engine {
         let mut terminal = Terminal::new(Options {
             cols: launch.dimensions.cols,
             rows: launch.dimensions.rows,
-            max_scrollback: SCROLLBACK_LINES,
+            max_scrollback: SCROLLBACK_BYTES,
         })?;
         configure_colors(&mut terminal, &launch.colors)?;
         register_effects(
@@ -357,12 +365,17 @@ impl Engine {
             }
             if self.rebuild_due.is_some_and(|due| Instant::now() >= due) {
                 self.rebuild_due = None;
-                if let Err(error) = self.rebuild_blocks() {
-                    self.attention(Attention::Notification {
-                        title: Some("Command blocks".into()),
-                        body: format!("{error:#}"),
-                    });
+                if let Some(blocks) = &mut self.blocks {
+                    blocks.mark_stale();
                 }
+            }
+            if self.rebuilding()
+                && let Err(error) = self.rebuild_blocks()
+            {
+                self.attention(Attention::Notification {
+                    title: Some("Command blocks".into()),
+                    body: format!("{error:#}"),
+                });
             }
             self.refresh_info();
             match requests.try_recv() {
@@ -371,7 +384,7 @@ impl Engine {
                     self.refresh_info();
                     let _ = reply.send(result);
                 }
-                Err(mpsc::TryRecvError::Empty) if self.output.is_empty() => {
+                Err(mpsc::TryRecvError::Empty) if self.output.is_empty() && !self.rebuilding() => {
                     thread::park_timeout(METADATA_INTERVAL)
                 }
                 Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
@@ -388,6 +401,7 @@ impl Engine {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn consume_output(&mut self) {
         let output = self.output.clone();
         for chunk in crate::output::OutputBatch::new(&output) {
@@ -441,6 +455,7 @@ impl Engine {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn apply_hook(&mut self, hook: Hook) {
         let result = match hook {
             Hook::Bootstrapped(shell) => {
@@ -504,12 +519,13 @@ impl Engine {
     }
 
     /// Swap in a fresh terminal at the session's size and colors.
+    #[tracing::instrument(skip_all)]
     fn replace_terminal(&mut self) -> Result<()> {
         let dimensions = self.dimensions.get();
         let mut terminal = Terminal::new(Options {
             cols: dimensions.cols,
             rows: dimensions.rows,
-            max_scrollback: SCROLLBACK_LINES,
+            max_scrollback: SCROLLBACK_BYTES,
         })?;
         terminal.resize(
             dimensions.cols,
@@ -531,22 +547,31 @@ impl Engine {
         Ok(())
     }
 
-    /// Rebuild finished blocks' rows at the session's width and colors.
+    /// Rebuild some stale blocks' rows at the session's width and colors,
+    /// as much as fits one slice of the loop.
+    #[tracing::instrument(skip_all)]
     fn rebuild_blocks(&mut self) -> Result<()> {
         let Some(blocks) = &mut self.blocks else {
             return Ok(());
         };
         let dimensions = self.dimensions.get();
         let colors = &self.colors;
-        blocks.rebuild_rows(|| {
-            let mut terminal = Terminal::new(Options {
-                cols: dimensions.cols,
-                rows: dimensions.rows,
-                max_scrollback: SCROLLBACK_LINES,
-            })?;
-            configure_colors(&mut terminal, colors)?;
-            Ok(terminal)
-        })
+        blocks.rebuild_stale(
+            || {
+                let mut terminal = Terminal::new(Options {
+                    cols: dimensions.cols,
+                    rows: dimensions.rows,
+                    max_scrollback: SCROLLBACK_BYTES,
+                })?;
+                configure_colors(&mut terminal, colors)?;
+                Ok(terminal)
+            },
+            REBUILD_SLICE,
+        )
+    }
+
+    fn rebuilding(&self) -> bool {
+        self.blocks.as_ref().is_some_and(BlockLog::has_stale)
     }
 
     /// Write `text` into the shell's line editor after clearing it, then
@@ -582,6 +607,7 @@ impl Engine {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn update_metadata(&mut self) {
         if let Ok(metadata) = self.metadata_results.try_recv() {
             self.metadata_pending = false;
@@ -610,6 +636,7 @@ impl Engine {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn refresh_info(&mut self) {
         let title = self.terminal.title().unwrap_or_default().trim();
         self.info.title = if title.is_empty() {
@@ -702,6 +729,7 @@ impl Engine {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all)]
     fn operate(&mut self, operation: Operation) -> Result<Response> {
         match operation {
             Operation::Input { bytes } => self.write_input(&bytes)?,
@@ -994,7 +1022,7 @@ impl Engine {
                 let mut text = self
                     .blocks
                     .as_ref()
-                    .map(|blocks| blocks.text(lines.min(SCROLLBACK_LINES)))
+                    .map(|blocks| blocks.text(lines.min(MAX_READ_LINES)))
                     .unwrap_or_default();
                 text.push_str(&search::screen_text(&self.terminal)?);
                 let lines: Vec<&str> = text
@@ -1002,7 +1030,7 @@ impl Engine {
                     .map(str::trim_end)
                     .filter(|line| !line.is_empty())
                     .rev()
-                    .take(lines.min(SCROLLBACK_LINES))
+                    .take(lines.min(MAX_READ_LINES))
                     .collect();
                 let text = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
                 ensure!(
@@ -1078,6 +1106,7 @@ impl Engine {
         )
     }
 
+    #[tracing::instrument(skip_all)]
     fn capture(&mut self) -> Result<Snapshot> {
         self.refresh_info();
         let full_screen = runtime_blocks::is_full_screen(&self.terminal);
@@ -1492,7 +1521,7 @@ mod tests {
 
         fn text(&self) -> String {
             match self.operate(Operation::Read {
-                lines: SCROLLBACK_LINES,
+                lines: MAX_READ_LINES,
             }) {
                 Response::Text(text) => text,
                 response => panic!("expected text: {response:?}"),
@@ -1616,6 +1645,68 @@ mod tests {
     #[test]
     fn default_shell_launch_preserves_zsh_integration() {
         assert_default_login_shell(true);
+    }
+
+    #[test]
+    #[ignore = "prints the cost of each step of a window resize; run with --release"]
+    fn resize_benchmark() {
+        // A dense, colored screen with scrollback, as after a build log.
+        let session = Session::new(
+            "awk 'BEGIN { for (i = 0; i < 3000; i++) { printf \"\\033[3%dm\", i % 7 + 1; \
+             for (j = 0; j < 190; j++) printf \"%c\", 65 + (i + j) % 26; printf \"\\033[0m\\n\" } }'; \
+             sleep 30",
+        );
+        let dimensions = |cols| Dimensions {
+            cols,
+            rows: 60,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        session.operate(Operation::Resize {
+            dimensions: dimensions(200),
+        });
+        wait_until(|| session.snapshot().rows.iter().any(|row| row.contains("Z")));
+        thread::sleep(Duration::from_millis(500));
+
+        let mut display = Terminal::new(Options {
+            cols: 200,
+            rows: 60,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let mut mirror = crate::runtime_display::DisplayState::default();
+        let mut renderer = crate::grid::GridRenderer::new().unwrap();
+        let (mut resize, mut snapshot, mut apply, mut frame) = (
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let steps = 40;
+        for step in 0..steps {
+            let started = Instant::now();
+            session.operate(Operation::Resize {
+                dimensions: dimensions(160 + (step % 40) as u16),
+            });
+            resize += started.elapsed();
+            let started = Instant::now();
+            let captured = session.snapshot();
+            snapshot += started.elapsed();
+            let started = Instant::now();
+            mirror.apply(&mut display, &captured).unwrap();
+            apply += started.elapsed();
+            let started = Instant::now();
+            renderer.build_frame(&display, true).unwrap();
+            frame += started.elapsed();
+        }
+        let per = |total: Duration| total / steps;
+        eprintln!(
+            "per resize step: resize {:?}, snapshot {:?}, mirror {:?}, grid {:?}",
+            per(resize),
+            per(snapshot),
+            per(apply),
+            per(frame)
+        );
     }
 
     #[test]

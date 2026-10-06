@@ -60,7 +60,7 @@ struct TextStyle {
     strikethrough: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct TextBatch {
     row: u16,
     col: u16,
@@ -73,7 +73,7 @@ struct TextBatch {
     wide: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct BackgroundSpan {
     row: u16,
     col: u16,
@@ -108,7 +108,7 @@ pub struct Frame {
 }
 
 /// One painted row of terminal cells, independent of where it is drawn.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct FrameRow {
     backgrounds: Vec<BackgroundSpan>,
     texts: Vec<TextBatch>,
@@ -149,6 +149,7 @@ impl GridRenderer {
         })
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn build_frame(
         &mut self,
         terminal: &Terminal<'static, 'static>,
@@ -420,6 +421,7 @@ impl GridRenderer {
 }
 
 /// Paint `rows` top to bottom starting at `origin`, one cell height apart.
+#[tracing::instrument(skip_all)]
 pub fn paint_rows(
     rows: &[Rc<FrameRow>],
     origin: Point<Pixels>,
@@ -545,6 +547,7 @@ impl Frame {
         });
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
@@ -582,6 +585,7 @@ impl Frame {
 
     /// Paint the cells with the top-left cell at `origin`, without the
     /// background.
+    #[tracing::instrument(skip_all)]
     pub fn paint_content(
         &self,
         origin: Point<Pixels>,

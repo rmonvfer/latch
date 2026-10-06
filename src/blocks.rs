@@ -234,6 +234,7 @@ impl BlockList {
     }
 
     /// Bring the list in line with the runtime's summaries.
+    #[tracing::instrument(skip_all)]
     pub fn sync(&mut self, summaries: &[BlockSummary]) -> ListChange {
         let old: Vec<u64> = self.blocks.iter().map(|block| block.id).collect();
         let new: Vec<u64> = summaries.iter().map(|summary| summary.id).collect();
@@ -269,21 +270,17 @@ impl BlockList {
         }
     }
 
-    /// Take rows the runtime sent for a block, `cols` wide, painted over
-    /// `background`. Returns the block's index when it changed.
+    /// Take a block's rows from `from` on, as `decode` made them. Returns
+    /// the block's index when it changed.
+    #[tracing::instrument(skip_all)]
     pub fn apply_rows(
         &mut self,
         id: u64,
         version: u64,
         from: usize,
-        rows: &[String],
-        cols: u16,
-        background: [u8; 3],
-    ) -> Result<Option<usize>> {
-        let Some(index) = self.blocks.iter().position(|block| block.id == id) else {
-            return Ok(None);
-        };
-        let decoded = decode(rows, cols, background)?;
+        rows: Vec<FrameRow>,
+    ) -> Option<usize> {
+        let index = self.blocks.iter().position(|block| block.id == id)?;
         let block = &mut self.blocks[index];
         if block.version != version {
             block.version = version;
@@ -292,16 +289,19 @@ impl BlockList {
         block.rows.truncate(from);
         if block.rows.len() < from {
             // Rows before `from` are missing; wait for the next full send.
-            return Ok(None);
+            return None;
         }
-        block.rows.extend(decoded);
+        block.rows.extend(rows.into_iter().map(Rc::new));
         block.shared = Rc::new(block.rows.clone());
-        Ok(Some(index))
+        Some(index)
     }
 }
 
-/// Paint encoded rows into scratch terminals and read them back as rows.
-fn decode(rows: &[String], cols: u16, background: [u8; 3]) -> Result<Vec<Rc<FrameRow>>> {
+/// Paint rows the runtime encoded, `cols` wide, into scratch terminals over
+/// the session's `background` and read them back as rows to paint. The
+/// rows own their data, so this can run away from the UI thread.
+#[tracing::instrument(skip_all)]
+pub fn decode(rows: &[String], cols: u16, background: [u8; 3]) -> Result<Vec<FrameRow>> {
     let mut decoded = Vec::with_capacity(rows.len());
     for page in rows.chunks(DECODE_PAGE_ROWS) {
         // A renderer copies only rows marked dirty, and blank rows of a
@@ -329,7 +329,9 @@ fn decode(rows: &[String], cols: u16, background: [u8; 3]) -> Result<Vec<Rc<Fram
             terminal.vt_write(format!("\x1b[{};1H", index + 1).as_bytes());
             terminal.vt_write(row.as_bytes());
         }
-        decoded.extend(decoder.viewport_rows(&terminal)?.iter().cloned());
+        let page_rows = decoder.viewport_rows(&terminal)?;
+        drop(decoder);
+        decoded.extend(page_rows.iter().map(|row| FrameRow::clone(row)));
     }
     Ok(decoded)
 }
@@ -425,14 +427,14 @@ mod tests {
             "second".to_string(),
         ];
         assert_eq!(
-            list.apply_rows(7, 1, 0, &rows, 20, [0, 0, 0]).unwrap(),
+            list.apply_rows(7, 1, 0, decode(&rows, 20, [0, 0, 0]).unwrap()),
             Some(0)
         );
         assert_eq!(list.blocks()[0].output_text(), "red text\nsecond");
-        list.apply_rows(7, 2, 0, &rows[1..], 20, [0, 0, 0]).unwrap();
+        list.apply_rows(7, 2, 0, decode(&rows[1..], 20, [0, 0, 0]).unwrap());
         assert_eq!(list.blocks()[0].output_text(), "second");
         assert_eq!(
-            list.apply_rows(99, 1, 0, &rows, 20, [0, 0, 0]).unwrap(),
+            list.apply_rows(99, 1, 0, decode(&rows, 20, [0, 0, 0]).unwrap()),
             None
         );
     }

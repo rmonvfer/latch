@@ -27,6 +27,8 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
+    blocks::decode,
+    grid::FrameRow,
     hooks::Bootstrapped,
     process_info,
     runtime_engine::{self, SessionHandle},
@@ -402,6 +404,7 @@ impl Rpc {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn request(&mut self, request: Request) -> Result<Response> {
         write_frame(
             &mut self.stream,
@@ -947,13 +950,14 @@ fn write_frame(stream: &mut impl Write, value: &impl Serialize) -> Result<()> {
 
 pub enum ClientEvent {
     Frame(Box<Snapshot>),
-    /// Rows of a command block from `from` on, at `version`; rows from an
-    /// earlier version are replaced.
+    /// Rows of a command block from `from` on, at `version`, decoded for
+    /// painting on this connection's thread; rows from an earlier version
+    /// are replaced.
     BlockRows {
         block: u64,
         version: u64,
         from: usize,
-        rows: Vec<String>,
+        rows: Vec<FrameRow>,
     },
     /// What the shell reported about itself.
     Shell(Box<Option<Bootstrapped>>),
@@ -1205,6 +1209,7 @@ fn client_loop(
                     // The frame goes first: block rows are drawn over its
                     // background.
                     let blocks = snapshot.blocks.clone();
+                    let painting = (snapshot.dimensions.cols, snapshot.background);
                     if events
                         .try_send(ClientEvent::Frame(Box::new(snapshot)))
                         .is_ok()
@@ -1217,6 +1222,7 @@ fn client_loop(
                             client,
                             session,
                             blocks,
+                            painting,
                             &mut block_state,
                             events,
                             stopped,
@@ -1266,10 +1272,12 @@ struct BlockFetchState {
 
 /// Send the view block rows and shell details a snapshot announces that it
 /// does not have yet. Returns false once the view is gone.
+#[tracing::instrument(skip_all)]
 fn fetch_block_updates(
     client: &mut Rpc,
     session: u64,
     blocks: &Blocks,
+    (columns, background): (u16, [u8; 3]),
     state: &mut BlockFetchState,
     events: &async_channel::Sender<ClientEvent>,
     stopped: &AtomicBool,
@@ -1314,6 +1322,13 @@ fn fetch_block_updates(
                 break;
             }
             sent.1 = from + rows.len();
+            let rows = match decode(&rows, columns, background) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    log::error!("failed to decode block rows: {error:#}");
+                    break;
+                }
+            };
             if !deliver(
                 events,
                 ClientEvent::BlockRows {

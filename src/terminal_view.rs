@@ -182,6 +182,10 @@ pub struct TerminalView {
     full_screen: bool,
     /// Repaints a running block's duration once a second.
     duration_tick: Option<Task<()>>,
+    /// When the grid's size was last sent, and the pending send of a later
+    /// one.
+    resize_sent: Option<Instant>,
+    resize_task: Option<Task<()>>,
     /// Scroll and layout state of the block list, one item per block.
     block_list: ListState,
     /// Whether the block list is anchored to the input, per the setting
@@ -504,6 +508,8 @@ impl TerminalView {
                 background: [0, 0, 0],
                 full_screen: false,
                 duration_tick: None,
+                resize_sent: None,
+                resize_task: None,
                 block_list: block_list_state(0, SettingsStore::get(cx).blocks_from_bottom),
                 blocks_from_bottom: SettingsStore::get(cx).blocks_from_bottom,
                 selected_block: None,
@@ -569,6 +575,7 @@ impl TerminalView {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn receive(&mut self, event: ClientEvent, cx: &mut Context<Self>) {
         match event {
             ClientEvent::Frame(frame) => self.apply_frame(*frame, cx),
@@ -578,19 +585,10 @@ impl TerminalView {
                 from,
                 rows,
             } => {
-                if let Some(blocks) = &mut self.blocks {
-                    match blocks.apply_rows(
-                        block,
-                        version,
-                        from,
-                        &rows,
-                        self.dimensions.cols,
-                        self.background,
-                    ) {
-                        Ok(Some(index)) => self.block_list.remeasure_items(index..index + 1),
-                        Ok(None) => {}
-                        Err(error) => log::error!("failed to show a block's rows: {error:#}"),
-                    }
+                if let Some(blocks) = &mut self.blocks
+                    && let Some(index) = blocks.apply_rows(block, version, from, rows)
+                {
+                    self.block_list.remeasure_items(index..index + 1);
                 }
             }
             ClientEvent::Shell(shell) => {
@@ -627,6 +625,7 @@ impl TerminalView {
         cx.notify();
     }
 
+    #[tracing::instrument(skip_all)]
     fn apply_frame(&mut self, frame: Snapshot, cx: &mut Context<Self>) {
         if let Err(error) = self.display.apply(&mut self.terminal, &frame) {
             self.connection_error = Some(error.to_string());
@@ -718,6 +717,7 @@ impl TerminalView {
 
     /// Follow the runtime's command blocks: the list, the prompt, and the
     /// shell's completions.
+    #[tracing::instrument(skip_all)]
     fn apply_blocks(&mut self, reported: Option<Blocks>, cx: &mut Context<Self>) {
         let Some(reported) = reported else {
             self.blocks = None;
@@ -1172,6 +1172,7 @@ impl TerminalView {
     }
 
     /// The editor with the shell's context above it.
+    #[tracing::instrument(skip_all)]
     fn render_editor_panel(&self, metrics: CellMetrics, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let context = self.prompt.clone().unwrap_or_default();
@@ -1344,6 +1345,7 @@ impl TerminalView {
     }
 
     /// The list items to show, when the pane shows blocks.
+    #[tracing::instrument(skip_all)]
     fn block_items(&mut self) -> Option<Vec<Item>> {
         if !self.shows_blocks() {
             return None;
@@ -1449,6 +1451,7 @@ impl TerminalView {
     }
 
     /// Fit the terminal grid to the space the layout gave us.
+    #[tracing::instrument(skip_all)]
     fn fit_to_bounds(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1478,8 +1481,38 @@ impl TerminalView {
         }
         self.dimensions = next;
         if self.connected {
-            self.send(Operation::Resize { dimensions: next }, cx);
+            self.send_resize(cx);
         }
+    }
+
+    /// Tell the runtime the grid's size. Each size change rewraps the
+    /// scrollback, so while a window edge is dragged the size is sent at
+    /// most once per interval, always ending with the final size.
+    fn send_resize(&mut self, cx: &mut Context<Self>) {
+        if self.resize_task.is_some() {
+            return;
+        }
+        let wait = self
+            .resize_sent
+            .map(|sent| RESIZE_INTERVAL.saturating_sub(sent.elapsed()))
+            .unwrap_or_default();
+        if wait.is_zero() {
+            self.resize_sent = Some(Instant::now());
+            self.send(
+                Operation::Resize {
+                    dimensions: self.dimensions,
+                },
+                cx,
+            );
+            return;
+        }
+        self.resize_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = view.update(cx, |view, cx| {
+                view.resize_task = None;
+                view.send_resize(cx);
+            });
+        }));
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2195,6 +2228,7 @@ impl TerminalView {
 }
 
 impl Render for TerminalView {
+    #[tracing::instrument(name = "TerminalView::render", skip_all)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = *self
             .metrics
@@ -2402,6 +2436,10 @@ fn common_prefix<'a>(mut words: impl Iterator<Item = &'a str>) -> String {
 const HISTORY_SEARCH_RESULTS: usize = 50;
 /// Entries the history menu lists.
 const HISTORY_MENU_ENTRIES: usize = 200;
+
+/// Shortest time between size changes sent to the runtime: about two
+/// frames.
+const RESIZE_INTERVAL: Duration = Duration::from_millis(33);
 
 /// How long a command runs before the editor hides and keys go to it.
 const EDITOR_GRACE: Duration = Duration::from_millis(50);

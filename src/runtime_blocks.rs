@@ -25,6 +25,9 @@ use crate::{
 /// this the oldest blocks give theirs up and keep their rows as captured.
 const OUTPUT_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Most rows of a running command's scrollback captured per snapshot.
+const MAX_ROWS_PER_CAPTURE: usize = 2_000;
+
 /// Most raw output replayed to rebuild one block; a larger block keeps the
 /// rows it was captured with, so a rebuild's cost stays bounded.
 const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
@@ -65,6 +68,7 @@ impl RowEncoder {
 
     /// Rows `from..to` of everything `terminal` holds, scrollback first,
     /// leaving its viewport at the bottom.
+    #[tracing::instrument(skip_all)]
     pub fn encode(
         &mut self,
         terminal: &mut Terminal<'static, 'static>,
@@ -180,6 +184,8 @@ struct Block {
     rows: Vec<String>,
     /// Everything the command wrote, while it fits the budget.
     raw: Option<Vec<u8>>,
+    /// The rows were made for an earlier width or colors.
+    stale: bool,
 }
 
 impl Block {
@@ -260,6 +266,7 @@ impl Blocks {
             outcome: Some((0, Duration::ZERO)),
             rows,
             raw: None,
+            stale: false,
         });
         Ok(())
     }
@@ -282,6 +289,7 @@ impl Blocks {
             outcome: None,
             rows: Vec::new(),
             raw: Some(Vec::new()),
+            stale: false,
         });
     }
 
@@ -321,6 +329,7 @@ impl Blocks {
     /// Capture rows of the running command that scrolled off `terminal`
     /// since the last call, so streaming output costs work in proportion to
     /// what is new.
+    #[tracing::instrument(skip_all)]
     pub fn capture_scrollback(&mut self, terminal: &mut Terminal<'static, 'static>) -> Result<()> {
         let screen = terminal.rows()? as usize;
         let scrollback = terminal.total_rows()?.saturating_sub(screen);
@@ -330,7 +339,10 @@ impl Blocks {
         if captured >= scrollback {
             return Ok(());
         }
-        let rows = self.encoder.encode(terminal, captured, scrollback)?;
+        // After a resize all scrollback is new again; it is caught up over
+        // several snapshots rather than stalling one.
+        let until = scrollback.min(captured + MAX_ROWS_PER_CAPTURE);
+        let rows = self.encoder.encode(terminal, captured, until)?;
         if let Some(block) = self.running_mut() {
             block.rows.extend(rows);
         }
@@ -346,6 +358,7 @@ impl Blocks {
     /// Close the running block with `exit_code`, capturing all of its
     /// output from `terminal`. A command that erased the scrollback clears
     /// the blocks before it, leaving its own.
+    #[tracing::instrument(skip_all)]
     pub fn finish(
         &mut self,
         exit_code: i32,
@@ -376,25 +389,47 @@ impl Blocks {
         }
     }
 
-    /// Rebuild finished blocks' rows by replaying their output into
-    /// terminals from `new_terminal`, after the width or colors changed.
-    /// Those terminals must not be connected to the PTY, since replayed
-    /// queries would otherwise be answered again.
-    pub fn rebuild_rows(
+    /// Mark finished blocks' rows as made for an earlier width or colors,
+    /// to be rebuilt by `rebuild_stale`.
+    pub fn mark_stale(&mut self) {
+        for block in self.blocks.iter_mut().filter(|block| !block.is_running()) {
+            block.stale = block
+                .raw
+                .as_ref()
+                .is_some_and(|raw| raw.len() <= MAX_REPLAY_BYTES);
+        }
+    }
+
+    pub fn has_stale(&self) -> bool {
+        self.blocks.iter().any(|block| block.stale)
+    }
+
+    /// Rebuild stale blocks' rows by replaying their output into terminals
+    /// from `new_terminal`, newest first, until `budget` is spent, so a
+    /// session with long history stays responsive while it rewraps. Those
+    /// terminals must not be connected to the PTY, since replayed queries
+    /// would otherwise be answered again.
+    #[tracing::instrument(skip_all)]
+    pub fn rebuild_stale(
         &mut self,
         mut new_terminal: impl FnMut() -> Result<Terminal<'static, 'static>>,
+        budget: Duration,
     ) -> Result<()> {
-        for block in &mut self.blocks {
-            let (Some(raw), false) = (&block.raw, block.is_running()) else {
-                continue;
-            };
-            if raw.len() > MAX_REPLAY_BYTES {
+        let started = Instant::now();
+        for block in self.blocks.iter_mut().rev() {
+            if !block.stale {
                 continue;
             }
-            let mut terminal = new_terminal()?;
-            terminal.vt_write(raw);
-            block.rows = self.encoder.encode_all(&mut terminal)?;
-            block.version += 1;
+            block.stale = false;
+            if let Some(raw) = &block.raw {
+                let mut terminal = new_terminal()?;
+                terminal.vt_write(raw);
+                block.rows = self.encoder.encode_all(&mut terminal)?;
+                block.version += 1;
+            }
+            if started.elapsed() >= budget {
+                break;
+            }
         }
         Ok(())
     }
@@ -532,7 +567,11 @@ mod tests {
         blocks.finish(0, &mut output).unwrap();
         let id = blocks.summaries()[0].id;
         assert_eq!(texts(&blocks, id).len(), 2);
-        blocks.rebuild_rows(|| Ok(terminal(10, 5))).unwrap();
+        blocks.mark_stale();
+        blocks
+            .rebuild_stale(|| Ok(terminal(10, 5)), Duration::from_secs(1))
+            .unwrap();
+        assert!(!blocks.has_stale());
         assert_eq!(texts(&blocks, id).len(), 3);
         assert_eq!(blocks.summaries()[0].version, 2);
     }
@@ -590,6 +629,53 @@ mod tests {
         assert_eq!(commands(&blocks), vec!["clear", "echo"]);
         blocks.clear();
         assert!(blocks.summaries().is_empty());
+    }
+
+    #[test]
+    #[ignore = "prints the cost of capturing and rebuilding a long block; run with --release"]
+    fn block_rows_benchmark() {
+        let mut blocks = Blocks::new(10).unwrap();
+        let mut output = Terminal::new(Options {
+            cols: 200,
+            rows: 60,
+            max_scrollback: 64 * 1024 * 1024,
+        })
+        .unwrap();
+        let bytes: String = (0..10_000)
+            .map(|line| format!("\x1b[3{}m{}\x1b[0m\r\n", line % 7 + 1, "x".repeat(150)))
+            .collect();
+        blocks.start("build".into());
+        blocks.record(bytes.as_bytes());
+        output.vt_write(bytes.as_bytes());
+        let started = std::time::Instant::now();
+        blocks.finish(0, &mut output).unwrap();
+        let finish = started.elapsed();
+        let started = std::time::Instant::now();
+        blocks.mark_stale();
+        blocks
+            .rebuild_stale(
+                || {
+                    Terminal::new(Options {
+                        cols: 180,
+                        rows: 60,
+                        max_scrollback: 64 * 1024 * 1024,
+                    })
+                    .map_err(Into::into)
+                },
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+        let rebuild = started.elapsed();
+        let id = blocks.summaries()[0].id;
+        let rows = blocks.rows(id, 0).unwrap().1;
+        let started = std::time::Instant::now();
+        crate::blocks::decode(&rows, 180, [0, 0, 0]).unwrap();
+        let decode = started.elapsed();
+        eprintln!(
+            "10k-row block: capture {finish:?}, rebuild {rebuild:?}, decode {:?} ({} rows sent)",
+            decode,
+            rows.len()
+        );
     }
 
     #[test]
