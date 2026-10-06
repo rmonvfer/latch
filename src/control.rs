@@ -394,7 +394,7 @@ fn same_user(stream: &UnixStream) -> bool {
 }
 
 /// The process on the other end of a local socket.
-fn peer_pid(stream: &UnixStream) -> Option<i32> {
+pub(crate) fn peer_pid(stream: &UnixStream) -> Option<i32> {
     let mut pid: libc::pid_t = 0;
     let mut size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
     // SAFETY: the descriptor is a live socket and `pid`/`size` describe a

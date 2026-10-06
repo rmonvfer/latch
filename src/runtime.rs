@@ -27,6 +27,7 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
+    control, process_info,
     runtime_engine::{self, SessionHandle},
     runtime_protocol::{
         Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request, Response, SessionInfo,
@@ -282,6 +283,23 @@ fn same_token(expected: &str, candidate: &str) -> bool {
         == 0
 }
 
+/// Whether the process on the other end of `stream` runs this same
+/// program. Clients check it before presenting the runtime's secret, so a
+/// program that swaps in its own socket cannot collect the secret, and the
+/// runtime checks it before serving a connection.
+fn peer_is_this_program(stream: &UnixStream) -> bool {
+    let Some(peer) = control::peer_pid(stream).and_then(process_info::executable_path) else {
+        return false;
+    };
+    let (Ok(peer), Ok(own)) = (
+        fs::canonicalize(peer),
+        std::env::current_exe().and_then(fs::canonicalize),
+    ) else {
+        return false;
+    };
+    peer == own
+}
+
 fn same_user(stream: &UnixStream) -> bool {
     let mut uid = 0;
     let mut gid = 0;
@@ -316,6 +334,10 @@ impl Rpc {
         ensure!(
             same_user(&stream),
             "session runtime belongs to another user"
+        );
+        ensure!(
+            peer_is_this_program(&stream),
+            "the session runtime socket is served by another program"
         );
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -676,6 +698,7 @@ impl Server {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     if !same_user(&stream)
+                        || !peer_is_this_program(&stream)
                         || reserve(&self.state.connections, 1, MAX_CONNECTIONS).is_err()
                     {
                         continue;
@@ -1313,6 +1336,13 @@ mod tests {
         assert!(write_token(&paths).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "unrelated");
         fs::remove_dir_all(paths.directory).unwrap();
+    }
+
+    #[test]
+    fn peers_running_this_program_are_recognized() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        assert!(peer_is_this_program(&ours));
+        assert!(peer_is_this_program(&theirs));
     }
 
     #[test]

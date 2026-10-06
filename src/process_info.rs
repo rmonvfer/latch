@@ -1,5 +1,7 @@
 use std::{
+    ffi::OsString,
     fs,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 
@@ -78,6 +80,25 @@ fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
     let mut args = vec![executable];
     args.extend(parts.take(argc));
     Some(args)
+}
+
+/// The path of a running process's executable.
+#[cfg(target_os = "macos")]
+pub fn executable_path(pid: i32) -> Option<PathBuf> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is valid for `buffer.len()` bytes and proc_pidpath
+    // writes at most that many.
+    let len = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    Some(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn executable_path(pid: i32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// The current working directory of a running process.
