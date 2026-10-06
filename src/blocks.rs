@@ -110,7 +110,6 @@ pub enum ListChange {
 #[derive(Default)]
 pub struct BlockList {
     blocks: Vec<Block>,
-    decoder: Option<GridRenderer>,
 }
 
 impl BlockList {
@@ -175,11 +174,7 @@ impl BlockList {
         let Some(index) = self.blocks.iter().position(|block| block.id == id) else {
             return Ok(None);
         };
-        let decoder = match &mut self.decoder {
-            Some(decoder) => decoder,
-            None => self.decoder.insert(GridRenderer::new()?),
-        };
-        let decoded = decode(decoder, rows, cols)?;
+        let decoded = decode(rows, cols)?;
         let block = &mut self.blocks[index];
         if block.version != version {
             block.version = version;
@@ -197,9 +192,12 @@ impl BlockList {
 }
 
 /// Paint encoded rows into scratch terminals and read them back as rows.
-fn decode(decoder: &mut GridRenderer, rows: &[String], cols: u16) -> Result<Vec<Rc<FrameRow>>> {
+fn decode(rows: &[String], cols: u16) -> Result<Vec<Rc<FrameRow>>> {
     let mut decoded = Vec::with_capacity(rows.len());
     for page in rows.chunks(DECODE_PAGE_ROWS) {
+        // A renderer copies only rows marked dirty, and blank rows of a
+        // fresh terminal are not, so each page gets a renderer of its own.
+        let mut decoder = GridRenderer::new()?;
         let mut terminal = Terminal::new(Options {
             cols: cols.max(1),
             rows: page.len() as u16,

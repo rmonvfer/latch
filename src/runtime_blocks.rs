@@ -40,7 +40,6 @@ impl From<&Precmd> for BlockContext {
 
 /// Encodes rows of any terminal, including its scrollback.
 pub struct RowEncoder {
-    render: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     graphemes: String,
@@ -50,7 +49,6 @@ pub struct RowEncoder {
 impl RowEncoder {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            render: RenderState::new()?,
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             graphemes: String::new(),
@@ -70,12 +68,16 @@ impl RowEncoder {
         let total = terminal.total_rows()?;
         let to = to.min(total);
         let mut encoded = Vec::with_capacity(to.saturating_sub(from));
+        // A render state copies only rows the terminal marks dirty, and the
+        // session's own renderer clears those marks as it draws, so each
+        // encoding starts from a render state that has seen nothing.
+        let mut render = RenderState::new()?;
         let mut next = from;
         while next < to {
             let top = next.min(total.saturating_sub(screen));
             terminal.scroll_viewport(ScrollViewport::Row(top));
             let palette = terminal.color_palette()?;
-            let frame = self.render.update(terminal)?;
+            let frame = render.update(terminal)?;
             let colors = frame.colors()?;
             frame.set_dirty(Dirty::Full)?;
             let mut rows = self.rows.update(&frame)?;
