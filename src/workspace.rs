@@ -6,8 +6,8 @@ use std::{
 
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
-    Focusable, MouseButton, MouseMoveEvent, Pixels, Point, PromptLevel, ScrollHandle, SharedString,
-    Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    Focusable, Modifiers, MouseButton, MouseMoveEvent, Pixels, Point, PromptLevel, ScrollHandle,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 
 use crate::{
@@ -134,6 +134,8 @@ pub(crate) enum Target {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuKind {
     Tab(TabId),
+    /// The tabs selected together with Cmd- or Shift-click.
+    SelectedTabs,
     Group(GroupId),
     ViewOptions,
     NewTab,
@@ -180,6 +182,10 @@ pub struct Workspace {
     pub(crate) sidebar_open: bool,
     pub(crate) sidebar_width: Pixels,
     pub(crate) sidebar_resizing: bool,
+    /// Tabs selected together with Cmd- or Shift-click, in sidebar order,
+    /// and the tab a Shift-click selects from.
+    pub(crate) selected_tabs: Vec<TabId>,
+    selection_anchor: Option<TabId>,
     /// The session runtime running is from an older build and cannot be
     /// attached to; a banner offers to restart sessions.
     outdated_runtime: bool,
@@ -240,6 +246,8 @@ impl Workspace {
             sidebar_open: true,
             sidebar_width: theme::SIDEBAR_WIDTH,
             sidebar_resizing: false,
+            selected_tabs: Vec::new(),
+            selection_anchor: None,
             outdated_runtime: false,
             restarting_runtime: false,
             titlebar_dragging: false,
@@ -598,6 +606,128 @@ impl Workspace {
             .into_iter()
             .filter(|id| !self.is_tab_hidden(*id))
             .collect()
+    }
+
+    /// A click on a tab in the sidebar: Cmd adds or removes it from the
+    /// selection, Shift selects the visible tabs from the last one clicked
+    /// to it, and a plain click selects only it and opens it.
+    pub(crate) fn click_tab(
+        &mut self,
+        id: TabId,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if modifiers.platform {
+            if self.selected_tabs.is_empty()
+                && let Some(active) = self.active.filter(|active| *active != id)
+            {
+                self.selected_tabs.push(active);
+            }
+            match self.selected_tabs.iter().position(|tab| *tab == id) {
+                Some(index) => {
+                    self.selected_tabs.remove(index);
+                }
+                None => self.selected_tabs.push(id),
+            }
+            self.selection_anchor = Some(id);
+            self.order_selection();
+            cx.notify();
+            return;
+        }
+        if modifiers.shift {
+            let order = self.ordered_open_tabs();
+            let anchor = self.selection_anchor.or(self.active).unwrap_or(id);
+            if let (Some(from), Some(to)) = (
+                order.iter().position(|tab| *tab == anchor),
+                order.iter().position(|tab| *tab == id),
+            ) {
+                self.selected_tabs = order[from.min(to)..=from.max(to)].to_vec();
+            }
+            cx.notify();
+            return;
+        }
+        self.selected_tabs.clear();
+        self.selection_anchor = Some(id);
+        self.activate(id, window, cx);
+    }
+
+    /// Whether `id` is one of several tabs selected together.
+    pub(crate) fn is_tab_selected(&self, id: TabId) -> bool {
+        self.selected_tabs.len() > 1 && self.selected_tabs.contains(&id)
+    }
+
+    fn order_selection(&mut self) {
+        let order = self.layout.ordered_tabs();
+        self.selected_tabs
+            .sort_by_key(|tab| order.iter().position(|other| other == tab));
+    }
+
+    /// Put the selected tabs in a new group, in their sidebar order, and
+    /// name it.
+    pub(crate) fn group_selected_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = std::mem::take(&mut self.selected_tabs);
+        let Some((&first, rest)) = tabs.split_first() else {
+            return;
+        };
+        let name = format!("Group {}", self.layout.groups().len() + 1);
+        let group = self.layout.group_tab(first, name);
+        for &tab in rest {
+            self.layout.move_tab(tab, TabDestination::IntoGroup(group));
+        }
+        self.close_context_menu(cx);
+        self.layout_changed(cx);
+        self.start_rename(Target::Group(group), window, cx);
+    }
+
+    /// Move the selected tabs into `group`.
+    pub(crate) fn move_selected_tabs(&mut self, group: GroupId, cx: &mut Context<Self>) {
+        for tab in std::mem::take(&mut self.selected_tabs) {
+            self.layout.move_tab(tab, TabDestination::IntoGroup(group));
+        }
+        self.close_context_menu(cx);
+        self.layout_changed(cx);
+    }
+
+    /// The menu for several selected tabs.
+    pub(crate) fn render_selected_tabs_menu(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let count = self.selected_tabs.len();
+        let groups: Vec<(GroupId, String)> = self
+            .layout
+            .groups()
+            .iter()
+            .map(|group| (group.id, group.name.clone()))
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                components::menu_item(
+                    "menu-group-selected",
+                    "layers",
+                    format!("Group {count} Tabs"),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.group_selected_tabs(window, cx)
+                })),
+            )
+            .children(groups.into_iter().map(|(group, name)| {
+                components::menu_item(
+                    ("menu-move-selected", group.element_id()),
+                    "folder",
+                    format!("Move {count} Tabs to {name}"),
+                    theme,
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.move_selected_tabs(group, cx)
+                }))
+            }))
+            .into_any_element()
     }
 
     pub(crate) fn activate(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {

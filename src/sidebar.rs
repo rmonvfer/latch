@@ -636,6 +636,7 @@ impl Workspace {
     ) -> Option<impl IntoElement> {
         let display = self.display(id, cx)?;
         let active = self.active == Some(id);
+        let selected = self.is_tab_selected(id);
         let hover_group = SharedString::from(format!("tab-{id:?}"));
         let color = tab_color(display.color, theme);
         let group_color = group
@@ -694,17 +695,23 @@ impl Workspace {
                     (None, true) => row.bg(theme.ghost_selected),
                     (None, false) => row.hover(move |style| style.bg(hover)),
                 })
+                .when(selected, |row| row.bg(theme.ghost_selected))
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     if event.click_count() == 2 {
                         this.start_rename(Target::Tab(id), window, cx);
                     } else {
-                        this.activate(id, window, cx);
+                        this.click_tab(id, event.modifiers(), window, cx);
                     }
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.open_context_menu(MenuKind::Tab(id), event.position, cx);
+                        let kind = if this.is_tab_selected(id) {
+                            MenuKind::SelectedTabs
+                        } else {
+                            MenuKind::Tab(id)
+                        };
+                        this.open_context_menu(kind, event.position, cx);
                     }),
                 )
                 .on_drag(
@@ -856,6 +863,7 @@ impl Workspace {
         let menu = self.context_menu.as_ref()?;
         let body = match menu.kind {
             MenuKind::Tab(id) => self.render_tab_menu(id, theme, cx)?.into_any_element(),
+            MenuKind::SelectedTabs => self.render_selected_tabs_menu(theme, cx),
             MenuKind::Group(id) => self.render_group_menu(id, theme, cx)?.into_any_element(),
             MenuKind::ViewOptions => {
                 render_view_options_menu(&SettingsStore::get(cx).sidebar, theme).into_any_element()
