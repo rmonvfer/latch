@@ -18,6 +18,10 @@ use portable_pty::CommandBuilder;
 
 use crate::settings::SettingsStore;
 
+/// Environment variable telling the scripts that commands show as blocks,
+/// so the shell's prompt is never drawn.
+pub const COMMAND_BLOCKS_VARIABLE: &str = "TERMINAL_COMMAND_BLOCKS";
+
 /// Environment variable carrying the id the scripts put in every hook.
 pub const SESSION_ID_VARIABLE: &str = "TERMINAL_SESSION_ID";
 

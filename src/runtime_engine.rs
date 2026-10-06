@@ -240,6 +240,9 @@ impl Engine {
         // Lifecycle hooks carry this id; hooks with any other are ignored.
         let session_id = crate::control::new_token()?;
         command.env(shell_integration::SESSION_ID_VARIABLE, &session_id);
+        if launch.command_blocks {
+            command.env(shell_integration::COMMAND_BLOCKS_VARIABLE, "1");
+        }
         let (pty, output) = Pty::spawn(
             command,
             pty_dimensions(launch.dimensions),

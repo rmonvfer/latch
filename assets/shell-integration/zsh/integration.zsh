@@ -183,6 +183,10 @@ _terminal_precmd() {
 
 _terminal_preexec() {
   _terminal_command_running=1
+  # With blocks the prompt is never drawn, so the mark zsh prints after
+  # output that lacks a final newline would be left in the block; an empty
+  # mark leaves only padding, which the block drops.
+  [[ -n "$TERMINAL_COMMAND_BLOCKS" ]] && PROMPT_EOL_MARK=
   _terminal_json "$1"
   _terminal_hook Preexec "{\"command\":$REPLY}"
   printf '\e]133;C\a'
