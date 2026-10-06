@@ -96,6 +96,7 @@ pub struct Cursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockContext {
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
     pub git_branch: Option<String>,
     pub virtualenv: Option<String>,
     pub conda_env: Option<String>,
@@ -113,6 +114,7 @@ pub struct BlockSummary {
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
     /// When the command started, in milliseconds since the Unix epoch.
+    #[serde(default)]
     pub started_at_ms: u64,
     pub running: bool,
     /// Rows available: all of a finished block's output, or the rows of a
