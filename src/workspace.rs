@@ -57,6 +57,14 @@ fn restored_tab(index: Option<usize>, slots: &[Option<TabId>]) -> Option<TabId> 
     index.and_then(|index| slots.get(index)).copied().flatten()
 }
 
+fn next_tab_after_close(ordered: &[TabId], closing: TabId) -> Option<TabId> {
+    let position = ordered.iter().position(|id| *id == closing)?;
+    ordered
+        .get(position + 1)
+        .or_else(|| position.checked_sub(1).and_then(|index| ordered.get(index)))
+        .copied()
+}
+
 fn sessions_using_worktree(
     sessions: &[SessionInfo],
     owned: &HashSet<u64>,
@@ -256,7 +264,7 @@ impl Workspace {
                 this.update_in(cx, |workspace, window, cx| {
                     match sessions {
                         Ok(sessions) => {
-                            let known: HashSet<u64> = workspace
+                            let views: Vec<Entity<TerminalView>> = workspace
                                 .open_tabs
                                 .values()
                                 .filter_map(|tab| match &tab.content {
@@ -264,8 +272,20 @@ impl Workspace {
                                     TabContent::Settings(_) => None,
                                 })
                                 .flatten()
+                                .collect();
+                            let known: HashSet<u64> = views
+                                .iter()
                                 .map(|view| view.read(cx).session_id())
                                 .collect();
+                            // Saved panes whose sessions ended with the runtime
+                            // (a restart, a reboot) start again where they were.
+                            let live: HashSet<u64> =
+                                sessions.iter().map(|session| session.id).collect();
+                            for view in views {
+                                if !live.contains(&view.read(cx).session_id()) {
+                                    view.update(cx, |view, cx| view.respawn(None, cx));
+                                }
+                            }
                             for session in sessions {
                                 if known.contains(&session.id) {
                                     continue;
@@ -487,6 +507,18 @@ impl Workspace {
             .map(|(id, _)| *id)
     }
 
+    pub(crate) fn is_tab_hidden(&self, id: TabId) -> bool {
+        self.open_tabs.get(&id).is_some_and(|tab| tab.hidden)
+    }
+
+    fn ordered_open_tabs(&self) -> Vec<TabId> {
+        self.layout
+            .ordered_tabs()
+            .into_iter()
+            .filter(|id| !self.is_tab_hidden(*id))
+            .collect()
+    }
+
     pub(crate) fn activate(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.open_tabs.get_mut(&id) else {
             return;
@@ -509,6 +541,7 @@ impl Workspace {
     }
 
     pub(crate) fn close(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let next = next_tab_after_close(&self.ordered_open_tabs(), id);
         let Some(tab) = self.open_tabs.get_mut(&id) else {
             return;
         };
@@ -519,11 +552,6 @@ impl Workspace {
         tab.hidden = true;
         if self.active == Some(id) {
             self.active = None;
-            let next = self
-                .layout
-                .ordered_tabs()
-                .into_iter()
-                .find(|other| self.open_tabs.get(other).is_some_and(|tab| !tab.hidden));
             match next {
                 Some(next) => self.activate(next, window, cx),
                 None => window.focus(&self.focus_handle, cx),
@@ -533,10 +561,10 @@ impl Workspace {
     }
 
     fn remove_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let next = next_tab_after_close(&self.ordered_open_tabs(), id);
         if self.open_tabs.remove(&id).is_none() {
             return;
         }
-        let position = self.layout.ordered_tabs().iter().position(|tab| *tab == id);
         self.layout.remove_tab(id);
         self.attention.remove(&id);
         if self
@@ -549,15 +577,6 @@ impl Workspace {
 
         if self.active == Some(id) {
             self.active = None;
-            let remaining: Vec<TabId> = self
-                .layout
-                .ordered_tabs()
-                .into_iter()
-                .filter(|other| self.open_tabs.get(other).is_some_and(|tab| !tab.hidden))
-                .collect();
-            let next = position
-                .and_then(|position| remaining.get(position.min(remaining.len().saturating_sub(1))))
-                .copied();
             match next {
                 Some(next) => self.activate(next, window, cx),
                 None => window.focus(&self.focus_handle, cx),
@@ -1029,6 +1048,9 @@ impl Workspace {
     ) {
         let name = format!("Group {}", self.layout.groups().len() + 1);
         let group = self.layout.group_tab(tab, name);
+        if self.is_tab_hidden(tab) {
+            self.activate(tab, window, cx);
+        }
         self.layout_changed(cx);
         self.start_rename(Target::Group(group), window, cx);
     }
@@ -1127,7 +1149,7 @@ impl Workspace {
         }
     }
 
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.save_task = Some(
             cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 cx.background_executor().timer(SESSION_SAVE_DELAY).await;
@@ -1455,12 +1477,7 @@ impl Workspace {
     }
 
     fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ordered: Vec<TabId> = self
-            .layout
-            .ordered_tabs()
-            .into_iter()
-            .filter(|id| self.open_tabs.get(id).is_some_and(|tab| !tab.hidden))
-            .collect();
+        let ordered = self.ordered_open_tabs();
         if ordered.is_empty() {
             return;
         }
@@ -1481,7 +1498,7 @@ impl Workspace {
     }
 
     fn activate_tab(&mut self, action: &ActivateTab, window: &mut Window, cx: &mut Context<Self>) {
-        let ordered = self.layout.ordered_tabs();
+        let ordered = self.ordered_open_tabs();
         if let Some(&id) = ordered.get(action.0.min(ordered.len().saturating_sub(1))) {
             self.activate(id, window, cx);
         }
@@ -1623,11 +1640,7 @@ impl Workspace {
                 div()
                     .text_size(theme::TEXT_DEFAULT)
                     .text_color(theme.text_muted)
-                    .child(if self.open_tabs.is_empty() {
-                        "No open terminals"
-                    } else {
-                        "Sessions keep running. Select one in the sidebar to return."
-                    }),
+                    .child("No open terminals"),
             )
             .child(
                 div()
@@ -1741,6 +1754,22 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_selects_the_next_open_tab_or_the_previous_at_the_end() {
+        let mut layout = TabLayout::default();
+        let first = layout.add_tab(TabStyle::default(), None);
+        let closed = layout.add_tab(TabStyle::default(), None);
+        let middle = layout.add_tab(TabStyle::default(), None);
+        let last = layout.add_tab(TabStyle::default(), None);
+        let open = [first, middle, last];
+        assert_eq!(next_tab_after_close(&open, first), Some(middle));
+        assert_eq!(next_tab_after_close(&open, middle), Some(last));
+        assert_eq!(next_tab_after_close(&open, last), Some(middle));
+        assert_eq!(next_tab_after_close(&open, closed), None);
+        assert_eq!(next_tab_after_close(&[last], last), None);
+        assert_eq!(next_tab_after_close(&[], last), None);
+    }
 
     #[test]
     fn restoring_selection_keeps_saved_slots_when_tabs_are_filtered() {

@@ -47,7 +47,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    agent_badge, notifications,
+    agent_badge,
+    agent_resume::{AgentSession, ResumableAgent},
+    notifications,
     pane_tree::Axis,
     process_info, runtime,
     settings::SettingsStore,
@@ -136,6 +138,13 @@ pub enum Request {
         #[serde(default)]
         body: String,
     },
+    /// A coding agent in the calling pane started a session, which the
+    /// pane resumes after a restart. Only the caller's own pane, proved by
+    /// its token, is ever changed.
+    ReportAgentSession {
+        agent: String,
+        session_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -214,7 +223,7 @@ impl Request {
     /// Listing tabs reveals only titles and directories; everything else
     /// reads terminal contents or acts on the user's behalf.
     fn needs_approval(&self) -> bool {
-        !matches!(self, Request::ListTabs)
+        !matches!(self, Request::ListTabs | Request::ReportAgentSession { .. })
     }
 }
 
@@ -260,6 +269,23 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
                     continue;
                 }
             };
+            if let Request::ReportAgentSession { agent, session_id } = &request {
+                let session = ResumableAgent::parse(agent)
+                    .and_then(|agent| AgentSession::new(agent, session_id));
+                let result = match (session, caller.token.clone()) {
+                    (Some(session), Some(token)) => cx
+                        .update(|cx| {
+                            window.update(cx, |workspace, _, cx| {
+                                workspace.report_agent_session(&token, session, cx)
+                            })
+                        })
+                        .unwrap_or_else(|_| Err("the window is closed".to_string())),
+                    (None, _) => Err("not a resumable agent session".to_string()),
+                    (_, None) => Err("only programs inside a pane can report sessions".to_string()),
+                };
+                let _ = reply.send(result);
+                continue;
+            }
             if request.needs_approval() {
                 let client = cx
                     .update(|cx| {
@@ -588,6 +614,27 @@ impl Workspace {
         }
     }
 
+    /// Remember the agent session a pane's program reported, so the pane
+    /// resumes it after a restart.
+    fn report_agent_session(
+        &mut self,
+        token: &str,
+        session: AgentSession,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let view = self
+            .layout
+            .ordered_tabs()
+            .into_iter()
+            .filter_map(|tab| self.panes_of(tab))
+            .flat_map(|panes| panes.read(cx).views())
+            .find(|view| view.read(cx).has_control_token(token))
+            .ok_or("no pane has that token")?;
+        view.update(cx, |view, cx| view.set_agent_session(session, cx));
+        self.schedule_save(cx);
+        Ok(json!({}))
+    }
+
     pub(crate) fn handle_control(
         &mut self,
         request: Request,
@@ -644,6 +691,8 @@ impl Workspace {
                 self.activate(tab, window, cx);
                 Ok(json!({ "tab": tab.element_id(), "pane": pane.read(cx).pane_id() }))
             }
+            // Answered before approval, with the caller's token.
+            Request::ReportAgentSession { .. } => Err("reported without a caller".to_string()),
             Request::Notify {
                 target,
                 title,

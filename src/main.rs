@@ -1,4 +1,5 @@
 mod agent_badge;
+mod agent_resume;
 mod agents;
 mod app_menus;
 mod assets;

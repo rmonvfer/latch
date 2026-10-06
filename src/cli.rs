@@ -3,13 +3,17 @@
 //! Commands talk to the app over the control socket. Inside a terminal
 //! tab they default to that tab's pane, through `TERMINAL_PANE_ID`.
 
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 use anyhow::{Context as _, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 use crate::{
+    agent_resume::{self, ResumableAgent},
     control::{self, NewTab, PaneTarget, Request, SplitDirection},
     mcp,
     terminal_view::PANE_ID_VARIABLE,
@@ -86,6 +90,12 @@ enum Command {
     },
     /// Serve the control API to an agent over MCP (stdio).
     Mcp,
+    /// Set up a coding agent (claude or codex) to report its sessions, so
+    /// panes resume them after the session runtime restarts.
+    Integrate { agent: String },
+    /// Run by an agent's SessionStart hook, with the hook's JSON on stdin.
+    #[command(hide = true)]
+    AgentHook { agent: String },
 }
 
 #[derive(Args)]
@@ -146,6 +156,31 @@ pub fn run_from_args() -> Option<i32> {
 
 fn joined(words: Vec<String>) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// Report the session a hook announces to the pane it runs in. Hooks must
+/// never get in an agent's way, so every failure is silent.
+fn report_agent_session(agent: &str) {
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    // Outside this app's panes there is nothing to report to.
+    if std::env::var_os(control::TOKEN_VARIABLE).is_none() {
+        return;
+    }
+    let Some(session) = ResumableAgent::parse(agent).and_then(|agent| {
+        let payload = serde_json::from_str::<Value>(&input).ok()?;
+        agent_resume::session_from_hook(agent, &payload)
+    }) else {
+        return;
+    };
+    let _ = control::ControlClient::connect().and_then(|mut client| {
+        client.request(Request::ReportAgentSession {
+            agent: agent.to_string(),
+            session_id: session.session_id,
+        })
+    });
 }
 
 fn run(command: Command) -> Result<()> {
@@ -233,6 +268,18 @@ fn run(command: Command) -> Result<()> {
             })?;
         }
         Command::Mcp => mcp::serve().context("the MCP server stopped")?,
+        Command::Integrate { agent } => {
+            let agent = ResumableAgent::parse(&agent)
+                .with_context(|| format!("no integration for {agent:?}; use claude or codex"))?;
+            for path in agent_resume::install(agent)? {
+                println!("updated {}", path.display());
+            }
+            println!(
+                "{} now reports its sessions; panes running it resume them after a restart.",
+                agent.display_name()
+            );
+        }
+        Command::AgentHook { agent } => report_agent_session(&agent),
     }
     Ok(())
 }

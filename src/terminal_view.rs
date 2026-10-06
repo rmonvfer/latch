@@ -20,6 +20,7 @@ use libghostty_vt::{
 };
 
 use crate::{
+    agent_resume::AgentSession,
     agents::{Agent, AgentStatus},
     block_view::{self, BlockAction, Item, ItemContent, OnBlockAction, PaintedOutputs},
     blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange},
@@ -219,6 +220,11 @@ pub struct TerminalView {
     completion_serial: u64,
     /// Completions shown over the editor.
     completion: Option<CompletionMenu>,
+    /// The coding agent session running here, as its hook reported it,
+    /// which a restored pane resumes.
+    agent_session: Option<AgentSession>,
+    /// Whether a coding agent was running at the last metadata refresh.
+    agent_was_running: bool,
 }
 
 /// A link in the viewport, in grid coordinates (end column exclusive).
@@ -257,42 +263,7 @@ impl Focusable for TerminalView {
 impl TerminalView {
     /// Start a persistent shell in `cwd`. `startup` is typed once its prompt is ready.
     pub fn build(cwd: Option<&Path>, startup: Option<&str>, cx: &mut App) -> Result<Entity<Self>> {
-        let dimensions = Dimensions {
-            cols: 80,
-            rows: 24,
-            cell_width: 8,
-            cell_height: 18,
-        };
-        let mut command =
-            shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
-        let control_token = control::new_token()?;
-        command.env(control::TOKEN_VARIABLE, &control_token);
-        control::configure_command(&mut command, cx);
-        let launch = Launch {
-            id: runtime::new_session_id()?,
-            argv: command
-                .get_argv()
-                .iter()
-                .map(|value| {
-                    value
-                        .to_str()
-                        .map(str::to_owned)
-                        .context("shell command contains invalid Unicode")
-                })
-                .collect::<Result<_>>()?,
-            env: command
-                .iter_full_env_as_str()
-                .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                .collect(),
-            cwd: cwd
-                .map(Path::to_path_buf)
-                .or_else(|| command.get_cwd().map(PathBuf::from)),
-            startup: startup.map(str::to_owned),
-            dimensions,
-            colors: runtime_colors(cx),
-            control_token,
-            command_blocks: SettingsStore::get(cx).command_blocks,
-        };
+        let launch = launch(runtime::new_session_id()?, cwd, startup, cx)?;
         let view = Self::from_session(
             SessionInfo {
                 id: launch.id,
@@ -305,17 +276,64 @@ impl TerminalView {
             },
             cx,
         )?;
-        let weak = view.downgrade();
-        cx.spawn(async move |cx: &mut AsyncApp| {
+        view.update(cx, |view, cx| view.start_session(launch, cx));
+        Ok(view)
+    }
+
+    /// Start a session in this view's identity again after it was lost
+    /// (the runtime stopped, the machine restarted): a fresh shell in the
+    /// directory it was last in, running `startup` once it is ready. A
+    /// directory that no longer exists is reported rather than replaced.
+    pub fn respawn(&mut self, startup: Option<String>, cx: &mut Context<Self>) {
+        // A pane that was running an agent session picks it up again.
+        let startup = startup.or_else(|| {
+            SettingsStore::get(cx)
+                .resume_agents
+                .then(|| {
+                    self.agent_session
+                        .as_ref()
+                        .map(AgentSession::resume_command)
+                })
+                .flatten()
+        });
+        if let Some(cwd) = self.info.cwd.clone().filter(|cwd| !cwd.is_dir()) {
+            self.connection_error =
+                Some(format!("Saved directory {} is unavailable", cwd.display()));
+            cx.emit(TerminalEvent::MetadataChanged);
+            cx.notify();
+            return;
+        }
+        match launch(
+            self.info.id,
+            self.info.cwd.as_deref(),
+            startup.as_deref(),
+            cx,
+        ) {
+            Ok(launch) => {
+                self.control_token.clone_from(&launch.control_token);
+                self.start_session(launch, cx);
+            }
+            Err(error) => {
+                self.connection_error = Some(format!("Could not start session: {error:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Ask the runtime to start `launch`, then show it.
+    fn start_session(&mut self, launch: Launch, cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { runtime::create_session(launch) })
                 .await;
-            let _ = weak.update(cx, |view, cx| match result {
+            let _ = view.update(cx, |view, cx| match result {
                 Ok(_) => {
+                    view.connection_error = None;
                     if let Some(client) = &view.client {
                         client.refresh();
                     }
+                    cx.notify();
                 }
                 Err(error) => {
                     view.connection_error = Some(format!("Could not start session: {error:#}"));
@@ -325,23 +343,40 @@ impl TerminalView {
             });
         })
         .detach();
-        Ok(view)
     }
 
     /// Attach to the same session identity, including an unavailable session.
     pub fn attach(session_id: u64, cx: &mut App) -> Result<Entity<Self>> {
-        Self::attach_in(session_id, None, cx)
+        Self::attach_in(session_id, None, None, cx)
     }
 
-    pub fn attach_in(session_id: u64, cwd: Option<&Path>, cx: &mut App) -> Result<Entity<Self>> {
-        Self::from_session(
+    /// Attach to session `session_id`, which ran in `cwd` and, if it had
+    /// one, the coding agent session `agent`.
+    pub fn attach_in(
+        session_id: u64,
+        cwd: Option<&Path>,
+        agent: Option<AgentSession>,
+        cx: &mut App,
+    ) -> Result<Entity<Self>> {
+        let view = Self::from_session(
             SessionInfo {
                 id: session_id,
                 cwd: cwd.map(Path::to_path_buf),
                 ..Default::default()
             },
             cx,
-        )
+        )?;
+        view.update(cx, |view, _| view.agent_session = agent);
+        Ok(view)
+    }
+
+    pub fn set_agent_session(&mut self, session: AgentSession, cx: &mut Context<Self>) {
+        self.agent_session = Some(session);
+        cx.emit(TerminalEvent::MetadataChanged);
+    }
+
+    pub fn agent_session(&self) -> Option<&AgentSession> {
+        self.agent_session.as_ref()
     }
 
     fn from_session(info: SessionInfo, cx: &mut App) -> Result<Entity<Self>> {
@@ -485,6 +520,8 @@ impl TerminalView {
                 pending_completion: None,
                 completion_serial: 0,
                 completion: None,
+                agent_session: None,
+                agent_was_running: false,
             }
         }))
     }
@@ -1334,6 +1371,13 @@ impl TerminalView {
 
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
         let metadata = self.read_metadata();
+        // A session ends when its agent quits; the hook reports a new one
+        // when an agent starts again.
+        let agent_running = metadata.agent.is_some();
+        if self.agent_was_running && !agent_running {
+            self.agent_session = None;
+        }
+        self.agent_was_running = agent_running;
         if metadata != self.metadata {
             self.metadata = metadata;
             cx.emit(TerminalEvent::MetadataChanged);
@@ -2376,6 +2420,45 @@ fn configure_colors(
         .set_default_cursor_color(Some(colors.cursor))?
         .set_default_color_palette(Some(palette))?;
     Ok(())
+}
+
+/// How to start a login shell in `cwd` for session `id`, running `startup`
+/// once its prompt is ready.
+fn launch(id: u64, cwd: Option<&Path>, startup: Option<&str>, cx: &App) -> Result<Launch> {
+    let mut command = shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
+    let control_token = control::new_token()?;
+    command.env(control::TOKEN_VARIABLE, &control_token);
+    control::configure_command(&mut command, cx);
+    Ok(Launch {
+        id,
+        argv: command
+            .get_argv()
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .context("shell command contains invalid Unicode")
+            })
+            .collect::<Result<_>>()?,
+        env: command
+            .iter_full_env_as_str()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
+        cwd: cwd
+            .map(Path::to_path_buf)
+            .or_else(|| command.get_cwd().map(PathBuf::from)),
+        startup: startup.map(str::to_owned),
+        dimensions: Dimensions {
+            cols: 80,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 18,
+        },
+        colors: runtime_colors(cx),
+        control_token,
+        command_blocks: SettingsStore::get(cx).command_blocks,
+    })
 }
 
 fn runtime_colors(cx: &App) -> Colors {

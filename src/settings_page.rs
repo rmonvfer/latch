@@ -11,8 +11,9 @@ use gpui::{
 };
 
 use crate::{
+    agent_resume::{self, ResumableAgent},
     components::{button, icon},
-    process_info::shorten_home,
+    process_info::{self, shorten_home},
     session,
     settings::{
         FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, Settings, SettingsStore, TERMINAL_PADDING_RANGE,
@@ -117,6 +118,8 @@ pub struct SettingsPage {
     /// The switch flipped last, which animates its knob.
     toggled: Option<&'static str>,
     reset_armed: bool,
+    /// What the last agent setup did, shown under its row.
+    integration_status: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -150,6 +153,7 @@ impl SettingsPage {
             hovered: None,
             toggled: None,
             reset_armed: false,
+            integration_status: None,
             _subscriptions: subscriptions,
         }
     }
@@ -300,6 +304,59 @@ impl SettingsPage {
                             .on_click(move |_: &ClickEvent, _, cx| {
                                 cx.open_with_system(&settings_path)
                             }),
+                    )
+                    .into_any_element(),
+                    row(
+                        "Resume agents",
+                        "When sessions restart (an update, a reboot), panes resume the Claude Code or Codex session they were running. Agents report their sessions once set up below.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "resume-agents",
+                        settings.resume_agents,
+                        true,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.resume_agents = on),
+                    ))
+                    .into_any_element(),
+                    row(
+                        "Agent session reporting",
+                        self.integration_status.clone().unwrap_or_else(|| {
+                            "Adds a SessionStart hook to the agent's own settings; other hooks are kept and the file is backed up.".to_string()
+                        }),
+                        theme,
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .children([ResumableAgent::Claude, ResumableAgent::Codex].map(|agent| {
+                                button(
+                                    match agent {
+                                        ResumableAgent::Claude => "integrate-claude",
+                                        ResumableAgent::Codex => "integrate-codex",
+                                    },
+                                    Some("bot"),
+                                    format!("Set up {}", agent.display_name()),
+                                    theme,
+                                )
+                                .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
+                                    page.integration_status = Some(match agent_resume::install(agent) {
+                                        Ok(paths) => format!(
+                                            "{} reports its sessions now (updated {}).",
+                                            agent.display_name(),
+                                            paths
+                                                .iter()
+                                                .map(|path| process_info::shorten_home(path))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        ),
+                                        Err(error) => format!("Could not set up {}: {error:#}", agent.display_name()),
+                                    });
+                                    cx.notify();
+                                }))
+                            })),
                     )
                     .into_any_element(),
                 ],

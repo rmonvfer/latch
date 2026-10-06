@@ -11,6 +11,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent_resume::AgentSession,
     components::{DragPreview, icon_button},
     pane_tree::{Axis, PaneNode, PaneTree, Split},
     sidebar::DraggedTab,
@@ -126,6 +127,10 @@ pub enum PaneState {
         session_id: Option<u64>,
         #[serde(default)]
         cwd: Option<PathBuf>,
+        /// The coding agent session the pane was running, resumed when the
+        /// pane is restored without its session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentSession>,
     },
     Split {
         axis: Axis,
@@ -851,6 +856,7 @@ fn snapshot_node(node: &PaneNode<Entity<TerminalView>>, cx: &App) -> PaneState {
         PaneNode::Leaf(view) => PaneState::Terminal {
             session_id: Some(view.read(cx).session_id()),
             cwd: view.read(cx).metadata().cwd.clone(),
+            agent: view.read(cx).agent_session().cloned(),
         },
         PaneNode::Split(split) => PaneState::Split {
             axis: split.axis,
@@ -866,8 +872,12 @@ fn snapshot_node(node: &PaneNode<Entity<TerminalView>>, cx: &App) -> PaneState {
 
 fn restore_node(state: &PaneState, cx: &mut App) -> Option<PaneNode<Entity<TerminalView>>> {
     match state {
-        PaneState::Terminal { session_id, cwd } => match match session_id {
-            Some(id) => TerminalView::attach_in(*id, cwd.as_deref(), cx),
+        PaneState::Terminal {
+            session_id,
+            cwd,
+            agent,
+        } => match match session_id {
+            Some(id) => TerminalView::attach_in(*id, cwd.as_deref(), agent.clone(), cx),
             None => TerminalView::build(cwd.as_deref(), None, cx),
         } {
             Ok(view) => Some(PaneNode::Leaf(view)),

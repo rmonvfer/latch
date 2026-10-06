@@ -49,6 +49,9 @@ pub struct Settings {
     /// Show each command and its output as a block, with an input editor,
     /// in shells with integration. Applies to new terminals.
     pub command_blocks: bool,
+    /// Resume the coding agent session a pane was running when it is
+    /// restored after the session runtime stopped.
+    pub resume_agents: bool,
 }
 
 impl Default for Settings {
@@ -67,6 +70,7 @@ impl Default for Settings {
             agent_worktrees: false,
             control_api: true,
             command_blocks: true,
+            resume_agents: true,
         }
     }
 }

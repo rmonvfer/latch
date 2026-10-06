@@ -101,7 +101,11 @@ pub fn save(state: &SessionState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{pane_tree::Axis, tabs::TabIcon};
+    use crate::{
+        agent_resume::{AgentSession, ResumableAgent},
+        pane_tree::Axis,
+        tabs::TabIcon,
+    };
 
     #[test]
     fn session_round_trips_through_json() {
@@ -117,10 +121,14 @@ mod tests {
                             PaneState::Terminal {
                                 session_id: Some(42),
                                 cwd: Some(PathBuf::from("/tmp")),
+                                agent: Some(
+                                    AgentSession::new(ResumableAgent::Claude, "s-1").unwrap(),
+                                ),
                             },
                             PaneState::Terminal {
                                 session_id: Some(43),
                                 cwd: None,
+                                agent: None,
                             },
                         ],
                     }),
@@ -188,7 +196,7 @@ mod tests {
         assert!(tab.hidden);
         assert!(matches!(
             &tab.panes,
-            Some(PaneState::Terminal { session_id: Some(9001), cwd })
+            Some(PaneState::Terminal { session_id: Some(9001), cwd, agent: None })
                 if cwd.as_deref() == Some(std::path::Path::new("/tmp"))
         ));
     }
