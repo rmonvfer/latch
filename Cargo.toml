@@ -22,7 +22,6 @@ git2 = "0.21.0"
 portable-pty = "0.9.0"
 rmcp = { version = "3.5.0", features = ["server", "macros", "transport-io"] }
 schemars = "1.2.2"
-security-framework = "3"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [profile.dev.package."*"]

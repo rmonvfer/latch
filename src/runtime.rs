@@ -203,40 +203,12 @@ fn forget_token(paths: &Paths) {
     let _ = fs::remove_file(paths.token_id());
 }
 
-/// The runtime's secret lives in the login keychain rather than a file:
-/// the item's access list trusts only the program that created it, so
-/// other programs running as the user, sandboxed agents among them, cannot
-/// read it without the user's approval.
-mod keychain {
-    use anyhow::{Context as _, Result};
-    use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password,
-    };
-
-    use super::Paths;
-
-    const SERVICE: &str = "Terminal session runtime";
-
-    pub fn store(_paths: &Paths, id: &str, token: &str) -> Result<()> {
-        set_generic_password(SERVICE, id, token.as_bytes())
-            .context("failed to store the session runtime secret in the keychain")
-    }
-
-    pub fn load(_paths: &Paths, id: &str) -> Result<String> {
-        let bytes = get_generic_password(SERVICE, id)
-            .context("failed to read the session runtime secret from the keychain")?;
-        Ok(String::from_utf8(bytes)?)
-    }
-
-    pub fn delete(_paths: &Paths, id: &str) {
-        let _ = delete_generic_password(SERVICE, id);
-    }
-}
-
-/// Tests keep the secret in a private file in the runtime directory, so
-/// they never touch the user's keychain.
-#[cfg(test)]
-mod test_secret_store {
+/// The runtime's secret lives in an owner-only file in the owner-only
+/// runtime directory. On its own a file readable by the user's programs
+/// would not keep other programs out, but both ends of the socket also
+/// check that the other runs this same executable, so the secret is of no
+/// use to any other program that reads it.
+mod secret_store {
     use std::{
         fs,
         io::{Read, Write},
@@ -255,12 +227,15 @@ mod test_secret_store {
         let mut file = private_file(&path(paths, id), true)?;
         file.set_len(0)?;
         file.write_all(token.as_bytes())?;
+        file.sync_all()?;
         Ok(())
     }
 
     pub fn load(paths: &Paths, id: &str) -> Result<String> {
         let mut token = String::new();
-        private_file(&path(paths, id), false)?.read_to_string(&mut token)?;
+        private_file(&path(paths, id), false)?
+            .take(65)
+            .read_to_string(&mut token)?;
         Ok(token)
     }
 
@@ -268,11 +243,6 @@ mod test_secret_store {
         let _ = fs::remove_file(path(paths, id));
     }
 }
-
-#[cfg(not(test))]
-use keychain as secret_store;
-#[cfg(test)]
-use test_secret_store as secret_store;
 
 fn same_token(expected: &str, candidate: &str) -> bool {
     if expected.len() != candidate.len() {
@@ -1450,16 +1420,6 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         assert!(peer_is_this_program(&ours));
         assert!(peer_is_this_program(&theirs));
-    }
-
-    #[test]
-    fn the_keychain_keeps_and_forgets_a_secret() {
-        let paths = temporary_paths();
-        let id = random_hex::<16>().unwrap();
-        keychain::store(&paths, &id, "secret").unwrap();
-        assert_eq!(keychain::load(&paths, &id).unwrap(), "secret");
-        keychain::delete(&paths, &id);
-        assert!(keychain::load(&paths, &id).is_err());
     }
 
     #[test]
