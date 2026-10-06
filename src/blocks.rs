@@ -113,13 +113,6 @@ pub struct BlockSelection {
 }
 
 impl BlockSelection {
-    pub fn at(point: BlockPoint) -> Self {
-        Self {
-            anchor: point,
-            head: point,
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
