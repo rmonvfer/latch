@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::{
     agents::{AgentProfile, AgentStatus},
-    components::{icon, icon_button, keybinding},
+    components::{self, icon, icon_button, keybinding},
     confirm::confirm_close,
     git::{self, DiffStats},
     notifications,
@@ -180,6 +180,11 @@ pub struct Workspace {
     pub(crate) sidebar_open: bool,
     pub(crate) sidebar_width: Pixels,
     pub(crate) sidebar_resizing: bool,
+    /// The session runtime running is from an older build and cannot be
+    /// attached to; a banner offers to restart sessions.
+    outdated_runtime: bool,
+    /// Sessions are restarting on the current runtime.
+    restarting_runtime: bool,
     titlebar_dragging: bool,
     pub(crate) tab_scroll: ScrollHandle,
     pub(crate) context_menu: Option<ContextMenu>,
@@ -235,6 +240,8 @@ impl Workspace {
             sidebar_open: true,
             sidebar_width: theme::SIDEBAR_WIDTH,
             sidebar_resizing: false,
+            outdated_runtime: false,
+            restarting_runtime: false,
             titlebar_dragging: false,
             tab_scroll: ScrollHandle::new(),
             context_menu: None,
@@ -252,6 +259,75 @@ impl Workspace {
         workspace.save_session(cx);
         workspace.reconcile_sessions(window, cx);
         workspace
+    }
+
+    /// Replace an outdated session runtime with the current one. Its
+    /// sessions end; panes start again where they were and resume their
+    /// agents.
+    fn restart_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restarting_runtime {
+            return;
+        }
+        self.restarting_runtime = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { runtime::replace_outdated() })
+                .await;
+            let _ = this.update_in(cx, |workspace, window, cx| {
+                workspace.restarting_runtime = false;
+                match result {
+                    Ok(()) => {
+                        workspace.outdated_runtime = false;
+                        workspace.reconcile_sessions(window, cx);
+                    }
+                    Err(error) => log::error!("failed to restart sessions: {error:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_runtime_banner(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.outdated_runtime {
+            return None;
+        }
+        let label = if self.restarting_runtime {
+            "Restarting…"
+        } else {
+            "Restart Sessions"
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.elevated_surface)
+                .text_sm()
+                .child(icon("circle-alert", px(14.), theme.text_accent))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.text_muted)
+                        .child(
+                            "Your sessions run on an older version of this app. Restart them to use this one: programs in them stop, and panes reopen where they were with their agents resumed.",
+                        ),
+                )
+                .child(
+                    components::button("restart-runtime", Some("refresh-cw"), label, theme)
+                        .on_click(cx.listener(|workspace, _, window, cx| {
+                            workspace.restart_runtime(window, cx)
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn reconcile_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -315,7 +391,12 @@ impl Workspace {
                                 }
                             }
                         }
-                        Err(error) => log::warn!("failed to list sessions: {error:#}"),
+                        Err(error) => {
+                            if runtime::is_outdated(&error) {
+                                workspace.outdated_runtime = true;
+                            }
+                            log::warn!("failed to list sessions: {error:#}");
+                        }
                     }
                     if workspace.open_tabs.is_empty() {
                         workspace.open_terminal(None, None, None, TabStyle::default(), window, cx);
@@ -1745,7 +1826,16 @@ impl Render for Workspace {
                     .when(self.sidebar_open, |row| {
                         row.child(self.render_sidebar(&theme, cx))
                     })
-                    .child(div().flex_1().min_w_0().h_full().child(content)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .children(self.render_runtime_banner(&theme, cx))
+                            .child(div().flex_1().min_h_0().child(content)),
+                    ),
             )
             .children(self.render_status_bar(&theme, cx))
             .children(self.render_context_menu(&theme, cx))

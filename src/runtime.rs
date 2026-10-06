@@ -378,9 +378,7 @@ impl Rpc {
         );
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let token = read_token(paths).context(
-            "the running session runtime is from an older build; stop it to start a current one",
-        )?;
+        let token = read_token(paths).context(OUTDATED)?;
         let mut client = Self { stream, token };
         match client.request(Request::Ping)? {
             Response::Ready { version } if version == VERSION => Ok(client),
@@ -405,6 +403,57 @@ impl Rpc {
             response => Ok(response),
         }
     }
+}
+
+/// Whether the runtime that is running can be talked to: `false` for one
+/// from an older build, which `replace_outdated` replaces.
+pub fn is_outdated(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains(OUTDATED) || message.contains(INCOMPATIBLE)
+    })
+}
+
+/// How a runtime speaking another protocol version is reported.
+const INCOMPATIBLE: &str = "session runtime protocol version";
+
+const OUTDATED: &str = "the running session runtime is from an older build";
+
+/// Stop a session runtime from an older build, which ends its sessions,
+/// and start the current one. Only a runtime running this same executable
+/// is stopped.
+pub fn replace_outdated() -> Result<()> {
+    let paths = Paths::configured();
+    if let Ok(stream) = UnixStream::connect(paths.socket()) {
+        ensure!(
+            same_user(&stream),
+            "session runtime belongs to another user"
+        );
+        let (pid, version) = peer_audit(&stream).context("cannot identify the session runtime")?;
+        let runs_this_program = process_info::executable_path(pid)
+            .and_then(|path| fs::canonicalize(path).ok())
+            .zip(std::env::current_exe().and_then(fs::canonicalize).ok())
+            .is_some_and(|(theirs, ours)| theirs == ours)
+            && pid_version(pid) == Some(version);
+        ensure!(
+            runs_this_program,
+            "the session runtime is not this program; stop it yourself"
+        );
+        drop(stream);
+        // The runtime waits for its sessions to end before stopping on a
+        // terminate signal, so it is stopped outright.
+        // SAFETY: kill has no memory preconditions.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let started = Instant::now();
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            ensure!(
+                started.elapsed() < STARTUP_TIMEOUT,
+                "the old session runtime did not stop"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    ensure_running()
 }
 
 /// Start the detached runtime once, leaving an existing runtime and its sessions intact.
