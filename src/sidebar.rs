@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent_badge,
+    agents::AgentStatus,
     components::{
         DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
         menu_surface,
@@ -334,6 +335,7 @@ impl Workspace {
                             })),
                     ),
             )
+            .children(self.render_attention(theme, cx))
             .when(searching && rows.is_empty(), |sidebar| {
                 sidebar.child(
                     div()
@@ -550,6 +552,81 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn render_attention(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tabs = self.needs_attention(cx);
+        if tabs.is_empty() {
+            return None;
+        }
+        let hover = theme.ghost_hover;
+        let rows = tabs
+            .into_iter()
+            .filter_map(|id| {
+                let display = self.display(id, cx)?;
+                let waiting = self.panes_of(id).is_some_and(|panes| {
+                    panes.read(cx).views().iter().any(|view| {
+                        view.read(cx)
+                            .metadata()
+                            .agent
+                            .is_some_and(|agent| agent.status == AgentStatus::NeedsInput)
+                    })
+                });
+                let reason = if waiting {
+                    "Needs input"
+                } else if display.exited {
+                    "Finished"
+                } else {
+                    "Activity"
+                };
+                Some(
+                    div()
+                        .id(("attention-tab", id.element_id()))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.activate_attention(id, window, cx);
+                        }))
+                        .child(icon("circle-alert", theme::ICON_SMALL, theme.text_accent))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(theme::TEXT_DEFAULT)
+                                .child(display.title),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(theme::TEXT_SMALL)
+                                .text_color(theme.text_muted)
+                                .child(reason),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Some(
+            div()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border_variant)
+                .child(menu_caption("Needs you", theme))
+                .child(
+                    div()
+                        .id("attention-list")
+                        .max_h(px(144.))
+                        .overflow_y_scroll()
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_tab_row(
         &self,
         id: TabId,
@@ -714,6 +791,24 @@ impl Workspace {
                                 .child(display.title)
                                 .into_any_element(),
                         })
+                        .when(
+                            display.hidden || display.exited || !display.connected,
+                            |line| {
+                                line.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(theme::TEXT_SMALL)
+                                        .text_color(theme.text_placeholder)
+                                        .child(if display.exited {
+                                            "Finished"
+                                        } else if !display.connected {
+                                            "Disconnected"
+                                        } else {
+                                            "Hidden"
+                                        }),
+                                )
+                            },
+                        )
                         // A failed command outranks other activity.
                         .when(display.failed || display.attention, |line| {
                             line.child(div().flex_none().size(px(6.)).rounded_full().bg(
@@ -733,7 +828,7 @@ impl Workspace {
                                 .size(px(18.))
                                 .child(icon("pin", theme::ICON_XSMALL, theme.text_muted))
                                 .into_any_element()
-                        } else {
+                        } else if !display.hidden {
                             icon_button(("close-tab", id.element_id()), "x", theme)
                                 .size(px(18.))
                                 .invisible()
@@ -743,6 +838,8 @@ impl Workspace {
                                     this.request_close(id, window, cx);
                                 }))
                                 .into_any_element()
+                        } else {
+                            div().flex_none().size(px(18.)).into_any_element()
                         }),
                 )
                 .when(has_details, |row| {
@@ -797,6 +894,8 @@ impl Workspace {
             .map(|group| (group.id, group.name.clone()))
             .collect();
         let pinned = style.pinned;
+        let display = self.display(id, cx)?;
+        let terminal = self.panes_of(id).is_some();
 
         Some(
             div()
@@ -879,13 +978,77 @@ impl Workspace {
                 })
                 .child(menu_separator(theme))
                 .child(
-                    menu_item("menu-close", "x", "Close Tab", theme).on_click(cx.listener(
+                    menu_item(
+                        "menu-close",
+                        "x",
+                        if display.hidden {
+                            "Show Tab"
+                        } else {
+                            "Close Tab"
+                        },
+                        theme,
+                    )
+                    .on_click(cx.listener(
                         move |this, _: &ClickEvent, window, cx| {
                             this.close_context_menu(cx);
-                            this.request_close(id, window, cx);
+                            if display.hidden {
+                                this.activate(id, window, cx);
+                            } else {
+                                this.request_close(id, window, cx);
+                            }
                         },
                     )),
-                ),
+                )
+                .when(terminal && !display.exited, |menu| {
+                    menu.child(
+                        menu_item("menu-stop", "circle-alert", "Stop Sessions…", theme).on_click(
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.close_context_menu(cx);
+                                this.request_stop(id, window, cx);
+                            }),
+                        ),
+                    )
+                })
+                .when(terminal && display.exited, |menu| {
+                    menu.child(
+                        menu_item("menu-archive", "x", "Remove Finished Sessions", theme).on_click(
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.close_context_menu(cx);
+                                this.archive(id, window, cx);
+                            }),
+                        ),
+                    )
+                })
+                .when(terminal && display.unavailable, |menu| {
+                    menu.child(
+                        menu_item(
+                            "menu-replace-unavailable",
+                            "terminal",
+                            "Replace with Fresh Shell…",
+                            theme,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.close_context_menu(cx);
+                                this.request_unavailable_action(id, true, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        menu_item(
+                            "menu-remove-unavailable",
+                            "x",
+                            "Remove Unavailable Views…",
+                            theme,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.close_context_menu(cx);
+                                this.request_unavailable_action(id, false, window, cx);
+                            },
+                        )),
+                    )
+                }),
         )
     }
 

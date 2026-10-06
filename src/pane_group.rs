@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     components::{DragPreview, icon_button},
-    confirm::confirm_close,
     pane_tree::{Axis, PaneNode, PaneTree, Split},
     sidebar::DraggedTab,
     tabs::TabId,
@@ -44,9 +43,12 @@ const DIVIDER_HIT_SIZE: f32 = 5.;
 pub enum PaneGroupEvent {
     /// The focused pane changed, or its title, directory, or branch did.
     MetadataChanged,
-    /// The last pane's shell exited.
-    Exited,
-    Attention(Attention),
+    /// A pane was hidden and needs a session entry outside this arrangement.
+    Hidden(Entity<TerminalView>),
+    Attention {
+        source: Entity<TerminalView>,
+        attention: Attention,
+    },
     /// A pane from another tab was dropped on one of this group's panes.
     PaneDropped {
         dragged: DraggedPane,
@@ -121,6 +123,8 @@ pub enum Detached {
 pub enum PaneState {
     Terminal {
         #[serde(default)]
+        session_id: Option<u64>,
+        #[serde(default)]
         cwd: Option<PathBuf>,
     },
     Split {
@@ -176,8 +180,7 @@ impl PaneGroup {
         Ok(cx.new(|cx| Self::from_tree(PaneTree::new(view.clone()), view, window, cx)))
     }
 
-    /// Recreate a saved arrangement. Panes whose shell fails to start are
-    /// left out; fails only if none start.
+    /// Attach the sessions in a saved arrangement. Fails if none can be displayed.
     pub fn restore(state: &PaneState, window: &mut Window, cx: &mut App) -> Result<Entity<Self>> {
         let root = restore_node(state, cx).ok_or_else(|| anyhow!("no pane could be restored"))?;
         let tree = PaneTree::from_root(root);
@@ -349,15 +352,21 @@ impl PaneGroup {
     fn watch(&mut self, view: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
         let focus = view.focus_handle(cx);
         let subscriptions = vec![
-            cx.subscribe_in(view, window, |group, view, event, window, cx| match event {
+            cx.subscribe_in(view, window, |group, view, event, _, cx| match event {
                 TerminalEvent::MetadataChanged => {
                     if *view == group.active {
                         cx.emit(PaneGroupEvent::MetadataChanged);
                     }
                 }
-                TerminalEvent::Exited => group.remove_pane(view.clone(), window, cx),
+                TerminalEvent::Exited => {
+                    cx.emit(PaneGroupEvent::MetadataChanged);
+                    cx.notify();
+                }
                 TerminalEvent::Attention(attention) => {
-                    cx.emit(PaneGroupEvent::Attention(attention.clone()));
+                    cx.emit(PaneGroupEvent::Attention {
+                        source: view.clone(),
+                        attention: attention.clone(),
+                    });
                 }
             }),
             cx.on_focus_in(&focus, window, {
@@ -415,19 +424,6 @@ impl PaneGroup {
         cx.notify();
     }
 
-    fn remove_pane(
-        &mut self,
-        view: Entity<TerminalView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.pane_count() == 1 {
-            cx.emit(PaneGroupEvent::Exited);
-            return;
-        }
-        self.remove_from_tree(view, window, cx);
-    }
-
     fn remove_from_tree(
         &mut self,
         view: Entity<TerminalView>,
@@ -477,7 +473,7 @@ impl PaneGroup {
         self.request_close_pane(self.active.clone(), window, cx);
     }
 
-    /// Close a pane the user asked to close, confirming if it is busy.
+    /// Hide a pane while its session remains available in the sidebar.
     fn request_close_pane(
         &mut self,
         pane: Entity<TerminalView>,
@@ -485,22 +481,8 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         if self.pane_count() > 1 {
-            let metadata = pane.read(cx).metadata();
-            let running = metadata
-                .running
-                .then(|| metadata.process.clone())
-                .flatten()
-                .into_iter()
-                .collect();
-            confirm_close(
-                running,
-                "Close this pane?",
-                window,
-                cx,
-                move |group, window, cx| {
-                    group.remove_pane(pane, window, cx);
-                },
-            );
+            self.remove_from_tree(pane.clone(), window, cx);
+            cx.emit(PaneGroupEvent::Hidden(pane));
         } else {
             // A lone pane closes the whole tab, which respects pinning.
             window.dispatch_action(Box::new(CloseTab), cx);
@@ -867,6 +849,7 @@ fn collect_views(node: &PaneNode<Entity<TerminalView>>, views: &mut Vec<Entity<T
 fn snapshot_node(node: &PaneNode<Entity<TerminalView>>, cx: &App) -> PaneState {
     match node {
         PaneNode::Leaf(view) => PaneState::Terminal {
+            session_id: Some(view.read(cx).session_id()),
             cwd: view.read(cx).metadata().cwd.clone(),
         },
         PaneNode::Split(split) => PaneState::Split {
@@ -883,7 +866,10 @@ fn snapshot_node(node: &PaneNode<Entity<TerminalView>>, cx: &App) -> PaneState {
 
 fn restore_node(state: &PaneState, cx: &mut App) -> Option<PaneNode<Entity<TerminalView>>> {
     match state {
-        PaneState::Terminal { cwd } => match TerminalView::build(cwd.as_deref(), None, cx) {
+        PaneState::Terminal { session_id, cwd } => match match session_id {
+            Some(id) => TerminalView::attach_in(*id, cwd.as_deref(), cx),
+            None => TerminalView::build(cwd.as_deref(), None, cx),
+        } {
             Ok(view) => Some(PaneNode::Leaf(view)),
             Err(error) => {
                 log::error!("failed to restore terminal: {error:#}");

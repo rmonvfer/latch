@@ -1,7 +1,12 @@
 use std::{
+    cell::Cell,
     io::{Read, Write},
-    path::Path,
-    sync::mpsc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -12,6 +17,9 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 pub const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 /// Maximum queued output chunks per PTY, totaling at most 512 KiB.
 pub const OUTPUT_QUEUE_CAPACITY: usize = 64;
+/// Largest input message accepted by a session.
+pub const MAX_INPUT_BYTES: usize = 256 * 1024;
+const INPUT_QUEUE_CAPACITY: usize = 32;
 
 /// Grid and pixel dimensions reported to the child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +49,11 @@ impl PtyDimensions {
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    input: mpsc::Sender<Vec<u8>>,
+    input: mpsc::SyncSender<Vec<u8>>,
     shell_pid: Option<i32>,
+    initial_cwd: Option<PathBuf>,
+    exit_status: Arc<AtomicU64>,
+    session_finished: Cell<bool>,
 }
 
 impl Pty {
@@ -61,13 +72,13 @@ impl Pty {
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        match cwd.filter(|cwd| cwd.is_dir()) {
-            Some(cwd) => command.cwd(cwd),
-            None => {
-                if let Some(home) = std::env::var_os("HOME") {
-                    command.cwd(home);
-                }
-            }
+        let initial_cwd = cwd
+            .filter(|cwd| cwd.is_dir())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = &initial_cwd {
+            command.cwd(cwd);
         }
 
         let mut child = pair
@@ -90,16 +101,30 @@ impl Pty {
             .context("failed to take pty writer")?;
 
         let (output_tx, output_rx) = async_channel::bounded(OUTPUT_QUEUE_CAPACITY);
+        let output_worker = thread::current();
         thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
-                read_output(reader, &output_tx);
-                // Reap the shell so it does not linger as a zombie.
-                let _ = child.wait();
+                read_output(reader, &output_tx, Some(&output_worker));
+                drop(output_tx);
+                output_worker.unpark();
             })
             .context("failed to start pty reader thread")?;
 
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        // Reap the shell independently of descendants retaining its terminal.
+        let exit_status = Arc::new(AtomicU64::new(0));
+        let status = Arc::clone(&exit_status);
+        let exit_worker = thread::current();
+        thread::Builder::new()
+            .name("pty-reaper".into())
+            .spawn(move || {
+                let code = child.wait().map(|status| status.exit_code()).unwrap_or(1);
+                status.store(u64::from(code) + 1, Ordering::Release);
+                exit_worker.unpark();
+            })
+            .context("failed to start pty reaper thread")?;
+
+        let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_CAPACITY);
         thread::Builder::new()
             .name("pty-writer".into())
             .spawn(move || {
@@ -121,18 +146,26 @@ impl Pty {
                 killer,
                 input: input_tx,
                 shell_pid,
+                initial_cwd,
+                exit_status,
+                session_finished: Cell::new(false),
             },
             output_rx,
         ))
     }
 
     /// A cloneable handle for sending bytes to the shell from callbacks.
-    pub fn input_sender(&self) -> mpsc::Sender<Vec<u8>> {
+    pub fn input_sender(&self) -> mpsc::SyncSender<Vec<u8>> {
         self.input.clone()
     }
 
     pub fn shell_pid(&self) -> Option<i32> {
         self.shell_pid
+    }
+
+    /// Directory used to start the shell, before process observations arrive.
+    pub fn initial_cwd(&self) -> Option<&Path> {
+        self.initial_cwd.as_deref()
     }
 
     /// The process currently in the foreground of the PTY: the shell itself
@@ -141,10 +174,74 @@ impl Pty {
         self.master.process_group_leader()
     }
 
-    pub fn write(&self, bytes: &[u8]) {
+    pub fn try_write(&self, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            bytes.len() <= MAX_INPUT_BYTES,
+            "terminal input exceeds 256 KiB"
+        );
+        anyhow::ensure!(self.exit_status().is_none(), "the session has exited");
         if !bytes.is_empty() {
-            let _ = self.input.send(bytes.to_vec());
+            self.input
+                .try_send(bytes.to_vec())
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => {
+                        anyhow::anyhow!("terminal input is busy; try again")
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        anyhow::anyhow!("terminal input is closed")
+                    }
+                })?;
         }
+        Ok(())
+    }
+
+    /// Exit code is published after the child has been reaped.
+    pub fn exit_status(&self) -> Option<u32> {
+        self.exit_status
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+            .map(|code| code as u32)
+    }
+
+    /// Processes sharing the shell's controlling session, including background jobs.
+    pub fn session_processes(&self) -> Result<Vec<i32>> {
+        if self.session_finished.get() {
+            return Ok(Vec::new());
+        }
+        let Some(session) = self.shell_pid else {
+            return Ok(Vec::new());
+        };
+        let processes: Vec<i32> = process_ids()?
+            .into_iter()
+            .filter(|pid| {
+                // SAFETY: getsid only queries a process and fails if it has exited.
+                *pid > 1 && unsafe { libc::getsid(*pid) } == session
+            })
+            .collect();
+        if processes.is_empty() && self.exit_status().is_some() {
+            self.session_finished.set(true);
+        }
+        Ok(processes)
+    }
+
+    /// Recheck session membership before signaling each process.
+    pub fn signal_session(&self, signal: i32) -> Result<()> {
+        let Some(session) = self.shell_pid else {
+            return Ok(());
+        };
+        for pid in self.session_processes()? {
+            // SAFETY: only a process still in this PTY's session is signaled.
+            if unsafe { libc::getsid(pid) } != session {
+                continue;
+            }
+            if unsafe { libc::kill(pid, signal) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn resize(&self, dimensions: PtyDimensions) {
@@ -156,11 +253,42 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        if self.exit_status().is_none() {
+            let _ = self.killer.kill();
+        }
     }
 }
 
-fn read_output(mut reader: impl Read, output: &async_channel::Sender<Vec<u8>>) {
+#[cfg(target_os = "macos")]
+fn process_ids() -> Result<Vec<i32>> {
+    // SAFETY: the null buffer requests the process count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    anyhow::ensure!(count > 0, "cannot enumerate session processes");
+    let mut processes = vec![0i32; count as usize + 256];
+    // SAFETY: the vector has exactly the writable byte capacity passed here.
+    let count = unsafe {
+        libc::proc_listallpids(
+            processes.as_mut_ptr().cast(),
+            std::mem::size_of_val(processes.as_slice()) as i32,
+        )
+    };
+    anyhow::ensure!(count >= 0, "cannot enumerate session processes");
+    processes.truncate(count as usize);
+    Ok(processes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_ids() -> Result<Vec<i32>> {
+    Ok(std::fs::read_dir("/proc")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect())
+}
+
+fn read_output(
+    mut reader: impl Read,
+    output: &async_channel::Sender<Vec<u8>>,
+    worker: Option<&thread::Thread>,
+) {
     let mut buffer = [0u8; OUTPUT_CHUNK_BYTES];
     loop {
         match reader.read(&mut buffer) {
@@ -169,6 +297,9 @@ fn read_output(mut reader: impl Read, output: &async_channel::Sender<Vec<u8>>) {
                 // Blocking here applies backpressure without occupying the UI thread.
                 if output.send_blocking(buffer[..len].to_vec()).is_err() {
                     break;
+                }
+                if let Some(worker) = worker {
+                    worker.unpark();
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -208,7 +339,7 @@ mod tests {
         let (output_tx, output_rx) = async_channel::bounded(OUTPUT_QUEUE_CAPACITY);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let reader = thread::spawn(move || {
-            read_output(Cursor::new(bytes), &output_tx);
+            read_output(Cursor::new(bytes), &output_tx, None);
             finished_tx.send(()).unwrap();
         });
 
@@ -242,7 +373,7 @@ mod tests {
         let (output_tx, output_rx) = async_channel::bounded(OUTPUT_QUEUE_CAPACITY);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let reader = thread::spawn(move || {
-            read_output(Cursor::new(bytes), &output_tx);
+            read_output(Cursor::new(bytes), &output_tx, None);
             finished_tx.send(()).unwrap();
         });
 

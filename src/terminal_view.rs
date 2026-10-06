@@ -1,12 +1,9 @@
 use std::{
-    cell::Cell,
     path::{Path, PathBuf},
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
     EventEmitter, FocusHandle, Focusable, KeyBinding, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -15,34 +12,25 @@ use gpui::{
     canvas, div, prelude::*, px,
 };
 use libghostty_vt::{
-    Terminal,
-    fmt::Format,
-    key, mouse, paste,
-    screen::{CellWide, RowSemanticPrompt},
-    selection::{
-        FormatOptions, Selection,
-        gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
-    },
+    Terminal, key, mouse,
+    screen::CellWide,
     style::Palette,
-    terminal::{
-        ColorScheme, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
-        Options, Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport,
-        SecondaryDeviceAttributes, SizeReportSize,
-    },
+    terminal::{Options, Point, PointCoordinate},
 };
 
 use crate::{
-    agents::{self, Activity, Agent, AgentStatus},
+    agents::{Agent, AgentStatus},
     components::{elevated_shadow, icon, icon_button},
     control,
     git::{self, DiffStats},
     grid::{CellMetrics, GridRenderer},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
-    osc::{OscEvent, OscScanner},
-    output, process_info,
-    pty::{Pty, PtyDimensions},
-    search::{self, SearchMatch},
+    process_info,
+    runtime::{self, ClientEvent, SessionClient},
+    runtime_display::DisplayState,
+    runtime_protocol::{Colors, Dimensions, Launch, Operation, SessionInfo, Snapshot},
+    search::SearchMatch,
     settings::SettingsStore,
     shell_integration::{self, ShellIntegration},
     text_input::{TextInput, TextInputEvent},
@@ -66,9 +54,7 @@ actions!(
 
 const SEARCH_CONTEXT: &str = "TerminalSearch";
 
-const SCROLLBACK_LINES: usize = 10_000;
 const FALLBACK_TITLE: &str = "shell";
-const METADATA_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
 
 /// What the sidebar shows about a session.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -135,35 +121,33 @@ pub enum Attention {
     },
 }
 
-/// How long to wait for a first prompt before typing a startup command
-/// anyway.
-const STARTUP_FALLBACK: Duration = Duration::from_secs(4);
-
-/// Environment variable telling programs which pane they run in.
+/// Environment variable telling programs which session they run in.
 pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
-static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How often uncommitted changes are recounted.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
-/// An agent must work at least this long before going quiet is news.
-const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
-
-/// A single shell session: PTY, libghostty terminal state, and the view that
-/// paints it and turns GPUI input into VT sequences.
+/// A view attached to a persistent session. The terminal is a display mirror;
+/// the runtime owns the process, parser, scrollback, and input encoding.
 pub struct TerminalView {
     terminal: Terminal<'static, 'static>,
     renderer: GridRenderer,
-    pty: Pty,
-    dimensions: Rc<Cell<PtyDimensions>>,
+    display: DisplayState,
+    client: Option<SessionClient>,
+    dimensions: Dimensions,
+    info: SessionInfo,
+    connected: bool,
+    connection_error: Option<String>,
+    input_error: Option<String>,
+    stop_requested: bool,
+    mouse_tracking: bool,
+    attention_serial: Option<u64>,
     focus_handle: FocusHandle,
-    keys: KeyInput,
     mouse: MouseInput,
-    selection: SelectionInput,
+    selecting: bool,
     bounds: Option<Bounds<Pixels>>,
     metrics: Option<CellMetrics>,
     metadata: TabMetadata,
-    process_metadata: ProcessMetadata,
     _output_task: Task<()>,
     _metadata_task: Task<()>,
     _settings_subscription: Subscription,
@@ -173,20 +157,11 @@ pub struct TerminalView {
     link_hover: Option<HoveredLink>,
     /// Last pointer position relative to the terminal, for ⌘ presses.
     last_mouse: Option<gpui::Point<Pixels>>,
-    osc: OscScanner,
-    /// Set by libghostty when the program rings the bell.
-    bell: Rc<Cell<bool>>,
-    activity: Activity,
-    /// A command to type once the shell shows its first prompt.
-    pending_startup: Option<String>,
-    pane_id: u64,
     /// Secret proving a control request comes from a program in this pane.
     control_token: String,
     diff: Option<DiffStats>,
-    /// When the foreground agent started its current stretch of work.
-    working_since: Option<Instant>,
+    branch: Option<String>,
     command_started: Option<Instant>,
-    last_command: Option<CommandOutcome>,
 }
 
 /// A link in the viewport, in grid coordinates (end column exclusive).
@@ -209,51 +184,9 @@ struct SearchBar {
     _subscription: Subscription,
 }
 
-/// Process and filesystem observations collected away from the UI thread.
-#[derive(Default)]
-struct ProcessMetadata {
-    foreground: Option<i32>,
-    process: Option<String>,
-    directory: Option<PathBuf>,
-    branch: Option<String>,
-    agent: Option<Agent>,
-}
-
-impl ProcessMetadata {
-    fn read(foreground: Option<i32>, shell: Option<i32>) -> Self {
-        let directory = shell.and_then(process_info::working_directory);
-        Self {
-            foreground,
-            process: foreground.and_then(process_info::process_name),
-            branch: directory.as_deref().and_then(process_info::git_branch),
-            directory,
-            agent: foreground
-                .filter(|pid| Some(*pid) != shell)
-                .and_then(process_info::process_args)
-                .and_then(|args| agents::detect(&args)),
-        }
-    }
-}
-
-struct KeyInput {
-    encoder: key::Encoder<'static>,
-    event: key::Event<'static>,
-}
-
 struct MouseInput {
-    encoder: mouse::Encoder<'static>,
-    event: mouse::Event<'static>,
     pressed: Option<mouse::Button>,
     scroll_remainder: f32,
-}
-
-struct SelectionInput {
-    gesture: Gesture<'static>,
-    press: PressEvent<'static>,
-    release: ReleaseEvent<'static>,
-    drag: DragEvent<'static>,
-    started_at: Instant,
-    selecting: bool,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -265,165 +198,184 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
-    /// Spawn a shell and create the view that displays it.
-    /// Start a shell in `cwd`. `startup` is typed into it once it starts,
-    /// as if the user had entered it at the prompt.
+    /// Start a persistent shell in `cwd`. `startup` is typed once its prompt is ready.
     pub fn build(cwd: Option<&Path>, startup: Option<&str>, cx: &mut App) -> Result<Entity<Self>> {
-        let initial = PtyDimensions {
+        let dimensions = Dimensions {
             cols: 80,
             rows: 24,
             cell_width: 8,
             cell_height: 18,
         };
-        let pane_id = NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed);
         let mut command =
             shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
-        // Lets programs in the pane, such as the control CLI, address it.
-        command.env(PANE_ID_VARIABLE, pane_id.to_string());
         let control_token = control::new_token()?;
         command.env(control::TOKEN_VARIABLE, &control_token);
         control::configure_command(&mut command, cx);
-        let (pty, output) = Pty::spawn(command, initial, cwd)?;
-        let initial_cwd = pty.initial_cwd().map(Path::to_path_buf);
-        let dimensions = Rc::new(Cell::new(initial));
+        let launch = Launch {
+            id: runtime::new_session_id()?,
+            argv: command
+                .get_argv()
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_owned)
+                        .context("shell command contains invalid Unicode")
+                })
+                .collect::<Result<_>>()?,
+            env: command
+                .iter_full_env_as_str()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+            cwd: cwd
+                .map(Path::to_path_buf)
+                .or_else(|| command.get_cwd().map(PathBuf::from)),
+            startup: startup.map(str::to_owned),
+            dimensions,
+            colors: runtime_colors(cx),
+            control_token,
+        };
+        let view = Self::from_session(
+            SessionInfo {
+                id: launch.id,
+                cwd: launch
+                    .cwd
+                    .clone()
+                    .or_else(|| launch.env.get("HOME").map(PathBuf::from)),
+                control_token: launch.control_token.clone(),
+                ..Default::default()
+            },
+            cx,
+        )?;
+        let weak = view.downgrade();
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { runtime::create_session(launch) })
+                .await;
+            let _ = weak.update(cx, |view, cx| match result {
+                Ok(_) => {
+                    if let Some(client) = &view.client {
+                        client.refresh();
+                    }
+                }
+                Err(error) => {
+                    view.connection_error = Some(format!("Could not start session: {error:#}"));
+                    cx.emit(TerminalEvent::MetadataChanged);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        Ok(view)
+    }
 
+    /// Attach to the same session identity, including an unavailable session.
+    pub fn attach(session_id: u64, cx: &mut App) -> Result<Entity<Self>> {
+        Self::attach_in(session_id, None, cx)
+    }
+
+    pub fn attach_in(session_id: u64, cwd: Option<&Path>, cx: &mut App) -> Result<Entity<Self>> {
+        Self::from_session(
+            SessionInfo {
+                id: session_id,
+                cwd: cwd.map(Path::to_path_buf),
+                ..Default::default()
+            },
+            cx,
+        )
+    }
+
+    fn from_session(info: SessionInfo, cx: &mut App) -> Result<Entity<Self>> {
+        let dimensions = Dimensions {
+            cols: 80,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 18,
+        };
         let mut terminal = Terminal::new(Options {
-            cols: initial.cols,
-            rows: initial.rows,
-            max_scrollback: SCROLLBACK_LINES,
+            cols: dimensions.cols,
+            rows: dimensions.rows,
+            max_scrollback: 0,
         })?;
         configure_colors(&mut terminal, &cx.theme().terminal)?;
-        let bell = Rc::new(Cell::new(false));
-        register_effects(&mut terminal, &pty, dimensions.clone(), bell.clone())?;
-
         let renderer = GridRenderer::new()?;
-        let keys = KeyInput {
-            encoder: key::Encoder::new()?,
-            event: key::Event::new()?,
+        let (client, events, connection_error) = match SessionClient::attach(info.id) {
+            Ok((client, events)) => (Some(client), events, None),
+            Err(error) => {
+                let (_, events) = async_channel::bounded(1);
+                (None, events, Some(error.to_string()))
+            }
         };
-        let mouse = MouseInput {
-            encoder: mouse::Encoder::new()?,
-            event: mouse::Event::new()?,
-            pressed: None,
-            scroll_remainder: 0.,
-        };
-        let mut press = PressEvent::new()?;
-        press.set_repeat_interval(Duration::from_millis(500))?;
-        let selection = SelectionInput {
-            gesture: Gesture::new()?,
-            press,
-            release: ReleaseEvent::new()?,
-            drag: DragEvent::new()?,
-            started_at: Instant::now(),
-            selecting: false,
-        };
-
         Ok(cx.new(|cx| {
             let output_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let executor = cx.background_executor().clone();
-                let mut last_frame = Instant::now() - output::FRAME_INTERVAL;
-                let pending = output.clone();
-                output::consume(
-                    output,
-                    |batch| {
-                        this.update(cx, |view, cx| {
-                            view.process_output(batch, cx);
-                            if pending.is_empty() || last_frame.elapsed() >= output::FRAME_INTERVAL
-                            {
-                                last_frame = Instant::now();
-                                cx.notify();
-                            }
-                        })
-                        .is_ok()
-                    },
-                    || executor.timer(output::YIELD_INTERVAL),
-                )
-                .await;
-                let _ = this.update(cx, |_, cx| cx.emit(TerminalEvent::Exited));
+                while let Ok(event) = events.recv().await {
+                    if this.update(cx, |view, cx| view.receive(event, cx)).is_err() {
+                        break;
+                    }
+                }
             });
-            if startup.is_some() {
-                // Shells without prompt marks never announce a prompt.
-                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    cx.background_executor().timer(STARTUP_FALLBACK).await;
-                    let _ = this.update(cx, |view, cx| view.send_startup_command(cx));
-                })
-                .detach();
-            }
-            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let metadata_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 loop {
-                    let Ok(cwd) = this.update(cx, |view, _| view.metadata.cwd.clone()) else {
+                    let Ok(cwd) = this.update(cx, |view, _| view.info.cwd.clone()) else {
                         return;
                     };
-                    let diff = match cwd.clone() {
+                    let (diff, branch) = match cwd.clone() {
                         Some(cwd) => {
                             cx.background_executor()
-                                .spawn(async move { git::diff_stats(&cwd) })
+                                .spawn(async move {
+                                    (git::diff_stats(&cwd), process_info::git_branch(&cwd))
+                                })
                                 .await
                         }
-                        None => None,
+                        None => (None, None),
                     };
-                    let updated = this.update(cx, |view, cx| {
-                        if view.metadata.cwd == cwd && view.diff != diff {
-                            view.diff = diff;
-                            view.refresh_metadata(cx);
-                        }
-                    });
-                    if updated.is_err() {
+                    if this
+                        .update(cx, |view, cx| {
+                            if view.info.cwd == cwd {
+                                view.diff = diff;
+                                view.branch = branch;
+                                view.refresh_metadata(cx);
+                            }
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     cx.background_executor().timer(DIFF_REFRESH_INTERVAL).await;
                 }
-            })
-            .detach();
-            let metadata_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                loop {
-                    let Ok((foreground, shell)) = this.update(cx, |view, _| {
-                        (view.pty.foreground_pid(), view.pty.shell_pid())
-                    }) else {
-                        return;
-                    };
-                    let metadata = cx
-                        .background_executor()
-                        .spawn(async move { ProcessMetadata::read(foreground, shell) })
-                        .await;
-                    let refreshed = this.update(cx, |view, cx| {
-                        if view.pty.foreground_pid() == foreground {
-                            view.process_metadata = metadata;
-                            view.refresh_metadata(cx);
-                        }
-                    });
-                    if refreshed.is_err() {
-                        return;
-                    }
-                    cx.background_executor()
-                        .timer(METADATA_REFRESH_INTERVAL)
-                        .await;
-                }
             });
-
             Self {
                 terminal,
                 renderer,
-                pty,
+                display: DisplayState::default(),
+                client,
                 dimensions,
+                control_token: info.control_token.clone(),
+                connected: false,
+                connection_error,
+                input_error: None,
+                stop_requested: false,
+                mouse_tracking: false,
+                attention_serial: None,
                 focus_handle: cx.focus_handle(),
-                keys,
-                mouse,
-                selection,
+                mouse: MouseInput {
+                    pressed: None,
+                    scroll_remainder: 0.,
+                },
+                selecting: false,
                 bounds: None,
                 metrics: None,
                 metadata: TabMetadata {
                     title: FALLBACK_TITLE.into(),
-                    directory: initial_cwd
+                    directory: info
+                        .cwd
                         .as_deref()
                         .map(|path| process_info::shorten_home(path).into()),
-                    cwd: initial_cwd.clone(),
+                    cwd: info.cwd.clone(),
                     ..Default::default()
                 },
-                process_metadata: ProcessMetadata {
-                    directory: initial_cwd,
-                    ..Default::default()
-                },
+                info,
                 _output_task: output_task,
                 _metadata_task: metadata_task,
                 // Font and padding changes take effect on the next frame.
@@ -431,31 +383,184 @@ impl TerminalView {
                     view.metrics = None;
                     cx.notify();
                 }),
+                _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
+                    if view.connected {
+                        view.send(
+                            Operation::Colors {
+                                colors: runtime_colors(cx),
+                            },
+                            cx,
+                        );
+                    }
+                }),
                 search: None,
                 link_hover: None,
                 last_mouse: None,
-                osc: OscScanner::default(),
-                bell,
-                activity: Activity::default(),
-                pending_startup: startup.map(str::to_string),
-                pane_id,
-                control_token,
                 diff: None,
-                working_since: None,
+                branch: None,
                 command_started: None,
-                last_command: None,
-                _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
-                    let colors = cx.theme().terminal.clone();
-                    if let Err(error) = configure_colors(&mut view.terminal, &colors) {
-                        log::warn!("failed to apply theme: {error}");
-                    }
-                    cx.notify();
-                }),
             }
         }))
     }
 
-    /// Where the terminal was last laid out, in window coordinates.
+    pub fn session_id(&self) -> u64 {
+        self.info.id
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.info.exited
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        self.stop_requested = true;
+        if self.connected {
+            self.send(Operation::Stop, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn acknowledge_attention(&mut self, cx: &mut Context<Self>) {
+        if self.connected && self.info.attention.is_some() {
+            self.send(
+                Operation::AcknowledgeAttention {
+                    serial: self.info.attention_serial,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn send(&mut self, operation: Operation, cx: &mut Context<Self>) {
+        if let Some(client) = &self.client
+            && let Err(error) = client.send(operation)
+        {
+            self.input_error = Some(error.to_string());
+            cx.notify();
+        }
+    }
+
+    fn receive(&mut self, event: ClientEvent, cx: &mut Context<Self>) {
+        match event {
+            ClientEvent::Frame(frame) => self.apply_frame(*frame, cx),
+            ClientEvent::Text(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            ClientEvent::Matches { query, matches } => {
+                if let Some(search) = &mut self.search
+                    && search.input.read(cx).text() == query
+                {
+                    search.matches = matches
+                        .into_iter()
+                        .map(|found| SearchMatch {
+                            row: found.row,
+                            start_col: found.start_col,
+                            end_col: found.end_col,
+                        })
+                        .collect();
+                    // Start from the newest match, nearest the prompt.
+                    search.current = search.matches.len().saturating_sub(1);
+                    self.reveal_current_match(cx);
+                }
+            }
+            ClientEvent::Disconnected(error) => {
+                self.connected = false;
+                self.connection_error = Some(error);
+                cx.emit(TerminalEvent::MetadataChanged);
+            }
+            ClientEvent::Error(error) => self.input_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn apply_frame(&mut self, frame: Snapshot, cx: &mut Context<Self>) {
+        if let Err(error) = self.display.apply(&mut self.terminal, &frame) {
+            self.connection_error = Some(error.to_string());
+            return;
+        }
+        let reconnected = !self.connected;
+        if self.bounds.is_none() {
+            self.dimensions = frame.dimensions;
+        }
+        let exited = !self.info.exited && frame.info.exited;
+        let attention_changed = frame.info.attention_serial > self.attention_serial.unwrap_or(0);
+        self.attention_serial = Some(frame.info.attention_serial);
+        self.connected = true;
+        self.connection_error = None;
+        self.mouse_tracking = frame.mouse_tracking;
+        self.control_token.clone_from(&frame.info.control_token);
+        self.command_started = match frame.info.command_elapsed_ms {
+            Some(elapsed) => {
+                if self.info.command_serial == frame.info.command_serial {
+                    self.command_started
+                        .or_else(|| Instant::now().checked_sub(Duration::from_millis(elapsed)))
+                } else {
+                    Instant::now().checked_sub(Duration::from_millis(elapsed))
+                }
+            }
+            None => None,
+        };
+        self.info = frame.info;
+        if self.info.exited {
+            self.stop_requested = false;
+        }
+        self.refresh_metadata(cx);
+        if attention_changed && let Some(event) = &self.info.attention {
+            let attention = match event {
+                crate::runtime_protocol::Attention::Bell => Attention::Bell,
+                crate::runtime_protocol::Attention::Notification { title, body } => {
+                    Attention::Notification {
+                        title: title.clone(),
+                        body: body.clone(),
+                    }
+                }
+                crate::runtime_protocol::Attention::CommandFinished {
+                    exit_code,
+                    duration_ms,
+                } => Attention::CommandFinished(CommandOutcome {
+                    exit_code: *exit_code,
+                    duration: Duration::from_millis(*duration_ms),
+                }),
+                crate::runtime_protocol::Attention::AgentWaiting { needs_input, .. } => {
+                    match self.metadata.agent {
+                        Some(state) => Attention::AgentWaiting {
+                            agent: state.agent,
+                            needs_input: *needs_input,
+                        },
+                        None => return,
+                    }
+                }
+            };
+            cx.emit(TerminalEvent::Attention(attention));
+        }
+        if exited {
+            cx.emit(TerminalEvent::Exited);
+        }
+        if reconnected || exited {
+            cx.emit(TerminalEvent::MetadataChanged);
+        }
+        if reconnected {
+            if self.stop_requested {
+                self.send(Operation::Stop, cx);
+            }
+            if self.bounds.is_some() {
+                self.send(
+                    Operation::Resize {
+                        dimensions: self.dimensions,
+                    },
+                    cx,
+                );
+            }
+            self.send(
+                Operation::Colors {
+                    colors: runtime_colors(cx),
+                },
+                cx,
+            );
+        }
+    }
+
     /// Whether `token` is this pane's control token, compared in constant
     /// time.
     pub fn has_control_token(&self, token: &str) -> bool {
@@ -469,25 +574,23 @@ impl TerminalView {
                 == 0
     }
 
-    /// Identifies this pane to the control API for the app's lifetime.
+    /// Identifies the persistent session to the control API.
     pub fn pane_id(&self) -> u64 {
-        self.pane_id
-    }
-
-    /// The last `lines` non-empty lines of the screen and scrollback.
-    pub fn recent_text(&self, lines: usize) -> String {
-        let text = search::screen_text(&self.terminal).unwrap_or_default();
-        let kept: Vec<&str> = text
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| !line.is_empty())
-            .collect();
-        kept[kept.len().saturating_sub(lines)..].join("\n")
+        self.info.id
     }
 
     /// Type `text` into the pane as if the user had.
-    pub fn send_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.write_input(text.as_bytes(), cx);
+    pub fn send_text(&mut self, text: &str, _cx: &mut Context<Self>) -> Result<()> {
+        anyhow::ensure!(
+            self.connected && !self.info.exited,
+            "session is not accepting input"
+        );
+        self.client
+            .as_ref()
+            .context("session is unavailable")?
+            .send(Operation::Input {
+                bytes: text.as_bytes().to_vec(),
+            })
     }
 
     pub fn bounds(&self) -> Option<Bounds<Pixels>> {
@@ -496,7 +599,7 @@ impl TerminalView {
 
     /// Current grid size as (columns, rows).
     pub fn grid_size(&self) -> (u16, u16) {
-        let dimensions = self.dimensions.get();
+        let dimensions = self.dimensions;
         (dimensions.cols, dimensions.rows)
     }
 
@@ -504,178 +607,70 @@ impl TerminalView {
         &self.metadata
     }
 
-    fn process_output(&mut self, chunks: &mut output::OutputBatch<'_>, cx: &mut Context<Self>) {
-        let mut command_changed = false;
-        for chunk in chunks {
-            for event in self.osc.scan(&chunk) {
-                command_changed |= self.apply_osc_event(event, cx);
-            }
-            self.terminal.vt_write(&chunk);
-        }
-        self.activity.output(Instant::now());
-        if self.bell.replace(false) {
-            self.activity.attention();
-            cx.emit(TerminalEvent::Attention(Attention::Bell));
-        }
-        if command_changed {
-            self.refresh_metadata(cx);
-        }
-    }
-
-    /// Returns whether the command state changed.
-    fn apply_osc_event(&mut self, event: OscEvent, cx: &mut Context<Self>) -> bool {
-        match event {
-            OscEvent::PromptStarted => {
-                self.send_startup_command(cx);
-                false
-            }
-            OscEvent::CommandStarted => {
-                self.command_started = Some(Instant::now());
-                true
-            }
-            OscEvent::CommandFinished(exit_code) => {
-                // A finish without a start (e.g. the first prompt) has no
-                // command to report.
-                let Some(started) = self.command_started.take() else {
-                    return false;
-                };
-                let outcome = CommandOutcome {
-                    exit_code,
-                    duration: started.elapsed(),
-                };
-                self.last_command = Some(outcome);
-                cx.emit(TerminalEvent::Attention(Attention::CommandFinished(
-                    outcome,
-                )));
-                true
-            }
-            OscEvent::Notify { title, body } => {
-                self.activity.attention();
-                cx.emit(TerminalEvent::Attention(Attention::Notification {
-                    title,
-                    body,
-                }));
-                false
-            }
-        }
-    }
-
-    /// Type the startup command into the shell. This waits for the first
-    /// prompt because startup files that query the terminal consume any
-    /// input typed before they finish.
-    fn send_startup_command(&mut self, cx: &mut Context<Self>) {
-        if let Some(command) = self.pending_startup.take() {
-            self.write_input(format!("{command}\n").as_bytes(), cx);
-        }
-    }
-
-    /// Screen rows where a shell prompt begins, oldest first.
-    fn prompt_rows(&self) -> Vec<u32> {
-        let total = self.terminal.total_rows().unwrap_or(0) as u32;
-        (0..total)
-            .filter(|row| {
-                self.terminal
-                    .grid_ref(Point::Screen(PointCoordinate { x: 0, y: *row }))
-                    .and_then(|grid_ref| grid_ref.row())
-                    .and_then(|row| row.semantic_prompt())
-                    .is_ok_and(|prompt| prompt == RowSemanticPrompt::Prompt)
-            })
-            .collect()
-    }
-
-    fn jump_to_prompt(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Ok(scrollbar) = self.terminal.scrollbar() else {
-            return;
-        };
-        let top = scrollbar.offset as u32;
-        let prompts = self.prompt_rows();
-        let target = if forward {
-            prompts.into_iter().find(|row| *row > top)
-        } else {
-            prompts.into_iter().rev().find(|row| *row < top)
-        };
-        match target {
-            Some(row) => self
-                .terminal
-                .scroll_viewport(ScrollViewport::Row(row as usize)),
-            None if forward => self.terminal.scroll_viewport(ScrollViewport::Bottom),
-            None => return,
-        }
-        cx.notify();
-    }
-
     fn previous_prompt(&mut self, _: &PreviousPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_to_prompt(false, cx);
+        self.send(Operation::Prompt { forward: false }, cx);
     }
 
     fn next_prompt(&mut self, _: &NextPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        self.jump_to_prompt(true, cx);
+        self.send(Operation::Prompt { forward: true }, cx);
     }
 
     fn refresh_metadata(&mut self, cx: &mut Context<Self>) {
         let metadata = self.read_metadata();
-        self.track_agent_work(metadata.agent, cx);
         if metadata != self.metadata {
             self.metadata = metadata;
             cx.emit(TerminalEvent::MetadataChanged);
         }
     }
 
-    /// Announce when an agent that worked for a while stops producing
-    /// output, which means it finished or is waiting on the user.
-    fn track_agent_work(&mut self, agent: Option<AgentState>, cx: &mut Context<Self>) {
-        match agent {
-            Some(state) if state.status == AgentStatus::Working => {
-                self.working_since.get_or_insert_with(Instant::now);
-            }
-            Some(state) => {
-                if let Some(since) = self.working_since.take()
-                    && since.elapsed() >= AGENT_MIN_WORK
-                {
-                    cx.emit(TerminalEvent::Attention(Attention::AgentWaiting {
-                        agent: state.agent,
-                        needs_input: state.status == AgentStatus::NeedsInput,
-                    }));
-                }
-            }
-            None => self.working_since = None,
-        }
-    }
-
     fn read_metadata(&self) -> TabMetadata {
-        let foreground = self.process_metadata.foreground;
-        let process = self.process_metadata.process.clone();
-        let running = foreground.is_some() && foreground != self.pty.shell_pid();
-        let program_title = self.terminal.title().unwrap_or_default().trim().to_string();
-        let title = if program_title.is_empty() {
-            process
-                .clone()
-                .unwrap_or_else(|| FALLBACK_TITLE.to_string())
+        let info = &self.info;
+        let title = if info.title.is_empty() {
+            info.process.as_deref().unwrap_or(FALLBACK_TITLE)
         } else {
-            program_title
+            &info.title
         };
-
-        // Ask the kernel rather than trusting OSC 7: any program writing to
-        // the terminal can emit that sequence and claim an arbitrary path,
-        // which new tabs, splits, and session restore would then open.
-        let directory = self.process_metadata.directory.clone();
-        let branch = self.process_metadata.branch.clone();
-
+        // The runtime asks the kernel rather than trusting OSC 7: programs
+        // must not choose the paths used by new tabs, splits, or session restore.
         TabMetadata {
-            title: title.into(),
-            directory: directory
+            title: title.to_owned().into(),
+            directory: info
+                .cwd
                 .as_deref()
                 .map(|path| process_info::shorten_home(path).into()),
-            cwd: directory,
-            branch: branch.map(Into::into),
-            process: process.map(Into::into),
-            running,
+            cwd: info.cwd.clone(),
+            branch: self.branch.clone().map(Into::into),
+            process: info.process.clone().map(Into::into),
+            running: !info.exited
+                && info.foreground_pid.is_some()
+                && info.foreground_pid != info.shell_pid,
             command_started: self.command_started,
-            last_command: self.last_command,
+            last_command: info
+                .last_command_duration_ms
+                .map(|duration| CommandOutcome {
+                    exit_code: info.last_command_exit,
+                    duration: Duration::from_millis(duration),
+                }),
             diff: self.diff,
-            agent: self.process_metadata.agent.map(|agent| AgentState {
+            agent: [
+                Agent::ClaudeCode,
+                Agent::Codex,
+                Agent::Gemini,
+                Agent::Aider,
+                Agent::OpenCode,
+                Agent::Amp,
+                Agent::Cursor,
+                Agent::Goose,
+            ]
+            .into_iter()
+            .find(|agent| Some(agent.name()) == info.agent.as_deref())
+            .map(|agent| AgentState {
                 agent,
-                status: self.activity.status(Instant::now()),
+                status: match info.status.as_str() {
+                    "working" => AgentStatus::Working,
+                    "needs_input" => AgentStatus::NeedsInput,
+                    _ => AgentStatus::Idle,
+                },
             }),
         }
     }
@@ -689,38 +684,19 @@ impl TerminalView {
     ) {
         self.bounds = Some(bounds);
         let (cols, rows) = metrics.grid_size(bounds);
-        let next = PtyDimensions {
+        let next = Dimensions {
             cols,
             rows,
             cell_width: f32::from(metrics.width).round() as u16,
             cell_height: f32::from(metrics.height).round() as u16,
         };
-        if next == self.dimensions.get() {
+        if next == self.dimensions {
             return;
         }
-        if let Err(error) = self.terminal.resize(
-            next.cols,
-            next.rows,
-            next.cell_width as u32,
-            next.cell_height as u32,
-        ) {
-            log::warn!("failed to resize terminal: {error}");
-            return;
+        self.dimensions = next;
+        if self.connected {
+            self.send(Operation::Resize { dimensions: next }, cx);
         }
-        self.dimensions.set(next);
-        self.pty.resize(next);
-        cx.notify();
-    }
-
-    fn write_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.terminal.scroll_viewport(ScrollViewport::Bottom);
-        let _ = self.terminal.set_selection(None);
-        self.activity.user_input(Instant::now());
-        self.pty.write(bytes);
-        cx.notify();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -734,8 +710,7 @@ impl TerminalView {
         } else {
             key::Action::Press
         };
-        let bytes = self.encode_key(&event.keystroke, action);
-        self.write_input(&bytes, cx);
+        self.send_key(&event.keystroke, action, cx);
         cx.stop_propagation();
     }
 
@@ -743,47 +718,34 @@ impl TerminalView {
         if event.keystroke.modifiers.platform || !self.focus_handle.is_focused(window) {
             return;
         }
-        // Release events only produce output when the Kitty keyboard
-        // protocol asks for them, so this is usually empty.
-        let bytes = self.encode_key(&event.keystroke, key::Action::Release);
-        if !bytes.is_empty() {
-            self.pty.write(&bytes);
-        }
+        // The runtime encodes releases only when the terminal protocol requests them.
+        self.send_key(&event.keystroke, key::Action::Release, cx);
         cx.stop_propagation();
     }
 
-    fn encode_key(&mut self, keystroke: &gpui::Keystroke, action: key::Action) -> Vec<u8> {
+    fn send_key(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        action: key::Action,
+        cx: &mut Context<Self>,
+    ) {
         let translated = translate_keystroke(keystroke);
-        let text = match action {
-            key::Action::Release => None,
-            _ => translated.text.clone(),
+        let text = if action == key::Action::Release {
+            None
+        } else {
+            translated.text
         };
-        self.keys
-            .event
-            .set_action(action)
-            .set_key(translated.key)
-            .set_mods(translated.mods)
-            .set_consumed_mods(translated.consumed_mods)
-            .set_unshifted_codepoint(translated.unshifted)
-            .set_utf8(text.clone());
-
-        let mut bytes = Vec::with_capacity(16);
-        if let Err(error) = self
-            .keys
-            .encoder
-            .set_options_from_terminal(&self.terminal)
-            .encode_to_vec(&self.keys.event, &mut bytes)
-        {
-            log::warn!("failed to encode key: {error}");
-        }
-        // Keys the encoder has no mapping for (non-US layouts, dead keys)
-        // still carry text the shell should receive.
-        if bytes.is_empty()
-            && let Some(text) = text
-        {
-            bytes.extend_from_slice(text.as_bytes());
-        }
-        bytes
+        self.send(
+            Operation::Key {
+                key: translated.key as u32,
+                action: action as u32,
+                mods: translated.mods.bits(),
+                consumed_mods: translated.consumed_mods.bits(),
+                unshifted: translated.unshifted,
+                text,
+            },
+            cx,
+        );
     }
 
     fn on_modifiers_changed(
@@ -819,7 +781,7 @@ impl TerminalView {
             return None;
         };
         let row = y as u16;
-        let cols = self.dimensions.get().cols;
+        let cols = self.dimensions.cols;
         let cell = |col: u16| {
             self.terminal
                 .grid_ref(Point::Viewport(PointCoordinate { x: col, y }))
@@ -914,7 +876,7 @@ impl TerminalView {
 
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.take().is_some() {
-            let _ = self.terminal.set_selection(None);
+            self.send(Operation::ClearSelection, cx);
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
@@ -925,16 +887,11 @@ impl TerminalView {
             return;
         };
         let query = search.input.read(cx).text().to_string();
-        search.matches = match search::screen_text(&self.terminal) {
-            Ok(text) => search::find_matches(&text, &query),
-            Err(error) => {
-                log::warn!("failed to read terminal text: {error}");
-                Vec::new()
-            }
-        };
-        // Start from the newest match, nearest the prompt.
-        search.current = search.matches.len().saturating_sub(1);
-        self.reveal_current_match(cx);
+        search.matches.clear();
+        search.current = 0;
+        self.send(Operation::ClearSelection, cx);
+        self.send(Operation::Search { query }, cx);
+        cx.notify();
     }
 
     fn step_match(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -964,28 +921,20 @@ impl TerminalView {
             .as_ref()
             .and_then(|search| search.matches.get(search.current).copied());
         let Some(found) = found else {
-            let _ = self.terminal.set_selection(None);
+            self.send(Operation::ClearSelection, cx);
             cx.notify();
             return;
         };
-        let start = self.terminal.grid_ref(Point::Screen(PointCoordinate {
-            x: found.start_col,
-            y: found.row,
-        }));
-        let end = self.terminal.grid_ref(Point::Screen(PointCoordinate {
-            x: found.end_col.saturating_sub(1),
-            y: found.row,
-        }));
-        if let (Ok(start), Ok(end)) = (start, end) {
-            let _ = self
-                .terminal
-                .set_selection(Some(&Selection::new(start, end, false)));
-        }
-        let rows = self.dimensions.get().rows as u32;
-        self.terminal.scroll_viewport(ScrollViewport::Row(
-            found.row.saturating_sub(rows / 2) as usize
-        ));
-        cx.notify();
+        self.send(
+            Operation::SelectMatch {
+                found: crate::runtime_protocol::Match {
+                    row: found.row,
+                    start_col: found.start_col,
+                    end_col: found.end_col,
+                },
+            },
+            cx,
+        );
     }
 
     /// The real destination of the hovered link, so text that merely looks
@@ -1002,7 +951,7 @@ impl TerminalView {
             LinkTarget::Path(path) => process_info::shorten_home(path),
         };
         let left = metrics.padding + metrics.width * link.start_col as f32;
-        let rows = self.dimensions.get().rows;
+        let rows = self.dimensions.rows;
         // Below the link, or above it on the bottom rows.
         let top = if link.row + 3 < rows {
             metrics.padding + metrics.height * (link.row + 1) as f32 + px(4.)
@@ -1096,41 +1045,17 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
-        let options = FormatOptions::new()
-            .with_emit_format(Format::Plain)
-            .with_trim(true)
-            .with_unwrap(true);
-        match self.terminal.format_selection_alloc(None, options) {
-            Ok(Some(bytes)) => {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
-            Ok(None) => {}
-            Err(error) => log::warn!("failed to copy selection: {error}"),
-        }
+        self.send(Operation::Copy, cx);
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
-        };
-        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
-        let mut data = text.into_bytes();
-        let mut encoded = vec![0u8; data.len() + 32];
-        match paste::encode(&mut data, bracketed, &mut encoded) {
-            Ok(len) => {
-                encoded.truncate(len);
-                self.write_input(&encoded, cx);
-            }
-            Err(error) => log::warn!("failed to encode paste: {error}"),
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.send(Operation::Paste { text }, cx);
         }
     }
 
     fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(selection) = self.terminal.select_all() {
-            let _ = self.terminal.set_selection(selection.as_ref());
-            cx.notify();
-        }
+        self.send(Operation::SelectAll, cx);
     }
 
     fn clear_scrollback(
@@ -1139,9 +1064,7 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Erase scrollback (CSI 3 J), then ask the shell to redraw its prompt.
-        self.terminal.vt_write(b"\x1b[3J");
-        self.write_input(b"\x0c", cx);
+        self.send(Operation::ClearScrollback, cx);
     }
 
     fn on_mouse_down(
@@ -1166,29 +1089,23 @@ impl TerminalView {
         }
 
         if event.button == MouseButton::Left && self.selection_allowed(&event.modifiers) {
-            self.selection.selecting = true;
-            let point = self.viewport_point(local);
-            let Ok(grid_ref) = self.terminal.grid_ref(point) else {
+            self.selecting = true;
+            let Point::Viewport(point) = self.viewport_point(local) else {
                 return;
             };
             let Some(metrics) = self.metrics else {
                 return;
             };
-            let result = self
-                .selection
-                .press
-                .set_repeat_distance(f32::from(metrics.width).into())
-                .and_then(|press| press.set_time(self.selection.started_at.elapsed()))
-                .and_then(|press| {
-                    press.set_position(f32::from(local.x).into(), f32::from(local.y).into())
-                })
-                .and_then(|press| {
-                    press.apply(&mut self.selection.gesture, &self.terminal, grid_ref)
-                });
-            if let Ok(selection) = result {
-                let _ = self.terminal.set_selection(selection.as_ref());
-            }
-            cx.notify();
+            self.send(
+                Operation::SelectionPress {
+                    col: point.x,
+                    row: point.y,
+                    x: f32::from(local.x).into(),
+                    y: f32::from(local.y).into(),
+                    cell_width: f32::from(metrics.width).into(),
+                },
+                cx,
+            );
             return;
         }
 
@@ -1205,14 +1122,17 @@ impl TerminalView {
         };
         let local = event.position - bounds.origin;
 
-        if event.button == MouseButton::Left && self.selection.selecting {
-            self.selection.selecting = false;
-            let grid_ref = self.terminal.grid_ref(self.viewport_point(local)).ok();
-            let _ =
-                self.selection
-                    .release
-                    .apply(&mut self.selection.gesture, &self.terminal, grid_ref);
-            cx.notify();
+        if event.button == MouseButton::Left && self.selecting {
+            self.selecting = false;
+            if let Point::Viewport(point) = self.viewport_point(local) {
+                self.send(
+                    Operation::SelectionRelease {
+                        col: point.x,
+                        row: point.y,
+                    },
+                    cx,
+                );
+            }
             return;
         }
 
@@ -1242,42 +1162,30 @@ impl TerminalView {
         self.last_mouse = Some(local);
         self.update_link_hover(event.modifiers.platform, cx);
 
-        if self.selection.selecting {
+        if self.selecting {
             let Some(metrics) = self.metrics else {
                 return;
             };
-            let Ok(grid_ref) = self.terminal.grid_ref(self.viewport_point(local)) else {
+            let Point::Viewport(point) = self.viewport_point(local) else {
                 return;
             };
-            let geometry = Geometry {
-                columns: self.dimensions.get().cols.into(),
-                cell_width: f32::from(metrics.width) as u32,
-                padding_left: f32::from(metrics.padding) as u32,
-                screen_height: f32::from(bounds.size.height) as u32,
-            };
-            let result = self
-                .selection
-                .drag
-                .set_rectangle(event.modifiers.alt)
-                .and_then(|drag| {
-                    drag.set_position(f32::from(local.x).into(), f32::from(local.y).into())
-                })
-                .and_then(|drag| {
-                    drag.apply(
-                        &mut self.selection.gesture,
-                        &self.terminal,
-                        grid_ref,
-                        geometry,
-                    )
-                });
-            if let Ok(selection) = result {
-                let _ = self.terminal.set_selection(selection.as_ref());
-            }
-            cx.notify();
+            self.send(
+                Operation::SelectionDrag {
+                    col: point.x,
+                    row: point.y,
+                    x: f32::from(local.x).into(),
+                    y: f32::from(local.y).into(),
+                    rectangle: event.modifiers.alt,
+                    cell_width: f32::from(metrics.width) as u32,
+                    padding: f32::from(metrics.padding) as u32,
+                    height: f32::from(bounds.size.height) as u32,
+                },
+                cx,
+            );
             return;
         }
 
-        if self.terminal.is_mouse_tracking().unwrap_or(false) {
+        if self.mouse_tracking {
             let button = self.mouse.pressed;
             self.send_mouse(
                 mouse::Action::Motion,
@@ -1310,7 +1218,7 @@ impl TerminalView {
         }
         let steps = whole.abs() as usize;
 
-        if self.terminal.is_mouse_tracking().unwrap_or(false) {
+        if self.mouse_tracking {
             let Some(bounds) = self.bounds else {
                 return;
             };
@@ -1328,25 +1236,12 @@ impl TerminalView {
             return;
         }
 
-        // Full-screen programs without mouse support (less, man) scroll with
-        // arrow keys when alternate scroll mode is on.
-        let alternate_screen = self.terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
-            || self.terminal.mode(Mode::ALT_SCREEN).unwrap_or(false);
-        if alternate_screen && self.terminal.mode(Mode::ALT_SCROLL).unwrap_or(false) {
-            let cursor_app = self.terminal.mode(Mode::DECCKM).unwrap_or(false);
-            let arrow: &[u8] = match (whole > 0., cursor_app) {
-                (true, true) => b"\x1bOA",
-                (true, false) => b"\x1b[A",
-                (false, true) => b"\x1bOB",
-                (false, false) => b"\x1b[B",
-            };
-            self.pty.write(&arrow.repeat(steps));
-            return;
-        }
-
-        self.terminal
-            .scroll_viewport(ScrollViewport::Delta(-(whole as isize)));
-        cx.notify();
+        self.send(
+            Operation::Scroll {
+                delta: -(whole as isize),
+            },
+            cx,
+        );
     }
 
     fn send_mouse(
@@ -1355,56 +1250,38 @@ impl TerminalView {
         button: Option<mouse::Button>,
         local: gpui::Point<Pixels>,
         mods: key::Mods,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let (Some(bounds), Some(metrics)) = (self.bounds, self.metrics) else {
             return;
         };
-        let padding = f32::from(metrics.padding) as u32;
-        self.mouse
-            .event
-            .set_action(action)
-            .set_button(button)
-            .set_mods(mods)
-            .set_position(mouse::Position {
+        self.send(
+            Operation::Mouse {
+                action: action as u32,
+                button: button.map(|button| button as u32),
+                mods: mods.bits(),
                 x: f32::from(local.x),
                 y: f32::from(local.y),
-            });
-        let mut bytes = Vec::with_capacity(16);
-        let result = self
-            .mouse
-            .encoder
-            .set_options_from_terminal(&self.terminal)
-            .set_size(mouse::EncoderSize {
-                screen_width: f32::from(bounds.size.width) as u32,
-                screen_height: f32::from(bounds.size.height) as u32,
-                cell_width: f32::from(metrics.width) as u32,
-                cell_height: f32::from(metrics.height) as u32,
-                padding_top: padding,
-                padding_bottom: padding,
-                padding_left: padding,
-                padding_right: padding,
-            })
-            .set_any_button_pressed(self.mouse.pressed.is_some())
-            .set_track_last_cell(true)
-            .encode_to_vec(&self.mouse.event, &mut bytes);
-        if let Err(error) = result {
-            log::warn!("failed to encode mouse event: {error}");
-        }
-        self.pty.write(&bytes);
+                width: f32::from(bounds.size.width) as u32,
+                height: f32::from(bounds.size.height) as u32,
+                padding: f32::from(metrics.padding) as u32,
+                pressed: self.mouse.pressed.is_some(),
+            },
+            cx,
+        );
     }
 
     /// Holding shift lets the user select text even when a program has
     /// taken over the mouse.
     fn selection_allowed(&self, modifiers: &Modifiers) -> bool {
-        !self.terminal.is_mouse_tracking().unwrap_or(false) || modifiers.shift
+        !self.mouse_tracking || modifiers.shift
     }
 
     fn viewport_point(&self, local: gpui::Point<Pixels>) -> Point {
         let Some(metrics) = self.metrics else {
             return Point::Viewport(PointCoordinate { x: 0, y: 0 });
         };
-        let dimensions = self.dimensions.get();
+        let dimensions = self.dimensions;
         let x = (f32::from(local.x - metrics.padding) / f32::from(metrics.width))
             .clamp(0., dimensions.cols.saturating_sub(1) as f32) as u16;
         let y = (f32::from(local.y - metrics.padding) / f32::from(metrics.height))
@@ -1488,6 +1365,50 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .when(
+                !self.connected
+                    || self.info.exited
+                    || self.connection_error.is_some()
+                    || self.input_error.is_some()
+                    || self.stop_requested,
+                |view| {
+                    let message = if let Some(error) = &self.input_error {
+                        format!("{error} · Click to dismiss")
+                    } else if let Some(error) = &self.connection_error {
+                        format!("Session unavailable · {error}")
+                    } else if self.stop_requested {
+                        "Stopping session…".to_owned()
+                    } else if self.info.exited {
+                        self.info.exit_code.map_or_else(
+                            || "Session finished".to_owned(),
+                            |code| format!("Session finished · exit {code}"),
+                        )
+                    } else {
+                        "Connecting to session…".to_owned()
+                    };
+                    view.child(
+                        div()
+                            .absolute()
+                            .bottom(px(8.))
+                            .left(px(8.))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(5.))
+                            .bg(cx.theme().elevated_surface)
+                            .text_color(cx.theme().text_muted)
+                            .text_size(px(12.))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| {
+                                    view.input_error = None;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(message),
+                    )
+                },
+            )
             .children(search_bar)
             .children(link_tooltip)
     }
@@ -1519,57 +1440,17 @@ fn configure_colors(
     Ok(())
 }
 
-/// Install the callbacks libghostty uses to answer queries from programs
-/// (device attributes, size reports, ...). Without them vim and tmux stall
-/// waiting for replies during startup.
-fn register_effects(
-    terminal: &mut Terminal<'static, 'static>,
-    pty: &Pty,
-    dimensions: Rc<Cell<PtyDimensions>>,
-    bell: Rc<Cell<bool>>,
-) -> Result<()> {
-    let replies = pty.input_sender();
-    terminal
-        .on_bell(move |_terminal| bell.set(true))?
-        .on_pty_write(move |_terminal, data| {
-            let _ = replies.send(data.to_vec());
-        })?
-        .on_size(move |_terminal| {
-            let current = dimensions.get();
-            Some(SizeReportSize {
-                rows: current.rows,
-                columns: current.cols,
-                cell_width: current.cell_width as u32,
-                cell_height: current.cell_height as u32,
-            })
-        })?
-        .on_device_attributes(|_terminal| {
-            Some(DeviceAttributes {
-                primary: PrimaryDeviceAttributes::new(
-                    ConformanceLevel::VT220,
-                    &[
-                        DeviceAttributeFeature::COLUMNS_132,
-                        DeviceAttributeFeature::SELECTIVE_ERASE,
-                        DeviceAttributeFeature::ANSI_COLOR,
-                    ],
-                ),
-                secondary: SecondaryDeviceAttributes {
-                    device_type: DeviceType::VT220,
-                    firmware_version: 1,
-                    rom_cartridge: 0,
-                },
-                tertiary: Default::default(),
-            })
-        })?
-        .on_xtversion(|_terminal| {
-            Some(concat!(
-                env!("CARGO_PKG_NAME"),
-                " ",
-                env!("CARGO_PKG_VERSION")
-            ))
-        })?
-        .on_color_scheme(|_terminal| Some(ColorScheme::Dark))?;
-    Ok(())
+fn runtime_colors(cx: &App) -> Colors {
+    let theme = cx.theme();
+    let colors = &theme.terminal;
+    let rgb = |color: libghostty_vt::style::RgbColor| [color.r, color.g, color.b];
+    Colors {
+        foreground: rgb(colors.foreground),
+        background: rgb(colors.background),
+        cursor: rgb(colors.cursor),
+        palette: colors.ansi.map(rgb),
+        dark: theme.appearance == theme::Appearance::Dark,
+    }
 }
 
 fn to_mouse_button(button: MouseButton) -> Option<mouse::Button> {

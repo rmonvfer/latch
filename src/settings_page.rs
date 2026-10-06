@@ -959,8 +959,8 @@ impl Render for SettingsPage {
                     )
                     .child(
                         setting_row(
-                            "Confirm Close",
-                            "Ask before closing a pane, tab, or window with a program still running.",
+                            "Confirm Stop",
+                            "Ask before stopping sessions with a program still running. Closing a view keeps it running.",
                             &theme,
                         )
                         .child(switch(

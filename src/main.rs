@@ -18,6 +18,10 @@ mod pane_group;
 mod pane_tree;
 mod process_info;
 mod pty;
+mod runtime;
+mod runtime_display;
+mod runtime_engine;
+mod runtime_protocol;
 mod search;
 mod session;
 mod settings;
@@ -43,8 +47,8 @@ use crate::{
     settings::SettingsStore,
     terminal_view::{ClearScrollback, Copy, Paste, SelectAll},
     workspace::{
-        ActivateTab, CloseTab, CloseWindow, NewTab, NextTab, OpenSettings, PreviousTab, Quit,
-        RenameTab, ToggleSidebar, Workspace,
+        ActivateTab, CloseTab, CloseWindow, NewTab, NextAttention, NextTab, OpenSettings,
+        PreviousTab, Quit, RenameTab, ToggleSidebar, Workspace,
     },
 };
 
@@ -53,6 +57,17 @@ const APP_IDENTIFIER: &str = "me.egrati.terminal";
 const APP_NAME: &str = "Terminal";
 
 fn main() {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--session-runtime")
+    {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+        if let Err(error) = runtime::serve() {
+            log::error!("session runtime: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // With arguments, act as the command-line client for a running app.
     if let Some(code) = cli::run_from_args() {
         std::process::exit(code);
@@ -135,6 +150,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, Some("Workspace")),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Workspace")),
         KeyBinding::new("cmd-b", ToggleSidebar, Some("Workspace")),
+        KeyBinding::new("cmd-shift-j", NextAttention, Some("Workspace")),
         KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("f2", RenameTab, Some("Workspace")),
         KeyBinding::new("cmd-9", ActivateTab(usize::MAX), Some("Workspace")),

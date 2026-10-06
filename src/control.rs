@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use crate::{
     agent_badge, notifications,
     pane_tree::Axis,
-    process_info,
+    process_info, runtime,
     settings::SettingsStore,
     tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
@@ -310,7 +310,18 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
                     })
                 })
                 .unwrap_or_else(|_| Err("the window is closed".to_string()));
-            let _ = reply.send(result);
+            match result {
+                Ok(ControlResponse::Read { session, lines }) => {
+                    cx.background_executor().spawn(async move {
+                        let result = runtime::read_session(session, lines)
+                            .map(|text| json!({ "text": text }))
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }).detach();
+                }
+                Ok(ControlResponse::Value(value)) => { let _ = reply.send(Ok(value)); }
+                Err(error) => { let _ = reply.send(Err(error)); }
+            }
         }
     })
     .detach();
@@ -533,6 +544,11 @@ pub fn call(request: Request) -> Result<Value> {
     ControlClient::connect()?.request(request)
 }
 
+pub(crate) enum ControlResponse {
+    Value(Value),
+    Read { session: u64, lines: usize },
+}
+
 impl Workspace {
     /// Identify a caller by its pane token. Without a valid token the
     /// caller is only this connection, described by the name the OS
@@ -577,8 +593,8 @@ impl Workspace {
         request: Request,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
-        match request {
+    ) -> Result<ControlResponse, String> {
+        let result = match request {
             Request::ListTabs => Ok(self.describe_tabs(cx)),
             Request::NewTab(new_tab) => self.control_new_tab(new_tab, window, cx),
             Request::FocusTab { tab } => {
@@ -598,13 +614,16 @@ impl Workspace {
             }
             Request::SendInput { target, text } => {
                 let (_, view) = self.resolve_pane(&target, cx)?;
-                view.update(cx, |view, cx| view.send_text(&text, cx));
+                view.update(cx, |view, cx| view.send_text(&text, cx))
+                    .map_err(|error| error.to_string())?;
                 Ok(json!({}))
             }
             Request::ReadOutput { target, lines } => {
                 let (_, view) = self.resolve_pane(&target, cx)?;
-                let text = view.read(cx).recent_text(lines.clamp(1, MAX_READ_LINES));
-                Ok(json!({ "text": text }))
+                return Ok(ControlResponse::Read {
+                    session: view.read(cx).session_id(),
+                    lines: lines.clamp(1, MAX_READ_LINES),
+                });
             }
             Request::Split {
                 target,
@@ -643,7 +662,8 @@ impl Workspace {
                 notifications::show(tab, tab_title, body, cx);
                 Ok(json!({}))
             }
-        }
+        };
+        result.map(ControlResponse::Value)
     }
 
     fn find_tab(&self, id: u64) -> Result<TabId, String> {

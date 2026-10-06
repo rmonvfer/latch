@@ -1,21 +1,28 @@
-//! Cooperative delivery of terminal output to the foreground thread.
+//! Bounded output parsing so a busy session still services its control queue.
 
 use std::time::{Duration, Instant};
 
 use async_channel::Receiver;
 
 /// Both limits apply between parser calls; one read is the smallest work unit.
-const SLICE_BYTES: usize = 64 * 1024;
+const SLICE_BYTES: usize = 256 * 1024;
 const SLICE_TIME: Duration = Duration::from_millis(2);
-pub const YIELD_INTERVAL: Duration = Duration::from_millis(1);
-pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// A bounded amount of queued output, consumed without changing byte order.
 pub struct OutputBatch<'a> {
-    first: Option<Vec<u8>>,
     receiver: &'a Receiver<Vec<u8>>,
     started: Instant,
     bytes: usize,
+}
+
+impl<'a> OutputBatch<'a> {
+    pub fn new(receiver: &'a Receiver<Vec<u8>>) -> Self {
+        Self {
+            receiver,
+            started: Instant::now(),
+            bytes: 0,
+        }
+    }
 }
 
 impl Iterator for OutputBatch<'_> {
@@ -25,114 +32,54 @@ impl Iterator for OutputBatch<'_> {
         if self.bytes >= SLICE_BYTES || (self.bytes > 0 && self.started.elapsed() >= SLICE_TIME) {
             return None;
         }
-        let chunk = self
-            .first
-            .take()
-            .or_else(|| self.receiver.try_recv().ok())?;
+        let chunk = self.receiver.try_recv().ok()?;
         self.bytes += chunk.len();
         Some(chunk)
-    }
-}
-
-/// Every batch yields even when the next receive could complete immediately.
-/// `process` returns false when the session has been removed.
-pub async fn consume<F, P, W>(receiver: Receiver<Vec<u8>>, mut process: F, mut pause: P)
-where
-    F: FnMut(&mut OutputBatch<'_>) -> bool,
-    P: FnMut() -> W,
-    W: Future<Output = ()>,
-{
-    while let Ok(first) = receiver.recv().await {
-        let mut batch = OutputBatch {
-            first: Some(first),
-            receiver: &receiver,
-            started: Instant::now(),
-            bytes: 0,
-        };
-        if !process(&mut batch) {
-            return;
-        }
-        pause().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        cell::Cell,
-        pin::Pin,
-        task::{Context, Poll, Waker},
-        thread,
-    };
+    use std::thread;
 
     use libghostty_vt::{Terminal, terminal::Options};
 
-    use crate::{osc::OscScanner, pty::OUTPUT_CHUNK_BYTES, search};
-
-    #[derive(Default)]
-    struct YieldOnce(bool);
-
-    impl Future for YieldOnce {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
+    use crate::{
+        osc::OscScanner,
+        pty::{OUTPUT_CHUNK_BYTES, OUTPUT_QUEUE_CAPACITY},
+        search,
+    };
 
     #[test]
-    fn continuous_output_yields_and_preserves_order() {
-        let (sender, receiver) = async_channel::bounded(64);
+    fn continuous_output_is_bounded_and_preserves_order() {
         let total = SLICE_BYTES * 4;
+        let (sender, receiver) = async_channel::bounded(total / OUTPUT_CHUNK_BYTES);
         let source: Vec<u8> = (0..total).map(|index| (index % 251) as u8).collect();
         for chunk in source.chunks(OUTPUT_CHUNK_BYTES) {
             sender.try_send(chunk.to_vec()).unwrap();
         }
         drop(sender);
         let mut received = Vec::new();
-        let progress = Cell::new(0);
-        let mut task = Box::pin(consume(
-            receiver,
-            |batch| {
-                let before = received.len();
-                for chunk in batch {
-                    received.extend_from_slice(&chunk);
-                }
-                assert!(received.len() - before <= SLICE_BYTES);
-                progress.set(received.len());
-                true
-            },
-            YieldOnce::default,
-        ));
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(task.as_mut().poll(&mut cx).is_pending());
-        assert!(progress.get() > 0 && progress.get() < total);
-        let mut heartbeats = 1;
-        while task.as_mut().poll(&mut cx).is_pending() {
-            heartbeats += 1;
+        let mut batches = 0;
+        while !receiver.is_empty() {
+            let before = received.len();
+            for chunk in OutputBatch::new(&receiver) {
+                received.extend_from_slice(&chunk);
+            }
+            assert!(received.len() - before <= SLICE_BYTES);
+            batches += 1;
         }
-        drop(task);
-        assert!(heartbeats >= total / SLICE_BYTES);
+        assert!(batches >= total / SLICE_BYTES);
         assert_eq!(received, source);
     }
 
     #[test]
     fn slow_parser_returns_after_one_chunk() {
         let (sender, receiver) = async_channel::bounded(2);
+        sender.try_send(vec![1]).unwrap();
         sender.try_send(vec![2]).unwrap();
-        let mut batch = OutputBatch {
-            first: Some(vec![1]),
-            receiver: &receiver,
-            started: Instant::now(),
-            bytes: 0,
-        };
+        let mut batch = OutputBatch::new(&receiver);
         assert_eq!(batch.next(), Some(vec![1]));
         thread::sleep(SLICE_TIME * 2);
         assert_eq!(batch.next(), None);
@@ -147,33 +94,10 @@ mod tests {
         }
         let (quiet_tx, quiet_rx) = async_channel::bounded(1);
         quiet_tx.try_send(b"prompt".to_vec()).unwrap();
-        let busy_bytes = Cell::new(0);
-        let quiet_bytes = Cell::new(0);
-        let mut busy = Box::pin(consume(
-            busy_rx,
-            |batch| {
-                for bytes in batch {
-                    busy_bytes.set(busy_bytes.get() + bytes.len());
-                }
-                true
-            },
-            YieldOnce::default,
-        ));
-        let mut quiet = Box::pin(consume(
-            quiet_rx,
-            |batch| {
-                for bytes in batch {
-                    quiet_bytes.set(quiet_bytes.get() + bytes.len());
-                }
-                true
-            },
-            YieldOnce::default,
-        ));
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(busy.as_mut().poll(&mut cx).is_pending());
-        assert!(quiet.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(quiet_bytes.get(), 6);
-        assert!(busy_bytes.get() <= SLICE_BYTES);
+        let busy_bytes: usize = OutputBatch::new(&busy_rx).map(|chunk| chunk.len()).sum();
+        let quiet_bytes: usize = OutputBatch::new(&quiet_rx).map(|chunk| chunk.len()).sum();
+        assert_eq!(quiet_bytes, 6);
+        assert!(busy_bytes <= SLICE_BYTES);
     }
 
     #[test]
@@ -197,24 +121,83 @@ mod tests {
             sender.try_send(vec![*byte]).unwrap();
         }
         drop(sender);
-        let mut task = Box::pin(consume(
-            receiver,
-            |batch| {
-                for chunk in batch {
-                    events.extend(scanner.scan(&chunk));
-                    actual.vt_write(&chunk);
-                }
-                true
-            },
-            YieldOnce::default,
-        ));
-        let mut cx = Context::from_waker(Waker::noop());
-        while task.as_mut().poll(&mut cx).is_pending() {}
-        drop(task);
+        while !receiver.is_empty() {
+            for chunk in OutputBatch::new(&receiver) {
+                events.extend(scanner.scan(&chunk));
+                actual.vt_write(&chunk);
+            }
+        }
         assert_eq!(
             search::screen_text(&actual).unwrap(),
             search::screen_text(&expected).unwrap()
         );
         assert_eq!(events, OscScanner::default().scan(bytes));
+    }
+
+    #[test]
+    #[ignore = "prints sustained-output parsing and session control scheduling timings"]
+    fn output_latency_benchmark() {
+        let line = "│   ├── target/debug/deps/terminal-0123456789abcdef.d\r\n";
+        let bytes = line.repeat(200_000).into_bytes();
+        let create = || {
+            Terminal::new(Options {
+                cols: 160,
+                rows: 48,
+                max_scrollback: 10_000,
+            })
+            .unwrap()
+        };
+        let mut bulk_terminal = create();
+        let mut scanner = OscScanner::default();
+        let started = Instant::now();
+        for chunk in bytes.chunks(64 * 1024) {
+            scanner.scan(chunk);
+            bulk_terminal.vt_write(chunk);
+        }
+        let bulk_elapsed = started.elapsed();
+        let (sender, receiver) = async_channel::bounded(OUTPUT_QUEUE_CAPACITY);
+        let byte_count = bytes.len();
+        let producer = thread::spawn(move || {
+            for chunk in bytes.chunks(OUTPUT_CHUNK_BYTES) {
+                if sender.send_blocking(chunk.to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut terminal = create();
+        let mut scanner = OscScanner::default();
+        let mut received = 0;
+        let mut slices = Vec::new();
+        let started = Instant::now();
+        let mut heartbeats = 0;
+        while !receiver.is_closed() || !receiver.is_empty() {
+            let slice = Instant::now();
+            for chunk in OutputBatch::new(&receiver) {
+                received += chunk.len();
+                scanner.scan(&chunk);
+                terminal.vt_write(&chunk);
+            }
+            slices.push(slice.elapsed());
+            heartbeats += 1;
+            thread::yield_now();
+        }
+        let elapsed = started.elapsed();
+        producer.join().unwrap();
+        assert_eq!(received, byte_count);
+        assert_eq!(
+            search::screen_text(&terminal).unwrap(),
+            search::screen_text(&bulk_terminal).unwrap()
+        );
+        slices.sort_unstable();
+        eprintln!(
+            "{:.2} MiB: bulk parsing {:?}; bounded parsing wall {:?}, {:.2} MiB/s; {} heartbeats; slice p99 {:?}, max {:?}",
+            byte_count as f64 / 1_048_576.,
+            bulk_elapsed,
+            elapsed,
+            byte_count as f64 / 1_048_576. / elapsed.as_secs_f64(),
+            heartbeats,
+            slices[slices.len() * 99 / 100],
+            slices.last().unwrap(),
+        );
     }
 }

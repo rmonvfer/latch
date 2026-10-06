@@ -14,8 +14,8 @@ use crate::{
     sidebar::TabDensity,
     terminal_view::{ClearScrollback, Copy, Find, Paste, SearchNext, SearchPrevious, SelectAll},
     workspace::{
-        ActivateTab, CloseTab, CloseWindow, NewAgent, NewTab, NextTab, OpenSettings, PreviousTab,
-        Quit, RenameTab, ToggleSidebar,
+        ActivateTab, CloseTab, CloseWindow, NewAgent, NewTab, NextAttention, NextTab, OpenSettings,
+        PreviousTab, Quit, RenameTab, StopTab, ToggleSidebar,
     },
 };
 
@@ -148,7 +148,10 @@ pub fn app_menus(cx: &App) -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Close Pane", ClosePane),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Stop Sessions…", StopTab),
             MenuItem::action("Close Window", CloseWindow),
+            MenuItem::separator(),
+            MenuItem::action("Next Session Needing Attention", NextAttention),
         ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Copy", Copy, OsAction::Copy),

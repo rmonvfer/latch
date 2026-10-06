@@ -1,4 +1,4 @@
-//! Asking before closing something that still has programs running.
+//! Asking before stopping sessions that still have programs running.
 
 use gpui::{AsyncWindowContext, Context, PromptLevel, SharedString, WeakEntity, Window};
 
@@ -22,7 +22,7 @@ pub fn confirm_close<T: 'static>(
         PromptLevel::Warning,
         question,
         Some(&detail),
-        &["Close", "Cancel"],
+        &["Stop", "Cancel"],
         cx,
     );
     cx.spawn_in(

@@ -1,5 +1,5 @@
 //! Saving and restoring the window layout: groups, tab customizations, and
-//! each terminal's working directory.
+//! each terminal's runtime identity and working directory.
 
 use std::{fs, path::PathBuf};
 
@@ -23,6 +23,8 @@ pub enum TabKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TabState {
     pub kind: TabKind,
+    #[serde(default)]
+    pub hidden: bool,
     /// The pane arrangement of a terminal tab.
     #[serde(default)]
     pub panes: Option<PaneState>,
@@ -52,7 +54,7 @@ pub struct SessionState {
     pub entries: Vec<EntryState>,
     /// Position of the active tab in display order.
     #[serde(default)]
-    pub active: usize,
+    pub active: Option<usize>,
     #[serde(default = "default_true")]
     pub sidebar_open: bool,
     #[serde(default = "default_sidebar_width")]
@@ -107,14 +109,19 @@ mod tests {
             entries: vec![
                 EntryState::Tab(TabState {
                     kind: TabKind::Terminal,
+                    hidden: true,
                     panes: Some(PaneState::Split {
                         axis: Axis::Horizontal,
                         ratios: vec![0.6, 0.4],
                         children: vec![
                             PaneState::Terminal {
+                                session_id: Some(42),
                                 cwd: Some(PathBuf::from("/tmp")),
                             },
-                            PaneState::Terminal { cwd: None },
+                            PaneState::Terminal {
+                                session_id: Some(43),
+                                cwd: None,
+                            },
                         ],
                     }),
                     style: TabStyle {
@@ -131,12 +138,13 @@ mod tests {
                     collapsed: true,
                     tabs: vec![TabState {
                         kind: TabKind::Settings,
+                        hidden: false,
                         panes: None,
                         style: TabStyle::default(),
                     }],
                 }),
             ],
-            active: 1,
+            active: Some(1),
             sidebar_open: false,
             sidebar_width: 320.,
         };
@@ -151,10 +159,37 @@ mod tests {
                 .unwrap();
         assert!(state.sidebar_open);
         assert_eq!(state.sidebar_width, f32::from(theme::SIDEBAR_WIDTH));
-        assert_eq!(state.active, 0);
+        assert_eq!(state.active, None);
         let EntryState::Tab(tab) = &state.entries[0] else {
             panic!("expected a tab");
         };
         assert_eq!(tab.style, TabStyle::default());
+        assert!(!tab.hidden);
+    }
+
+    #[test]
+    fn hidden_sessions_preserve_identity_without_an_active_view() {
+        let json = r#"{
+            "entries": [{
+                "type": "tab",
+                "kind": "terminal",
+                "hidden": true,
+                "panes": { "type": "terminal", "session_id": 9001, "cwd": "/tmp" }
+            }],
+            "active": null
+        }"#;
+        let saved: SessionState = serde_json::from_str(json).unwrap();
+        let restored: SessionState =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(restored.active.is_none());
+        let EntryState::Tab(tab) = &restored.entries[0] else {
+            panic!("expected a terminal tab");
+        };
+        assert!(tab.hidden);
+        assert!(matches!(
+            &tab.panes,
+            Some(PaneState::Terminal { session_id: Some(9001), cwd })
+                if cwd.as_deref() == Some(std::path::Path::new("/tmp"))
+        ));
     }
 }

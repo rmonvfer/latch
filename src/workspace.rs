@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::{
-    agents::AgentProfile,
+    agents::{AgentProfile, AgentStatus},
     components::{icon, icon_button, keybinding},
     confirm::confirm_close,
     git::{self, DiffStats},
@@ -19,6 +19,8 @@ use crate::{
     pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
     pane_tree::PaneNode,
     process_info::shorten_home,
+    runtime,
+    runtime_protocol::SessionInfo,
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
@@ -35,7 +37,9 @@ actions!(
     [
         NewTab,
         CloseTab,
+        StopTab,
         CloseWindow,
+        NextAttention,
         NextTab,
         PreviousTab,
         ToggleSidebar,
@@ -47,6 +51,29 @@ actions!(
 
 fn clamp_sidebar_width(width: Pixels) -> Pixels {
     width.clamp(theme::SIDEBAR_MIN_WIDTH, theme::SIDEBAR_MAX_WIDTH)
+}
+
+fn restored_tab(index: Option<usize>, slots: &[Option<TabId>]) -> Option<TabId> {
+    index.and_then(|index| slots.get(index)).copied().flatten()
+}
+
+fn sessions_using_worktree(
+    sessions: &[SessionInfo],
+    owned: &HashSet<u64>,
+    path: &Path,
+) -> Vec<u64> {
+    sessions
+        .iter()
+        .filter(|session| {
+            !session.exited
+                && (owned.contains(&session.id)
+                    || session
+                        .cwd
+                        .as_ref()
+                        .is_some_and(|cwd| cwd.starts_with(path)))
+        })
+        .map(|session| session.id)
+        .collect()
 }
 
 /// Activate the tab at the given index; `usize::MAX` selects the last tab.
@@ -86,6 +113,7 @@ impl TabContent {
 
 struct OpenTab {
     content: TabContent,
+    hidden: bool,
     _subscription: Option<Subscription>,
 }
 
@@ -120,6 +148,10 @@ pub(crate) struct TabDisplay {
     pub icon: &'static str,
     pub color: Option<TabColor>,
     pub pinned: bool,
+    pub hidden: bool,
+    pub exited: bool,
+    pub connected: bool,
+    pub unavailable: bool,
     pub directory: Option<SharedString>,
     pub branch: Option<SharedString>,
     /// The last command in the focused pane exited with an error.
@@ -209,18 +241,80 @@ impl Workspace {
         if let Some(state) = session::load() {
             workspace.restore(state, window, cx);
         }
-        if workspace.open_tabs.is_empty() {
-            workspace.open_terminal(None, None, None, TabStyle::default(), window, cx);
-        }
+        workspace.save_session(cx);
+        workspace.reconcile_sessions(window, cx);
         workspace
+    }
+
+    fn reconcile_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let sessions = cx
+                .background_executor()
+                .spawn(async move { runtime::list_sessions() })
+                .await;
+            let _ =
+                this.update_in(cx, |workspace, window, cx| {
+                    match sessions {
+                        Ok(sessions) => {
+                            let known: HashSet<u64> = workspace
+                                .open_tabs
+                                .values()
+                                .filter_map(|tab| match &tab.content {
+                                    TabContent::Terminal(panes) => Some(panes.read(cx).views()),
+                                    TabContent::Settings(_) => None,
+                                })
+                                .flatten()
+                                .map(|view| view.read(cx).session_id())
+                                .collect();
+                            for session in sessions {
+                                if known.contains(&session.id) {
+                                    continue;
+                                }
+                                match TerminalView::attach(session.id, cx) {
+                                    Ok(view) => {
+                                        let show = workspace.open_tabs.is_empty();
+                                        let panes = PaneGroup::from_view(view, window, cx);
+                                        let id = workspace.add_terminal_tab(
+                                            panes,
+                                            None,
+                                            TabStyle::default(),
+                                            window,
+                                            cx,
+                                        );
+                                        if let Some(tab) = workspace.open_tabs.get_mut(&id) {
+                                            tab.hidden = !show;
+                                        }
+                                        if show {
+                                            workspace.activate(id, window, cx);
+                                        }
+                                    }
+                                    Err(error) => log::warn!(
+                                        "failed to attach session {}: {error:#}",
+                                        session.id,
+                                    ),
+                                }
+                            }
+                        }
+                        Err(error) => log::warn!("failed to list sessions: {error:#}"),
+                    }
+                    if workspace.open_tabs.is_empty() {
+                        workspace.open_terminal(None, None, None, TabStyle::default(), window, cx);
+                    }
+                    workspace.focus_content(window, cx);
+                    workspace.layout_changed(cx);
+                    workspace.save_session(cx);
+                });
+        })
+        .detach();
     }
 
     fn restore(&mut self, state: SessionState, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = state.sidebar_open;
         self.sidebar_width = clamp_sidebar_width(px(state.sidebar_width));
+        let mut restored = Vec::new();
         for entry in state.entries {
             match entry {
-                EntryState::Tab(tab) => self.restore_tab(tab, None, window, cx),
+                EntryState::Tab(tab) => restored.push(self.restore_tab(tab, None, window, cx)),
                 EntryState::Group(group) => {
                     let id = self.layout.add_group(group.name);
                     if let Some(created) = self.layout.group_mut(id) {
@@ -228,7 +322,7 @@ impl Workspace {
                         created.collapsed = group.collapsed;
                     }
                     for tab in group.tabs {
-                        self.restore_tab(tab, Some(id), window, cx);
+                        restored.push(self.restore_tab(tab, Some(id), window, cx));
                     }
                 }
             }
@@ -244,8 +338,11 @@ impl Workspace {
         for group in empty_groups {
             self.layout.ungroup(group);
         }
-        let ordered = self.layout.ordered_tabs();
-        if let Some(&active) = ordered.get(state.active).or(ordered.first()) {
+        let active = restored_tab(state.active, &restored);
+        self.active = None;
+        if let Some(active) =
+            active.filter(|id| self.open_tabs.get(id).is_some_and(|tab| !tab.hidden))
+        {
             self.activate(active, window, cx);
         }
     }
@@ -256,7 +353,7 @@ impl Workspace {
         group: Option<GroupId>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<TabId> {
         match tab.kind {
             TabKind::Terminal => {
                 let panes = match &tab.panes {
@@ -265,16 +362,22 @@ impl Workspace {
                 };
                 match panes {
                     Ok(panes) => {
-                        self.add_terminal_tab(panes, group, tab.style, window, cx);
+                        let id = self.add_terminal_tab(panes, group, tab.style, window, cx);
+                        if let Some(open) = self.open_tabs.get_mut(&id) {
+                            open.hidden = tab.hidden;
+                        }
+                        Some(id)
                     }
-                    Err(error) => log::error!("failed to restore tab: {error:#}"),
+                    Err(error) => {
+                        log::error!("failed to restore tab: {error:#}");
+                        None
+                    }
                 }
             }
-            TabKind::Settings => {
-                if self.settings_tab().is_none() {
-                    self.add_settings_tab(tab.style, group, cx);
-                }
-            }
+            TabKind::Settings => Some(
+                self.settings_tab()
+                    .unwrap_or_else(|| self.add_settings_tab(tab.style, group, cx)),
+            ),
         }
     }
 
@@ -288,7 +391,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<TabId> {
         match PaneGroup::build(cwd, startup, window, cx) {
-            Ok(panes) => Some(self.add_terminal_tab(panes, group, style, window, cx)),
+            Ok(panes) => {
+                let id = self.add_terminal_tab(panes, group, style, window, cx);
+                self.activate(id, window, cx);
+                self.save_session(cx);
+                Some(id)
+            }
             Err(error) => {
                 log::error!("failed to open terminal: {error:#}");
                 None
@@ -314,9 +422,21 @@ impl Workspace {
                         cx.notify();
                         this.schedule_save(cx);
                     }
-                    PaneGroupEvent::Exited => this.close(id, window, cx),
-                    PaneGroupEvent::Attention(attention) => {
-                        this.handle_attention(id, attention, window, cx)
+                    PaneGroupEvent::Hidden(view) => {
+                        let group = this.layout.group_of(id);
+                        let panes = PaneGroup::from_view(view.clone(), window, cx);
+                        let style = TabStyle {
+                            worktree: this.layout.style(id).worktree,
+                            ..TabStyle::default()
+                        };
+                        let hidden = this.add_terminal_tab(panes, group, style, window, cx);
+                        if let Some(tab) = this.open_tabs.get_mut(&hidden) {
+                            tab.hidden = true;
+                        }
+                        this.layout_changed(cx);
+                    }
+                    PaneGroupEvent::Attention { source, attention } => {
+                        this.handle_attention(id, source, attention, window, cx)
                     }
                     PaneGroupEvent::PaneDropped {
                         dragged,
@@ -334,10 +454,10 @@ impl Workspace {
             id,
             OpenTab {
                 content: TabContent::Terminal(panes),
+                hidden: false,
                 _subscription: Some(subscription),
             },
         );
-        self.activate(id, window, cx);
         id
     }
 
@@ -353,6 +473,7 @@ impl Workspace {
             id,
             OpenTab {
                 content: TabContent::Settings(page),
+                hidden: false,
                 _subscription: None,
             },
         );
@@ -367,9 +488,10 @@ impl Workspace {
     }
 
     pub(crate) fn activate(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.open_tabs.get(&id) else {
+        let Some(tab) = self.open_tabs.get_mut(&id) else {
             return;
         };
+        tab.hidden = false;
         let focus = tab.content.focus_handle(cx);
         if let Some(group) = self.layout.group_of(id)
             && let Some(group) = self.layout.group_mut(group)
@@ -378,6 +500,7 @@ impl Workspace {
         }
         self.active = Some(id);
         self.attention.remove(&id);
+        self.acknowledge_tab_attention(id, cx);
         window.focus(&focus, cx);
         if let Some(index) = sidebar_child_index(&self.visible_rows(cx), id) {
             self.tab_scroll.scroll_to_item(index);
@@ -386,11 +509,36 @@ impl Workspace {
     }
 
     pub(crate) fn close(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.open_tabs.get_mut(&id) else {
+            return;
+        };
+        if matches!(tab.content, TabContent::Settings(_)) {
+            self.remove_tab(id, window, cx);
+            return;
+        }
+        tab.hidden = true;
+        if self.active == Some(id) {
+            self.active = None;
+            let next = self
+                .layout
+                .ordered_tabs()
+                .into_iter()
+                .find(|other| self.open_tabs.get(other).is_some_and(|tab| !tab.hidden));
+            match next {
+                Some(next) => self.activate(next, window, cx),
+                None => window.focus(&self.focus_handle, cx),
+            }
+        }
+        self.layout_changed(cx);
+    }
+
+    fn remove_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_tabs.remove(&id).is_none() {
             return;
         }
         let position = self.layout.ordered_tabs().iter().position(|tab| *tab == id);
         self.layout.remove_tab(id);
+        self.attention.remove(&id);
         if self
             .renaming
             .as_ref()
@@ -401,7 +549,12 @@ impl Workspace {
 
         if self.active == Some(id) {
             self.active = None;
-            let remaining = self.layout.ordered_tabs();
+            let remaining: Vec<TabId> = self
+                .layout
+                .ordered_tabs()
+                .into_iter()
+                .filter(|other| self.open_tabs.get(other).is_some_and(|tab| !tab.hidden))
+                .collect();
             let next = position
                 .and_then(|position| remaining.get(position.min(remaining.len().saturating_sub(1))))
                 .copied();
@@ -507,7 +660,7 @@ impl Workspace {
         self.open_terminal(cwd, Some(&command), group, style, window, cx);
     }
 
-    /// Close a tab and delete the worktree it was opened in, after asking.
+    /// Stop sessions using a worktree and delete its directory, after asking.
     /// The worktree's branch is kept.
     pub(crate) fn request_remove_worktree(
         &mut self,
@@ -519,7 +672,7 @@ impl Workspace {
             return;
         };
         let detail = format!(
-            "{}\n\nThe tab closes and the folder is deleted. Its branch is kept.",
+            "{}\n\nSessions using this worktree stop and the folder is deleted. Its branch is kept.",
             shorten_home(&path)
         );
         let answer = window.prompt(
@@ -533,13 +686,45 @@ impl Workspace {
             if answer.await != Ok(0) {
                 return;
             }
-            let _ = this.update_in(cx, |this, window, cx| this.close(id, window, cx));
+            let Ok(owned) = this.update_in(cx, |workspace, _, cx| {
+                workspace
+                    .open_tabs
+                    .iter()
+                    .filter(|(tab, _)| {
+                        workspace.layout.style(**tab).worktree.as_ref() == Some(&path)
+                    })
+                    .filter_map(|(_, tab)| match &tab.content {
+                        TabContent::Terminal(panes) => Some(panes.read(cx).views()),
+                        TabContent::Settings(_) => None,
+                    })
+                    .flatten()
+                    .map(|view| view.read(cx).session_id())
+                    .collect::<HashSet<_>>()
+            }) else {
+                return;
+            };
+            let worktree = path.clone();
             let removed = cx
                 .background_executor()
-                .spawn(async move { git::remove_worktree(&path) })
+                .spawn(async move {
+                    let sessions = runtime::list_sessions()?;
+                    for session in sessions_using_worktree(&sessions, &owned, &worktree) {
+                        runtime::stop_session(session)?;
+                    }
+                    git::remove_worktree(&worktree)
+                })
                 .await;
-            if let Err(error) = removed {
-                let _ = this.update_in(cx, |_, window, cx| {
+            let _ = this.update_in(cx, |this, window, cx| match removed {
+                Ok(()) => {
+                    for tab in this.layout.ordered_tabs() {
+                        if this.layout.style(tab).worktree.as_ref() == Some(&path) {
+                            this.layout.update_style(tab, |style| style.worktree = None);
+                        }
+                    }
+                    this.layout_changed(cx);
+                    this.save_session(cx);
+                }
+                Err(error) => {
                     let detail = format!("{error:#}");
                     // Only informs; the answer is not needed.
                     let _acknowledged = window.prompt(
@@ -549,8 +734,8 @@ impl Workspace {
                         &["OK"],
                         cx,
                     );
-                });
-            }
+                }
+            });
         })
         .detach();
     }
@@ -575,11 +760,16 @@ impl Workspace {
         let display = match &self.open_tabs.get(&id)?.content {
             TabContent::Terminal(panes) => {
                 let metadata = panes.read(cx).active_metadata(cx);
+                let views = panes.read(cx).views();
                 TabDisplay {
                     title: custom_name.unwrap_or_else(|| metadata.title.clone()),
                     icon: style.icon.unwrap_or(TabIcon::Terminal).asset(),
                     color: style.color,
                     pinned: style.pinned,
+                    hidden: self.open_tabs.get(&id)?.hidden,
+                    exited: views.iter().all(|view| view.read(cx).is_exited()),
+                    connected: views.iter().all(|view| view.read(cx).is_connected()),
+                    unavailable: views.iter().all(|view| !view.read(cx).is_connected()),
                     directory: metadata.directory.clone(),
                     branch: metadata.branch.clone(),
                     attention: self.attention.contains(&id),
@@ -596,6 +786,10 @@ impl Workspace {
                 icon: style.icon.map(TabIcon::asset).unwrap_or("settings"),
                 color: style.color,
                 pinned: style.pinned,
+                hidden: false,
+                exited: false,
+                connected: true,
+                unavailable: false,
                 directory: None,
                 branch: None,
                 failed: false,
@@ -657,7 +851,7 @@ impl Workspace {
             None => return,
             // The pane was its tab's only one: the tab goes away, its
             // terminal lives on in the destination.
-            Some(Err(source_tab)) => self.close(source_tab, window, cx),
+            Some(Err(source_tab)) => self.remove_tab(source_tab, window, cx),
             Some(Ok(())) => {}
         }
         destination.update(cx, |group, cx| {
@@ -684,7 +878,7 @@ impl Workspace {
             return;
         };
         let panes = source.read(cx).root();
-        self.close(source_tab, window, cx);
+        self.remove_tab(source_tab, window, cx);
         destination.update(cx, |group, cx| {
             group.adopt(panes, &target, edge, window, cx)
         });
@@ -700,13 +894,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let worktree = self
+            .tab_holding(&dragged.source)
+            .and_then(|tab| self.layout.style(tab).worktree);
         let id = match self.lift_pane(dragged, window, cx) {
             None => return,
             // Already a tab of its own: just move it.
             Some(Err(source_tab)) => source_tab,
             Some(Ok(())) => {
                 let panes = PaneGroup::from_view(dragged.view.clone(), window, cx);
-                self.add_terminal_tab(panes, None, TabStyle::default(), window, cx)
+                self.add_terminal_tab(
+                    panes,
+                    None,
+                    TabStyle {
+                        worktree,
+                        ..TabStyle::default()
+                    },
+                    window,
+                    cx,
+                )
             }
         };
         self.layout.move_tab(id, destination);
@@ -731,21 +937,32 @@ impl Workspace {
         }
     }
 
+    fn acknowledge_tab_attention(&self, id: TabId, cx: &mut Context<Self>) {
+        if let Some(panes) = self.panes_of(id) {
+            for view in panes.read(cx).views() {
+                view.update(cx, |view, cx| view.acknowledge_attention(cx));
+            }
+        }
+    }
+
     fn handle_attention(
         &mut self,
         id: TabId,
+        source: &Entity<TerminalView>,
         attention: &Attention,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let window_active = window.is_window_active();
         if window_active && self.active == Some(id) {
+            source.update(cx, |view, cx| view.acknowledge_attention(cx));
             return;
         }
         // Quick commands finishing are routine; only long ones are news.
         if let Attention::CommandFinished(outcome) = attention
             && outcome.duration < LONG_COMMAND
         {
+            source.update(cx, |view, cx| view.acknowledge_attention(cx));
             return;
         }
         self.attention.insert(id);
@@ -946,15 +1163,12 @@ impl Workspace {
                 }),
             })
             .collect();
-        let active = self
-            .active
-            .and_then(|active| {
-                self.layout
-                    .ordered_tabs()
-                    .iter()
-                    .position(|id| *id == active)
-            })
-            .unwrap_or(0);
+        let active = self.active.and_then(|active| {
+            self.layout
+                .ordered_tabs()
+                .iter()
+                .position(|id| *id == active)
+        });
         SessionState {
             entries,
             active,
@@ -971,6 +1185,7 @@ impl Workspace {
         };
         Some(TabState {
             kind: tab.content.kind(),
+            hidden: tab.hidden,
             panes,
             style: self.layout.style(id),
         })
@@ -1007,18 +1222,210 @@ impl Workspace {
             .collect()
     }
 
-    /// Close a tab the user asked to close, confirming if it is busy.
-    pub(crate) fn request_close(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn request_stop(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panes) = self.panes_of(id) else {
+            return;
+        };
         let running = self.running_in(&[id], cx);
         confirm_close(
             running,
-            "Close this tab?",
+            "Stop these sessions?",
             window,
             cx,
-            move |this, window, cx| {
-                this.close(id, window, cx);
+            move |_, _, cx| {
+                for view in panes.read(cx).views() {
+                    if !view.read(cx).is_exited() {
+                        view.update(cx, |view, cx| view.stop(cx));
+                    }
+                }
             },
         );
+    }
+
+    fn stop_tab(&mut self, _: &StopTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active {
+            self.request_stop(id, window, cx);
+        }
+    }
+
+    pub(crate) fn archive(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panes) = self.panes_of(id) else {
+            return;
+        };
+        let views = panes.read(cx).views();
+        if views.iter().any(|view| !view.read(cx).is_exited()) {
+            return;
+        }
+        let sessions: Vec<u64> = views
+            .iter()
+            .map(|view| view.read(cx).session_id())
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let available: HashMap<u64, SessionInfo> = runtime::list_sessions()?
+                        .into_iter()
+                        .map(|session| (session.id, session))
+                        .collect();
+                    for session in sessions {
+                        if let Some(info) = available.get(&session) {
+                            anyhow::ensure!(info.exited, "stop the session before removing it");
+                            runtime::remove_session(session)?;
+                        }
+                    }
+                    anyhow::Ok(())
+                })
+                .await;
+            let _ = this.update_in(cx, |workspace, window, cx| match result {
+                Ok(()) => {
+                    workspace.remove_tab(id, window, cx);
+                    workspace.save_session(cx);
+                }
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    let _acknowledged = window.prompt(
+                        PromptLevel::Warning,
+                        "Couldn't remove the sessions",
+                        Some(&detail),
+                        &["OK"],
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn request_unavailable_action(
+        &mut self,
+        id: TabId,
+        replace: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .display(id, cx)
+            .is_some_and(|display| display.unavailable)
+        {
+            return;
+        }
+        let (question, detail, button) = if replace {
+            (
+                "Replace unavailable views with a fresh shell?",
+                "A fresh shell opens in the last known directory. Running sessions are recovered when you next open the app.",
+                "Start Fresh Shell",
+            )
+        } else {
+            (
+                "Remove unavailable views?",
+                "These views are removed from the workspace. Running sessions are recovered when you next open the app.",
+                "Remove Views",
+            )
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            question,
+            Some(detail),
+            &[button, "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let _ = this.update_in(cx, |workspace, window, cx| {
+                if !workspace
+                    .display(id, cx)
+                    .is_some_and(|display| display.unavailable)
+                {
+                    return;
+                }
+                if replace {
+                    let cwd = workspace
+                        .panes_of(id)
+                        .and_then(|panes| panes.read(cx).active_metadata(cx).cwd.clone());
+                    let group = workspace.layout.group_of(id);
+                    let style = workspace.layout.style(id);
+                    let Some(replacement) =
+                        workspace.open_terminal(cwd.as_deref(), None, group, style, window, cx)
+                    else {
+                        let _acknowledged = window.prompt(
+                            PromptLevel::Warning,
+                            "Couldn't start a fresh shell",
+                            Some("The unavailable session views are still in the workspace."),
+                            &["OK"],
+                            cx,
+                        );
+                        return;
+                    };
+                    workspace
+                        .layout
+                        .move_tab(replacement, TabDestination::Before(id));
+                }
+                workspace.remove_tab(id, window, cx);
+                workspace.save_session(cx);
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn needs_attention(&self, cx: &App) -> Vec<TabId> {
+        self.layout
+            .ordered_tabs()
+            .into_iter()
+            .filter(|id| {
+                self.attention.contains(id)
+                    || self.panes_of(*id).is_some_and(|panes| {
+                        panes.read(cx).views().iter().any(|view| {
+                            view.read(cx)
+                                .metadata()
+                                .agent
+                                .is_some_and(|agent| agent.status == AgentStatus::NeedsInput)
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn activate_attention(
+        &mut self,
+        id: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate(id, window, cx);
+        if let Some(panes) = self.panes_of(id) {
+            let waiting = panes.read(cx).views().into_iter().find(|view| {
+                view.read(cx)
+                    .metadata()
+                    .agent
+                    .is_some_and(|agent| agent.status == AgentStatus::NeedsInput)
+            });
+            if let Some(view) = waiting {
+                window.focus(&view.focus_handle(cx), cx);
+            }
+        }
+    }
+
+    fn next_attention(&mut self, _: &NextAttention, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = self.needs_attention(cx);
+        let next = self
+            .active
+            .and_then(|active| {
+                tabs.iter()
+                    .position(|id| *id == active)
+                    .map(|index| (index + 1) % tabs.len())
+            })
+            .unwrap_or(0);
+        if let Some(&id) = tabs.get(next) {
+            self.activate_attention(id, window, cx);
+        }
+    }
+
+    /// Hide a terminal tab without stopping its sessions.
+    pub(crate) fn request_close(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(id, window, cx);
     }
 
     pub(crate) fn request_close_group(
@@ -1027,39 +1434,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tabs = self
-            .layout
-            .group(group)
-            .map(|group| group.tabs().to_vec())
-            .unwrap_or_default();
-        let running = self.running_in(&tabs, cx);
-        confirm_close(
-            running,
-            "Close this group?",
-            window,
-            cx,
-            move |this, window, cx| {
-                this.close_group(group, window, cx);
-            },
-        );
+        self.close_group(group, window, cx);
     }
 
-    fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
-        let running = self.running_in(&self.layout.ordered_tabs(), cx);
-        confirm_close(running, "Quit?", window, cx, |_, _, cx| cx.quit());
+    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_session(cx);
+        cx.quit();
     }
 
-    /// Whether the window may close right away. When programs are running
-    /// this asks first and closes the window itself if the user agrees.
-    pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let running = self.running_in(&self.layout.ordered_tabs(), cx);
-        if running.is_empty() || !SettingsStore::get(cx).confirm_close {
-            return true;
-        }
-        confirm_close(running, "Close this window?", window, cx, |_, window, _| {
-            window.remove_window();
-        });
-        false
+    /// Save the arrangement before disconnecting the window from its sessions.
+    pub fn should_close_window(&mut self, _: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.save_session(cx);
+        true
     }
 
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -1069,7 +1455,12 @@ impl Workspace {
     }
 
     fn step_tab(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ordered = self.layout.ordered_tabs();
+        let ordered: Vec<TabId> = self
+            .layout
+            .ordered_tabs()
+            .into_iter()
+            .filter(|id| self.open_tabs.get(id).is_some_and(|tab| !tab.hidden))
+            .collect();
         if ordered.is_empty() {
             return;
         }
@@ -1232,7 +1623,11 @@ impl Workspace {
                 div()
                     .text_size(theme::TEXT_DEFAULT)
                     .text_color(theme.text_muted)
-                    .child("No open terminals"),
+                    .child(if self.open_tabs.is_empty() {
+                        "No open terminals"
+                    } else {
+                        "Sessions keep running. Select one in the sidebar to return."
+                    }),
             )
             .child(
                 div()
@@ -1304,6 +1699,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::new_agent))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::stop_tab))
+            .on_action(cx.listener(Self::next_attention))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
@@ -1338,5 +1735,45 @@ impl Render for Workspace {
             )
             .children(self.render_status_bar(&theme, cx))
             .children(self.render_context_menu(&theme, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restoring_selection_keeps_saved_slots_when_tabs_are_filtered() {
+        let mut layout = TabLayout::default();
+        let settings = layout.add_tab(TabStyle::default(), None);
+        let terminal = layout.add_tab(TabStyle::default(), None);
+        let restored = [Some(settings), None, Some(settings), Some(terminal)];
+        assert_eq!(restored_tab(Some(3), &restored), Some(terminal));
+        assert_eq!(restored_tab(Some(2), &restored), Some(settings));
+        assert_eq!(restored_tab(Some(1), &restored), None);
+        assert_eq!(restored_tab(None, &restored), None);
+        assert_eq!(restored_tab(Some(9), &restored), None);
+    }
+
+    #[test]
+    fn worktree_removal_stops_only_live_associated_sessions() {
+        let session = |id, cwd: &str, exited| SessionInfo {
+            id,
+            cwd: Some(PathBuf::from(cwd)),
+            exited,
+            ..Default::default()
+        };
+        let sessions = [
+            session(1, "/tmp/worktree", false),
+            session(2, "/tmp/worktree/src", false),
+            session(3, "/tmp/worktree-other", false),
+            session(4, "/tmp/elsewhere", false),
+            session(5, "/tmp/worktree", true),
+        ];
+        let owned = HashSet::from([4, 5, 999]);
+        assert_eq!(
+            sessions_using_worktree(&sessions, &owned, Path::new("/tmp/worktree")),
+            vec![1, 2, 4],
+        );
     }
 }
