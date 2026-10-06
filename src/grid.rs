@@ -554,6 +554,10 @@ impl Frame {
         );
     }
 
+    pub fn rows(&self) -> &[Rc<FrameRow>] {
+        &self.rows
+    }
+
     /// Rows down to the last one with content or the cursor, whichever is
     /// lower; the blank rows below them are not worth showing.
     pub fn content_rows(&self) -> usize {

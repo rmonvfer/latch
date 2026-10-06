@@ -1,15 +1,15 @@
 //! Painting a pane's command blocks as a scrolling list: a header per block
 //! with its context, command, and outcome, above the block's output rows.
 
-use std::{rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClickEvent, Hsla, ListState, Pixels, SharedString, Window, canvas, div, list,
-    point, prelude::*, px,
+    AnyElement, App, Bounds, ClickEvent, Hsla, ListState, Pixels, Point, SharedString, Window,
+    canvas, div, fill, list, point, prelude::*, px, size,
 };
 
 use crate::{
-    blocks::{Block, Outcome, Rows},
+    blocks::{Block, BlockPoint, BlockSelection, Outcome, Rows},
     components::icon,
     grid::{CellMetrics, Frame, paint_rows},
     process_info::shorten_home,
@@ -38,6 +38,68 @@ pub struct Item {
     content: ItemContent,
     collapsed: bool,
     selected: bool,
+    /// Text selected across blocks, painted where it covers this block.
+    selection: Option<BlockSelection>,
+}
+
+/// Where each visible block's output was last painted, for mapping the
+/// pointer to a cell.
+#[derive(Clone, Default)]
+pub struct PaintedOutputs(Rc<RefCell<Vec<PaintedOutput>>>);
+
+#[derive(Clone, Copy)]
+struct PaintedOutput {
+    block: usize,
+    /// Top-left of the block's first row, first column.
+    origin: Point<Pixels>,
+    rows: usize,
+}
+
+impl PaintedOutputs {
+    pub fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    fn record(&self, output: PaintedOutput) {
+        self.0.borrow_mut().push(output);
+    }
+
+    /// The cell at `position`, or for a point between or beyond blocks,
+    /// the nearest cell of the nearest block, so drags keep selecting.
+    pub fn hit(&self, position: Point<Pixels>, metrics: CellMetrics) -> Option<BlockPoint> {
+        let outputs = self.0.borrow();
+        let distance = |output: &PaintedOutput| {
+            let top = output.origin.y;
+            let bottom = top + metrics.height * output.rows as f32;
+            if position.y < top {
+                top - position.y
+            } else if position.y >= bottom {
+                position.y - bottom
+            } else {
+                px(0.)
+            }
+        };
+        let nearest = outputs
+            .iter()
+            .filter(|output| output.rows > 0)
+            .min_by(|a, b| f32::from(distance(a)).total_cmp(&f32::from(distance(b))))?;
+        let row = ((position.y - nearest.origin.y) / metrics.height).floor();
+        let col = ((position.x - nearest.origin.x) / metrics.width)
+            .round()
+            .max(0.) as usize;
+        let (row, col) = if row < 0. {
+            (0, 0)
+        } else if row as usize >= nearest.rows {
+            (nearest.rows - 1, usize::MAX)
+        } else {
+            (row as usize, col)
+        };
+        Some(BlockPoint {
+            block: nearest.block,
+            row,
+            col,
+        })
+    }
 }
 
 /// Something done to a block from its header.
@@ -75,7 +137,13 @@ impl Item {
             content,
             collapsed: block.collapsed,
             selected,
+            selection: None,
         }
+    }
+
+    pub fn with_selection(mut self, selection: Option<BlockSelection>) -> Self {
+        self.selection = selection;
+        self
     }
 
     fn failed(&self) -> bool {
@@ -93,6 +161,7 @@ struct Palette {
     chip: Hsla,
     error: Hsla,
     selected: Hsla,
+    selection: Hsla,
     hover: Hsla,
 }
 
@@ -105,6 +174,7 @@ impl Palette {
             chip: theme.element_background,
             error: theme::to_hsla(theme.terminal.ansi[1]),
             selected: theme.ghost_selected.opacity(0.5),
+            selection: theme.text_accent.opacity(0.3),
             hover: theme.ghost_hover,
         }
     }
@@ -119,6 +189,7 @@ pub fn render_list(
     metrics: CellMetrics,
     theme: &Theme,
     on_action: OnBlockAction,
+    painted: PaintedOutputs,
 ) -> AnyElement {
     let palette = Palette::new(theme);
     list(state.clone(), move |index, _window, _cx| {
@@ -132,6 +203,7 @@ pub fn render_list(
             metrics,
             palette,
             on_action.clone(),
+            painted.clone(),
         )
     })
     .size_full()
@@ -145,6 +217,7 @@ fn render_item(
     metrics: CellMetrics,
     palette: Palette,
     on_action: OnBlockAction,
+    painted: PaintedOutputs,
 ) -> AnyElement {
     let (rows, scrollback, live_frame) = match &item.content {
         _ if item.collapsed => (None, Vec::new(), None),
@@ -156,11 +229,18 @@ fn render_item(
         + live_frame.as_ref().map_or(0, |frame| frame.content_rows());
     let output_height = metrics.height * row_count as f32;
     let padding = metrics.padding + HORIZONTAL_INSET;
+    let selection = item.selection;
 
     let output = canvas(
         |_, _, _| {},
         move |bounds, (), window, cx| {
             let mut origin = bounds.origin + point(padding, px(0.));
+            painted.record(PaintedOutput {
+                block: index,
+                origin,
+                rows: row_count,
+            });
+            let selection_origin = origin;
             if let Some(rows) = &rows {
                 paint_rows(rows, origin, metrics, window, cx);
             }
@@ -170,6 +250,27 @@ fn render_item(
             }
             if let Some(frame) = &live_frame {
                 frame.paint_content(origin, metrics, window, cx);
+            }
+            if let Some(selection) = selection {
+                let right = bounds.right() - padding;
+                for row in 0..row_count {
+                    let Some((from, to)) = selection.columns_in(index, row) else {
+                        continue;
+                    };
+                    let top = selection_origin.y + metrics.height * row as f32;
+                    let left = selection_origin.x + metrics.width * from as f32;
+                    let end = if to == usize::MAX {
+                        right
+                    } else {
+                        (selection_origin.x + metrics.width * to as f32).min(right)
+                    };
+                    if end > left {
+                        window.paint_quad(fill(
+                            Bounds::new(point(left, top), size(end - left, metrics.height)),
+                            palette.selection,
+                        ));
+                    }
+                }
             }
         },
     )

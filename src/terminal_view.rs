@@ -21,8 +21,8 @@ use libghostty_vt::{
 
 use crate::{
     agents::{Agent, AgentStatus},
-    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction},
-    blocks::{BlockList, ListChange},
+    block_view::{self, BlockAction, Item, ItemContent, OnBlockAction, PaintedOutputs},
+    blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange},
     command_editor::{CommandEditor, CommandEditorEvent},
     completion::{self, CompletionMenu},
     components::{elevated_shadow, icon, icon_button},
@@ -180,6 +180,11 @@ pub struct TerminalView {
     block_list: ListState,
     /// The block picked by clicking or with ⌘↑ and ⌘↓.
     selected_block: Option<usize>,
+    /// Text selected in the block list, and whether a drag is extending it.
+    block_selection: Option<BlockSelection>,
+    selecting_blocks: bool,
+    /// Where the block list last painted each block's rows.
+    painted_outputs: PaintedOutputs,
     /// Where commands are typed while the shell waits at its prompt.
     editor: Entity<CommandEditor>,
     _editor_subscription: Subscription,
@@ -451,6 +456,9 @@ impl TerminalView {
                     state
                 },
                 selected_block: None,
+                block_selection: None,
+                selecting_blocks: false,
+                painted_outputs: PaintedOutputs::default(),
                 _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
                 editor,
                 prompt: None,
@@ -660,6 +668,8 @@ impl TerminalView {
             ListChange::Unchanged => {}
             ListChange::Shifted { dropped, added } => {
                 if dropped > 0 {
+                    // Block indices shift, so a selection would point elsewhere.
+                    self.block_selection = None;
                     self.block_list.splice(0..dropped, 0);
                     self.selected_block = self
                         .selected_block
@@ -680,6 +690,7 @@ impl TerminalView {
             ListChange::Reset => {
                 self.block_list.reset(blocks.blocks().len());
                 self.selected_block = None;
+                self.block_selection = None;
             }
         }
         let became_ready = self.prompt.is_none() && reported.prompt.is_some();
@@ -1196,6 +1207,7 @@ impl TerminalView {
                     self.sync_editor_menu(cx);
                 } else {
                     self.selected_block = None;
+                    self.block_selection = None;
                 }
                 cx.notify();
             }
@@ -1239,7 +1251,7 @@ impl TerminalView {
                 ItemContent::Finished(block.rows())
             };
             let selected = self.selected_block == Some(items.len());
-            items.push(Item::block(block, content, selected));
+            items.push(Item::block(block, content, selected).with_selection(self.block_selection));
         }
         // A running block is drawn from the live terminal and grows with it.
         if blocks.running().is_some() {
@@ -1695,7 +1707,86 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.block_selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
         self.send(Operation::Copy, cx);
+    }
+
+    /// Begin selecting at the pointer: a cell, or with a double or triple
+    /// click a word or a whole row.
+    fn start_block_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(point) = self
+            .metrics
+            .and_then(|metrics| self.painted_outputs.hit(event.position, metrics))
+        else {
+            self.block_selection = None;
+            return;
+        };
+        let text = self
+            .block_row_texts(point.block)
+            .into_iter()
+            .nth(point.row)
+            .unwrap_or_default();
+        let (from, to) = match event.click_count {
+            2 => blocks::word_columns(&text, point.col),
+            count if count >= 3 => (0, usize::MAX),
+            _ => (point.col, point.col),
+        };
+        let at = |col| BlockPoint { col, ..point };
+        self.block_selection = Some(BlockSelection {
+            anchor: at(from),
+            head: at(to),
+        });
+        self.selecting_blocks = true;
+        cx.notify();
+    }
+
+    /// Each row of a block's output as text: its rows, and for a running
+    /// block the live screen after them.
+    fn block_row_texts(&self, index: usize) -> Vec<String> {
+        let Some(block) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.blocks().get(index))
+        else {
+            return Vec::new();
+        };
+        let mut texts: Vec<String> = block.rows().iter().map(|row| row.text()).collect();
+        if block.is_running()
+            && let Ok(frame) = self.renderer_frame_rows()
+        {
+            texts.extend(frame);
+        }
+        texts
+    }
+
+    /// Text of the live screen's rows down to the last with content.
+    fn renderer_frame_rows(&self) -> Result<Vec<String>> {
+        let mut renderer = GridRenderer::new()?;
+        let frame = renderer.build_frame(&self.terminal, false)?;
+        Ok(frame.rows()[..frame.content_rows().min(frame.rows().len())]
+            .iter()
+            .map(|row| row.text())
+            .collect())
+    }
+
+    /// The text selected in the block list, if any.
+    fn block_selection_text(&self) -> Option<String> {
+        let selection = self
+            .block_selection
+            .filter(|selection| !selection.is_empty())?;
+        let (start, end) = selection.range();
+        let mut lines = Vec::new();
+        for block in start.block..=end.block {
+            for (row, text) in self.block_row_texts(block).iter().enumerate() {
+                if let Some((from, to)) = selection.columns_in(block, row) {
+                    lines.push(blocks::slice_columns(text, from, to).trim_end().to_string());
+                }
+            }
+        }
+        Some(lines.join("\n"))
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1725,10 +1816,13 @@ impl TerminalView {
     ) {
         if self.shows_editor() {
             window.focus(&self.editor.focus_handle(cx), cx);
-            return;
+        } else {
+            window.focus(&self.focus_handle, cx);
         }
-        window.focus(&self.focus_handle, cx);
         if self.shows_blocks() {
+            if event.button == MouseButton::Left {
+                self.start_block_selection(event, cx);
+            }
             return;
         }
         let Some(bounds) = self.bounds else {
@@ -1775,6 +1869,17 @@ impl TerminalView {
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.shows_blocks() {
+            if event.button == MouseButton::Left && self.selecting_blocks {
+                self.selecting_blocks = false;
+                // A plain click selects the block, not an empty range.
+                if self
+                    .block_selection
+                    .is_some_and(|selection| selection.is_empty())
+                {
+                    self.block_selection = None;
+                }
+                cx.notify();
+            }
             return;
         }
         let Some(bounds) = self.bounds else {
@@ -1816,6 +1921,14 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if self.shows_blocks() {
+            if self.selecting_blocks
+                && let (Some(metrics), Some(selection)) = (self.metrics, &mut self.block_selection)
+                && let Some(point) = self.painted_outputs.hit(event.position, metrics)
+                && selection.head != point
+            {
+                selection.head = point;
+                cx.notify();
+            }
             return;
         }
         let Some(bounds) = self.bounds else {
@@ -1973,6 +2086,7 @@ impl Render for TerminalView {
             window.focus(&self.focus_handle, cx);
         }
         let focused = self.focus_handle.is_focused(window);
+        self.painted_outputs.clear();
         let block_items = self.block_items();
         let frame = match self.renderer.build_frame(&self.terminal, focused) {
             Ok(mut frame) => {
@@ -2005,6 +2119,7 @@ impl Render for TerminalView {
                     metrics,
                     cx.theme(),
                     self.on_block_action(cx),
+                    self.painted_outputs.clone(),
                 );
                 let editor_panel = self
                     .shows_editor()

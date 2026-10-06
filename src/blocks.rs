@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::Result;
 use libghostty_vt::{Terminal, terminal::Options};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     grid::{FrameRow, GridRenderer},
@@ -91,6 +93,112 @@ impl Block {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// A cell in the block list: a block, a row of its output (scrollback and
+/// live screen together for a running block), and a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BlockPoint {
+    pub block: usize,
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Text selected across blocks, from where the drag started to where the
+/// pointer is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockSelection {
+    pub anchor: BlockPoint,
+    pub head: BlockPoint,
+}
+
+impl BlockSelection {
+    pub fn at(point: BlockPoint) -> Self {
+        Self {
+            anchor: point,
+            head: point,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Start and end in order; the end column is exclusive.
+    pub fn range(&self) -> (BlockPoint, BlockPoint) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+
+    /// The selected columns of `row` in `block`, end exclusive, if any.
+    pub fn columns_in(&self, block: usize, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.range();
+        let here = (block, row);
+        if here < (start.block, start.row) || here > (end.block, end.row) {
+            return None;
+        }
+        let from = if here == (start.block, start.row) {
+            start.col
+        } else {
+            0
+        };
+        let to = if here == (end.block, end.row) {
+            end.col
+        } else {
+            usize::MAX
+        };
+        (from < to).then_some((from, to))
+    }
+}
+
+/// The part of `text` covering grid columns `start..end`, counting wide
+/// characters as two columns.
+pub fn slice_columns(text: &str, start: usize, end: usize) -> &str {
+    let mut col = 0;
+    let mut from = text.len();
+    let mut to = text.len();
+    for (index, grapheme) in text.grapheme_indices(true) {
+        if col >= start && from == text.len() {
+            from = index;
+        }
+        if col >= end {
+            to = index;
+            break;
+        }
+        col += grapheme.width().max(1);
+    }
+    if from > to { "" } else { &text[from..to] }
+}
+
+/// Columns of the word around `col` in `text`: a run of non-whitespace, or
+/// the single column when there is none.
+pub fn word_columns(text: &str, col: usize) -> (usize, usize) {
+    let cells: Vec<(usize, usize, bool)> = text
+        .graphemes(true)
+        .scan(0, |position, grapheme| {
+            let width = grapheme.width().max(1);
+            let start = *position;
+            *position += width;
+            Some((start, start + width, grapheme.trim().is_empty()))
+        })
+        .collect();
+    let Some(hit) = cells
+        .iter()
+        .position(|(start, end, _)| (*start..*end).contains(&col))
+    else {
+        return (col, col + 1);
+    };
+    if cells[hit].2 {
+        return (cells[hit].0, cells[hit].1);
+    }
+    let first = cells[..hit]
+        .iter()
+        .rposition(|cell| cell.2)
+        .map_or(0, |index| index + 1);
+    let last = cells[hit..]
+        .iter()
+        .position(|cell| cell.2)
+        .map_or(cells.len(), |index| hit + index);
+    (cells[first].0, cells[last - 1].1)
 }
 
 /// How the list of blocks changed in a sync, for keeping a list view's
@@ -229,6 +337,36 @@ mod tests {
             running,
             rows,
         }
+    }
+
+    #[test]
+    fn selections_cover_rows_across_blocks() {
+        let selection = BlockSelection {
+            anchor: BlockPoint {
+                block: 1,
+                row: 2,
+                col: 4,
+            },
+            head: BlockPoint {
+                block: 0,
+                row: 1,
+                col: 3,
+            },
+        };
+        assert_eq!(selection.columns_in(0, 0), None);
+        assert_eq!(selection.columns_in(0, 1), Some((3, usize::MAX)));
+        assert_eq!(selection.columns_in(1, 0), Some((0, usize::MAX)));
+        assert_eq!(selection.columns_in(1, 2), Some((0, 4)));
+        assert_eq!(selection.columns_in(1, 3), None);
+    }
+
+    #[test]
+    fn columns_map_to_text_with_wide_characters() {
+        assert_eq!(slice_columns("hello world", 6, usize::MAX), "world");
+        assert_eq!(slice_columns("日本語 ok", 2, 6), "本語");
+        assert_eq!(slice_columns("short", 10, 20), "");
+        assert_eq!(word_columns("git commit --amend", 6), (4, 10));
+        assert_eq!(word_columns("a  b", 1), (1, 2));
     }
 
     #[test]

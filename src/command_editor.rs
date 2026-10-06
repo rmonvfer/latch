@@ -366,7 +366,10 @@ impl CommandEditor {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         let selected = self.buffer.selected_text();
-        if !selected.is_empty() {
+        if selected.is_empty() {
+            // Nothing selected here: let the pane copy what is selected in it.
+            cx.propagate();
+        } else {
             cx.write_to_clipboard(ClipboardItem::new_string(selected.to_string()));
         }
     }
