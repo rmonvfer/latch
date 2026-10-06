@@ -251,7 +251,9 @@ impl GridRenderer {
                 let mut fg: RgbColor = cell.fg_color()?.unwrap_or(colors.foreground);
                 let explicit_bg = cell.bg_color()?;
                 let mut bg = explicit_bg.unwrap_or(default_background);
-                let mut paint_bg = explicit_bg.is_some();
+                // A background that matches the default is left unpainted, so
+                // whatever lies under the grid (a block's tint) shows through.
+                let mut paint_bg = explicit_bg.is_some_and(|bg| bg != default_background);
 
                 if style.is_some_and(|style| style.inverse) {
                     std::mem::swap(&mut fg, &mut bg);

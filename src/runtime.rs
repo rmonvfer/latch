@@ -1102,7 +1102,18 @@ fn client_loop(
         if let Some(client) = connection.as_mut() {
             match client.request(Request::Poll { session, revision }) {
                 Ok(Response::Snapshot(snapshot)) => {
-                    if let Some(blocks) = &snapshot.blocks
+                    let next_revision = snapshot.revision;
+                    // The frame goes first: block rows are drawn over its
+                    // background.
+                    let blocks = snapshot.blocks.clone();
+                    if events
+                        .try_send(ClientEvent::Frame(Box::new(snapshot)))
+                        .is_ok()
+                    {
+                        revision = Some(next_revision);
+                        reported_error = None;
+                    }
+                    if let Some(blocks) = &blocks
                         && !fetch_block_updates(
                             client,
                             session,
@@ -1113,14 +1124,6 @@ fn client_loop(
                         )
                     {
                         return;
-                    }
-                    let next_revision = snapshot.revision;
-                    if events
-                        .try_send(ClientEvent::Frame(Box::new(snapshot)))
-                        .is_ok()
-                    {
-                        revision = Some(next_revision);
-                        reported_error = None;
                     }
                 }
                 Ok(Response::Unchanged) => {}

@@ -174,6 +174,8 @@ pub struct TerminalView {
     command_started: Option<Instant>,
     /// The session's command blocks, once the runtime reports them.
     blocks: Option<BlockList>,
+    /// The session's default background, which block rows are drawn over.
+    background: [u8; 3],
     /// A program has the alternate screen, so it gets the whole pane.
     full_screen: bool,
     /// Scroll and layout state of the block list, one item per block.
@@ -449,6 +451,7 @@ impl TerminalView {
                 branch: None,
                 command_started: None,
                 blocks: None,
+                background: [0, 0, 0],
                 full_screen: false,
                 block_list: {
                     let state = ListState::new(0, ListAlignment::Top, px(400.));
@@ -525,7 +528,14 @@ impl TerminalView {
                 rows,
             } => {
                 if let Some(blocks) = &mut self.blocks {
-                    match blocks.apply_rows(block, version, from, &rows, self.dimensions.cols) {
+                    match blocks.apply_rows(
+                        block,
+                        version,
+                        from,
+                        &rows,
+                        self.dimensions.cols,
+                        self.background,
+                    ) {
                         Ok(Some(index)) => self.block_list.remeasure_items(index..index + 1),
                         Ok(None) => {}
                         Err(error) => log::error!("failed to show a block's rows: {error:#}"),
@@ -581,6 +591,7 @@ impl TerminalView {
         self.connected = true;
         self.connection_error = None;
         self.mouse_tracking = frame.mouse_tracking;
+        self.background = frame.background;
         self.apply_blocks(frame.blocks.map(|blocks| *blocks), cx);
         self.control_token.clone_from(&frame.info.control_token);
         self.command_started = match frame.info.command_elapsed_ms {

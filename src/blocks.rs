@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
-use libghostty_vt::{Terminal, terminal::Options};
+use libghostty_vt::{Terminal, style::RgbColor, terminal::Options};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -262,8 +262,8 @@ impl BlockList {
         }
     }
 
-    /// Take rows the runtime sent for a block, `cols` wide. Returns the
-    /// block's index when it changed.
+    /// Take rows the runtime sent for a block, `cols` wide, painted over
+    /// `background`. Returns the block's index when it changed.
     pub fn apply_rows(
         &mut self,
         id: u64,
@@ -271,11 +271,12 @@ impl BlockList {
         from: usize,
         rows: &[String],
         cols: u16,
+        background: [u8; 3],
     ) -> Result<Option<usize>> {
         let Some(index) = self.blocks.iter().position(|block| block.id == id) else {
             return Ok(None);
         };
-        let decoded = decode(rows, cols)?;
+        let decoded = decode(rows, cols, background)?;
         let block = &mut self.blocks[index];
         if block.version != version {
             block.version = version;
@@ -293,7 +294,7 @@ impl BlockList {
 }
 
 /// Paint encoded rows into scratch terminals and read them back as rows.
-fn decode(rows: &[String], cols: u16) -> Result<Vec<Rc<FrameRow>>> {
+fn decode(rows: &[String], cols: u16, background: [u8; 3]) -> Result<Vec<Rc<FrameRow>>> {
     let mut decoded = Vec::with_capacity(rows.len());
     for page in rows.chunks(DECODE_PAGE_ROWS) {
         // A renderer copies only rows marked dirty, and blank rows of a
@@ -304,6 +305,12 @@ fn decode(rows: &[String], cols: u16) -> Result<Vec<Rc<FrameRow>>> {
             rows: page.len() as u16,
             max_scrollback: 0,
         })?;
+        // Cells in the session's own background are then left unpainted.
+        terminal.set_default_bg_color(Some(RgbColor {
+            r: background[0],
+            g: background[1],
+            b: background[2],
+        }))?;
         // Rows are exactly one line each; wrapping would shift the rest.
         terminal.vt_write(b"\x1b[?7l");
         for (index, row) in page.iter().enumerate() {
@@ -396,10 +403,10 @@ mod tests {
             "\x1b[0m\x1b]8;;\x1b\\\x1b[0;38;2;200;0;0;48;2;0;0;0mred \x1b[0mtext".to_string(),
             "second".to_string(),
         ];
-        assert_eq!(list.apply_rows(7, 1, 0, &rows, 20).unwrap(), Some(0));
+        assert_eq!(list.apply_rows(7, 1, 0, &rows, 20, [0, 0, 0]).unwrap(), Some(0));
         assert_eq!(list.blocks()[0].output_text(), "red text\nsecond");
-        list.apply_rows(7, 2, 0, &rows[1..], 20).unwrap();
+        list.apply_rows(7, 2, 0, &rows[1..], 20, [0, 0, 0]).unwrap();
         assert_eq!(list.blocks()[0].output_text(), "second");
-        assert_eq!(list.apply_rows(99, 1, 0, &rows, 20).unwrap(), None);
+        assert_eq!(list.apply_rows(99, 1, 0, &rows, 20, [0, 0, 0]).unwrap(), None);
     }
 }
