@@ -2922,9 +2922,16 @@ impl TerminalView {
         let had_text = self
             .block_selection
             .is_some_and(|selection| !selection.is_empty());
+        let running = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.blocks().get(block))
+            .is_some_and(|block| block.is_running());
         // A press that only dismisses selected text, or picks a word or a
-        // row, leaves the blocks unselected.
-        let selects_block = event.click_count == 1 && !had_text;
+        // row, leaves the blocks unselected. So does a press on the running
+        // command, which belongs to the program, as in Warp; it clears the
+        // selection, so a pane taken up by a program can always clear it.
+        let selects_block = event.click_count == 1 && !had_text && !running;
         if !selects_block {
             self.selected_blocks.clear();
         }

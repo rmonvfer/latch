@@ -1246,6 +1246,10 @@ pub(crate) fn encode_row(
     let mut previous_style = None;
     let mut previous_link: Option<String> = None;
     let mut column = 0u16;
+    // Empty cells in the default colors, held back until something follows
+    // them, so a row ends at its last visible cell and a blank row is empty.
+    let mut pending_blanks = 0usize;
+    let plain = (Style::default(), colors.foreground, colors.background, None);
     while let Some(cell) = cells.next() {
         let raw = cell.raw_cell()?;
         let wide = raw.wide()?;
@@ -1272,6 +1276,27 @@ pub(crate) fn encode_row(
             StyleColor::Palette(index) => Some(palette.0[usize::from(index.0)]),
             StyleColor::None => None,
         };
+        let blank = cell.graphemes_len()? == 0
+            && background == colors.background
+            && style.underline == Underline::None
+            && !style.strikethrough
+            && !raw.has_hyperlink()?;
+        if blank {
+            pending_blanks += 1;
+            column += 1;
+            continue;
+        }
+        if pending_blanks > 0 {
+            if previous_style != Some(plain) {
+                append_style(&mut encoded, plain.0, plain.1, plain.2, plain.3);
+                previous_style = Some(plain);
+            }
+            if previous_link.take().is_some() {
+                encoded.push_str("\x1b]8;;\x1b\\");
+            }
+            encoded.extend(std::iter::repeat_n(' ', pending_blanks));
+            pending_blanks = 0;
+        }
         let signature = (style, foreground, background, underline);
         if previous_style != Some(signature) {
             append_style(&mut encoded, style, foreground, background, underline);
