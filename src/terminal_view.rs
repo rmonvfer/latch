@@ -23,7 +23,7 @@ use crate::{
     agents::{Agent, AgentStatus},
     block_view::{self, BlockAction, Item, ItemContent, OnBlockAction, PaintedOutputs},
     blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange},
-    command_editor::{CommandEditor, CommandEditorEvent},
+    command_editor::{CommandEditor, CommandEditorEvent, Highlight},
     completion::{self, CompletionMenu},
     components::{elevated_shadow, icon, icon_button},
     control,
@@ -1059,17 +1059,26 @@ impl TerminalView {
                     .prompt
                     .as_ref()
                     .and_then(|prompt| prompt.cwd.as_deref());
+                // Warp's scheme: commands green, flags yellow, arguments
+                // cyan, variables magenta; a command the shell cannot run
+                // is underlined in red.
+                let ansi = |index: usize| Some(theme::to_hsla(colors.ansi[index]));
                 highlight::highlight(&text, commands, cwd)
                     .into_iter()
                     .map(|token| {
-                        let color = match token.kind {
-                            TokenKind::Command => colors.ansi[2],
-                            TokenKind::UnknownCommand => colors.ansi[1],
-                            TokenKind::Flag => colors.ansi[6],
-                            TokenKind::String => colors.ansi[3],
-                            TokenKind::Operator => colors.ansi[5],
+                        let (color, underline) = match token.kind {
+                            TokenKind::Command => (ansi(2), None),
+                            TokenKind::UnknownCommand => (None, ansi(1)),
+                            TokenKind::Flag => (ansi(3), None),
+                            TokenKind::Argument => (ansi(6), None),
+                            TokenKind::Variable => (ansi(5), None),
+                            TokenKind::Operator => (None, None),
                         };
-                        (token.range, theme::to_hsla(color))
+                        Highlight {
+                            range: token.range,
+                            color,
+                            underline,
+                        }
                     })
                     .collect()
             }

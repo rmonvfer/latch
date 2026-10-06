@@ -57,6 +57,15 @@ actions!(
 
 pub const KEY_CONTEXT: &str = "CommandEditor";
 
+/// How a range of the text is drawn: in its own color, underlined, or
+/// both.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Highlight {
+    pub range: Range<usize>,
+    pub color: Option<Hsla>,
+    pub underline: Option<Hsla>,
+}
+
 /// Rows shown before the editor scrolls.
 const MAX_VISIBLE_ROWS: usize = 12;
 
@@ -96,7 +105,7 @@ pub struct CommandEditor {
     scroll_row: usize,
     selecting: bool,
     /// Colors for ranges of the text; the rest is the terminal foreground.
-    highlights: Vec<(Range<usize>, Hsla)>,
+    highlights: Vec<Highlight>,
     /// Text that would complete the command, shown after the cursor when it
     /// is at the end.
     suggestion: Option<String>,
@@ -149,11 +158,7 @@ impl CommandEditor {
         self.edited(cx);
     }
 
-    pub fn set_highlights(
-        &mut self,
-        highlights: Vec<(Range<usize>, Hsla)>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_highlights(&mut self, highlights: Vec<Highlight>, cx: &mut Context<Self>) {
         self.highlights = highlights;
         cx.notify();
     }
@@ -669,7 +674,7 @@ impl Render for CommandEditor {
                     &font,
                     self.placeholder.len(),
                     theme.text_placeholder,
-                    false,
+                    None,
                 )],
                 selection: None,
             }]
@@ -722,7 +727,8 @@ impl Render for CommandEditor {
                 let fitted = fit_columns(first_line, room);
                 (!fitted.is_empty() && row >= self.scroll_row).then(|| {
                     let fitted: SharedString = fitted.to_string().into();
-                    let runs = vec![run(&font, fitted.len(), theme.text_placeholder, false)];
+                    // Ghost text is the foreground at 40%.
+                    let runs = vec![run(&font, fitted.len(), foreground.opacity(0.4), None)];
                     (row - self.scroll_row, col, fitted, runs)
                 })
             });
@@ -856,7 +862,7 @@ impl Render for CommandEditor {
 /// colors, the IME's marked range underlined.
 fn row_runs(
     row: Range<usize>,
-    highlights: &[(Range<usize>, Hsla)],
+    highlights: &[Highlight],
     marked: Option<Range<usize>>,
     font: &gpui::Font,
     foreground: Hsla,
@@ -864,7 +870,7 @@ fn row_runs(
     let mut edges = vec![row.start, row.end];
     for range in highlights
         .iter()
-        .map(|(range, _)| range)
+        .map(|highlight| &highlight.range)
         .chain(marked.as_ref())
     {
         edges.extend([range.start, range.end]);
@@ -875,13 +881,20 @@ fn row_runs(
     edges
         .windows(2)
         .map(|pair| {
-            let color = highlights
-                .iter()
-                .find(|(range, _)| range.start <= pair[0] && pair[0] < range.end)
-                .map_or(foreground, |(_, color)| *color);
-            let underline = marked
+            let highlight = highlights.iter().find(|highlight| {
+                highlight.range.start <= pair[0] && pair[0] < highlight.range.end
+            });
+            let color = highlight
+                .and_then(|highlight| highlight.color)
+                .unwrap_or(foreground);
+            let marked = marked
                 .as_ref()
                 .is_some_and(|marked| marked.start <= pair[0] && pair[0] < marked.end);
+            let underline = if marked {
+                Some(color)
+            } else {
+                highlight.and_then(|highlight| highlight.underline)
+            };
             run(font, pair[1] - pair[0], color, underline)
         })
         .collect()
@@ -900,15 +913,15 @@ fn fit_columns(text: &str, cols: usize) -> &str {
     text
 }
 
-fn run(font: &gpui::Font, len: usize, color: Hsla, underline: bool) -> TextRun {
+fn run(font: &gpui::Font, len: usize, color: Hsla, underline: Option<Hsla>) -> TextRun {
     TextRun {
         len,
         font: font.clone(),
         color,
         background_color: None,
-        underline: underline.then_some(UnderlineStyle {
+        underline: underline.map(|underline| UnderlineStyle {
             thickness: px(1.),
-            color: Some(color),
+            color: Some(underline),
             wavy: false,
         }),
         strikethrough: None,

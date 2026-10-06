@@ -1,5 +1,5 @@
-//! Syntax highlighting for command lines: command words colored by whether
-//! the shell can run them, plus flags, quoted strings, and operators.
+//! Syntax highlighting for command lines: command words marked by whether
+//! the shell can run them, plus flags, arguments, variables, and operators.
 
 use std::{
     collections::HashSet,
@@ -19,7 +19,10 @@ pub enum TokenKind {
     /// A command word that names nothing the shell can run.
     UnknownCommand,
     Flag,
-    String,
+    /// Any other word after the command, quoted strings included.
+    Argument,
+    /// A word that expands a variable, like `$HOME`.
+    Variable,
     Operator,
 }
 
@@ -234,14 +237,17 @@ pub fn highlight(text: &str, index: &CommandIndex, cwd: Option<&Path>) -> Vec<To
             }
             continue;
         }
-        if word.starts_with('-') && strings.is_empty() {
-            tokens.push(Token {
-                range: start..end,
-                kind: TokenKind::Flag,
-            });
+        let kind = if word.starts_with('-') && strings.is_empty() {
+            TokenKind::Flag
+        } else if word.starts_with('$') {
+            TokenKind::Variable
         } else {
-            tokens.extend(strings);
-        }
+            TokenKind::Argument
+        };
+        tokens.push(Token {
+            range: start..end,
+            kind,
+        });
     }
     tokens
 }
@@ -271,7 +277,7 @@ fn scan_word(text: &str, start: usize) -> (usize, Vec<Token>) {
                 position = (position + 1).min(bytes.len());
                 strings.push(Token {
                     range: opening..position,
-                    kind: TokenKind::String,
+                    kind: TokenKind::Argument,
                 });
             }
             _ => position += 1,
@@ -303,18 +309,21 @@ mod tests {
     }
 
     #[test]
-    fn colors_commands_flags_strings_and_operators() {
+    fn marks_commands_flags_arguments_variables_and_operators() {
         use TokenKind::*;
         assert_eq!(
-            kinds("git log --oneline | grep 'fix bug' && nope x"),
+            kinds("git log --oneline | grep 'fix bug' $HOME && nope x"),
             vec![
                 ("git", Command),
+                ("log", Argument),
                 ("--oneline", Flag),
                 ("|", Operator),
                 ("grep", Command),
-                ("'fix bug'", String),
+                ("'fix bug'", Argument),
+                ("$HOME", Variable),
                 ("&&", Operator),
                 ("nope", UnknownCommand),
+                ("x", Argument),
             ]
         );
     }
@@ -324,11 +333,16 @@ mod tests {
         use TokenKind::*;
         assert_eq!(
             kinds("FOO=1 sudo ls > out.txt"),
-            vec![("sudo", Command), ("ls", Command), (">", Operator)]
+            vec![
+                ("sudo", Command),
+                ("ls", Command),
+                (">", Operator),
+                ("out.txt", Argument)
+            ]
         );
         assert_eq!(
             kinds("echo \"a \\\" b\""),
-            vec![("echo", Command), ("\"a \\\" b\"", String)]
+            vec![("echo", Command), ("\"a \\\" b\"", Argument)]
         );
     }
 
@@ -339,7 +353,8 @@ mod tests {
             kinds("ls\ngi x"),
             vec![
                 ("ls", TokenKind::Command),
-                ("gi", TokenKind::UnknownCommand)
+                ("gi", TokenKind::UnknownCommand),
+                ("x", TokenKind::Argument)
             ]
         );
     }
