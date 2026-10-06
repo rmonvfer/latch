@@ -345,7 +345,7 @@ impl Blocks {
 
     /// Close the running block with `exit_code`, capturing all of its
     /// output from `terminal`. A command that erased the scrollback clears
-    /// every block, its own included.
+    /// the blocks before it, leaving its own.
     pub fn finish(
         &mut self,
         exit_code: i32,
@@ -356,8 +356,7 @@ impl Blocks {
         }
         self.output_tail.clear();
         if std::mem::take(&mut self.clear_requested) {
-            self.blocks.clear();
-            return Ok(());
+            self.clear();
         }
         let rows = self.encoder.encode_all(terminal)?;
         if let Some(block) = self.running_mut() {
@@ -578,10 +577,17 @@ mod tests {
         blocks.record(b"\x1b[H\x1b[2J\x1b[");
         blocks.record(b"3J");
         blocks.finish(0, &mut terminal(20, 5)).unwrap();
-        assert!(blocks.summaries().is_empty());
+        let commands = |blocks: &Blocks| -> Vec<String> {
+            blocks
+                .summaries()
+                .into_iter()
+                .map(|summary| summary.command)
+                .collect()
+        };
+        assert_eq!(commands(&blocks), vec!["clear"]);
         blocks.start("echo".into());
         blocks.finish(0, &mut terminal(20, 5)).unwrap();
-        assert_eq!(blocks.summaries().len(), 1);
+        assert_eq!(commands(&blocks), vec!["clear", "echo"]);
         blocks.clear();
         assert!(blocks.summaries().is_empty());
     }
