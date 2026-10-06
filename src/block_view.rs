@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Hsla, ListOffset, ListState, Pixels, Point, SharedString,
+    AnyElement, App, Bounds, ClickEvent, FontWeight, Hsla, ListOffset, ListState, Pixels, Point, SharedString,
     Window, canvas, div, fill, list, point, prelude::*, px, size,
 };
 use libghostty_vt::style::RgbColor;
@@ -29,7 +29,7 @@ use crate::{
 
 /// Space between a block's content and the pane's sides, on top of the
 /// terminal padding. The pane's grid is narrowed to match.
-pub const HORIZONTAL_INSET: Pixels = px(12.);
+pub const HORIZONTAL_INSET: Pixels = px(16.);
 
 /// Vertical spacing inside a block, in line heights, so it scales with the
 /// font: above the context line, between it and the command, between the
@@ -568,6 +568,12 @@ pub fn context_chips(
 ) -> Vec<AnyElement> {
     let palette = Palette::new(theme);
     let ansi = |index: usize| theme::to_hsla(theme.terminal.ansi[index]);
+    // Warp's chip: text one point under the terminal's, at its line height
+    // ratio, in a box bordered by the background mixed 15% toward the
+    // foreground.
+    let font_size = metrics.font_size - px(1.);
+    let line_height = font_size * (metrics.height / metrics.font_size);
+    let chip_border = mix(theme.terminal.background, theme.terminal.foreground, 0.15);
     let chip = |icon_name: &'static str, color: Hsla, label: AnyElement| {
         div()
             .flex()
@@ -578,10 +584,10 @@ pub fn context_chips(
             .py(px(2.))
             .rounded(px(4.))
             .border_1()
-            .border_color(palette.outline.opacity(2.))
+            .border_color(chip_border)
             .bg(palette.surface)
             .text_color(color)
-            .child(icon(icon_name, metrics.font_size - px(1.), color))
+            .child(icon(icon_name, font_size, color))
             .child(label)
             .into_any_element()
     };
@@ -622,7 +628,9 @@ pub fn context_chips(
         .map(|chip| {
             div()
                 .font_family(theme::FONT_FAMILY)
-                .text_size(metrics.font_size - px(1.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(font_size)
+                .line_height(line_height)
                 .child(chip)
                 .into_any_element()
         })

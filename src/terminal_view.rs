@@ -1203,12 +1203,14 @@ impl TerminalView {
             .relative()
             .flex()
             .flex_col()
-            // Warp's spacing: a block's top padding (1.1 lines) at 60% above
-            // the chips, 15px between them and the command, 16px below.
+            // Warp's spacing: a block's top padding (1.1 lines, less the
+            // hairline) at 60% above the chips, 15px between them and the
+            // command, and 24px below it.
             .gap(px(15.))
-            .px(metrics.padding + block_view::HORIZONTAL_INSET)
-            .pt(metrics.height * 1.1 * 0.6)
-            .pb(px(16.))
+            .pl(metrics.padding + block_view::HORIZONTAL_INSET)
+            .pr(px(16.))
+            .pt((metrics.height * 1.1 - px(1.)) * 0.6)
+            .pb(px(24.))
             .border_t_1()
             .border_color(foreground.opacity(0.1))
             .children(menu.map(|menu| {
