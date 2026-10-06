@@ -166,6 +166,7 @@ impl StatusBarSettings {
 }
 
 impl Workspace {
+    #[tracing::instrument(skip_all)]
     pub(crate) fn render_status_bar(
         &self,
         theme: &Theme,

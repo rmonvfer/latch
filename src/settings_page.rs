@@ -744,6 +744,7 @@ impl SettingsPage {
         ]
     }
 
+    #[tracing::instrument(skip_all)]
     fn render_status_bar(
         &self,
         settings: &Settings,
@@ -1879,6 +1880,7 @@ fn render_theme_preview(previewed: &Theme, chrome: &Theme) -> impl IntoElement {
 }
 
 impl Render for SettingsPage {
+    #[tracing::instrument(name = "SettingsPage::render", skip_all)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let settings = SettingsStore::get(cx).clone();

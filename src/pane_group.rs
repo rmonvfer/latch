@@ -917,6 +917,7 @@ fn restore_node(state: &PaneState, cx: &mut App) -> Option<PaneNode<Entity<Termi
 }
 
 impl Render for PaneGroup {
+    #[tracing::instrument(name = "PaneGroup::render", skip_all)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = if self.zoomed {
             self.render_leaf(&self.active.clone(), cx)

@@ -235,6 +235,7 @@ impl Palette {
 
 /// The block list. `live` is the frame of the running command's terminal,
 /// painted under its scrollback.
+#[tracing::instrument(skip_all)]
 pub fn render_list(
     state: &ListState,
     items: Rc<Vec<Item>>,
@@ -271,6 +272,7 @@ pub fn render_list(
 
 /// The header of the block whose output is scrolled under the top of the
 /// list, pinned there; clicking it scrolls back to the block's start.
+#[tracing::instrument(skip_all)]
 fn render_sticky_header(
     state: &ListState,
     items: &[Item],
@@ -313,6 +315,7 @@ fn header_height(metrics: CellMetrics) -> Pixels {
     metrics.height * (TOP_LINES + CONTEXT_SCALE + CONTEXT_TO_COMMAND_LINES + 1.)
 }
 
+#[tracing::instrument(skip_all)]
 fn render_item(
     index: usize,
     item: &Item,

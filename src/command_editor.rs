@@ -683,6 +683,7 @@ struct PaintRow {
 }
 
 impl Render for CommandEditor {
+    #[tracing::instrument(name = "CommandEditor::render", skip_all)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = CellMetrics::measure(SettingsStore::get(cx), window);
         // The cursor blinks only while the editor has focus.

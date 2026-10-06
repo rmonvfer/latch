@@ -1640,6 +1640,7 @@ impl Workspace {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     fn render_titlebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let display = self.active.and_then(|id| self.display(id, cx));
         // The toggle lives in the status bar by default; when the status bar
@@ -1766,6 +1767,7 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
+    #[tracing::instrument(name = "Workspace::render", skip_all)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let content: AnyElement = match self.active.and_then(|id| self.open_tabs.get(&id)) {

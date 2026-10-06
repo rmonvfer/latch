@@ -14,6 +14,7 @@ pub struct DisplayState {
 }
 
 impl DisplayState {
+    #[tracing::instrument(skip_all)]
     pub fn apply(
         &mut self,
         terminal: &mut Terminal<'static, 'static>,

@@ -1,0 +1,4 @@
+[env]
+# libghostty's Zig core otherwise builds in Debug mode with the dev profile,
+# which makes parsing terminal output dozens of times slower.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"

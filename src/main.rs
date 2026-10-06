@@ -27,6 +27,7 @@ mod output;
 mod pane_group;
 mod pane_tree;
 mod process_info;
+mod profiling;
 mod pty;
 mod runtime;
 mod runtime_blocks;
@@ -74,6 +75,7 @@ fn main() {
         .is_some_and(|arg| arg == "--session-runtime")
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+        profiling::init("runtime");
         if let Err(error) = runtime::serve() {
             log::error!("session runtime: {error:#}");
             std::process::exit(1);
@@ -86,6 +88,7 @@ fn main() {
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    profiling::init("app");
 
     application().with_assets(Assets).run(|cx: &mut App| {
         cx.set_app_identity(APP_IDENTIFIER, APP_NAME);
