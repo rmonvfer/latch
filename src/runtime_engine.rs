@@ -56,6 +56,9 @@ const MAX_GRID_CELLS: usize = 64 * 1024;
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SEARCH_MATCHES: usize = 20_000;
 const AGENT_MIN_WORK: Duration = Duration::from_secs(3);
+/// How long the width or colors must stay put before finished blocks are
+/// rebuilt for them.
+const REBUILD_DELAY: Duration = Duration::from_millis(250);
 /// Most command blocks a session keeps; older ones are dropped.
 const MAX_BLOCKS: usize = 1000;
 
@@ -186,6 +189,9 @@ struct Engine {
     completions: Option<Completions>,
     /// The terminal was swapped since the last snapshot, so every row is new.
     terminal_replaced: bool,
+    /// When finished blocks are rebuilt for a new width or colors: shortly
+    /// after the last change, so a window being dragged wider rebuilds once.
+    rebuild_due: Option<Instant>,
     pty: Pty,
     output: async_channel::Receiver<Vec<u8>>,
     shared: Arc<RwLock<SessionInfo>>,
@@ -301,6 +307,7 @@ impl Engine {
             prompt: None,
             completions: None,
             terminal_replaced: false,
+            rebuild_due: None,
             pty,
             output,
             shared,
@@ -344,6 +351,15 @@ impl Engine {
             self.update_metadata();
             if self.startup.is_some() && self.started.elapsed() >= STARTUP_FALLBACK {
                 self.send_startup();
+            }
+            if self.rebuild_due.is_some_and(|due| Instant::now() >= due) {
+                self.rebuild_due = None;
+                if let Err(error) = self.rebuild_blocks() {
+                    self.attention(Attention::Notification {
+                        title: Some("Command blocks".into()),
+                        body: format!("{error:#}"),
+                    });
+                }
             }
             self.refresh_info();
             match requests.try_recv() {
@@ -796,7 +812,7 @@ impl Engine {
                     blocks.terminal_resized();
                 }
                 if previous.cols != dimensions.cols {
-                    self.rebuild_blocks()?;
+                    self.rebuild_due = Some(Instant::now() + REBUILD_DELAY);
                 }
             }
             Operation::Scroll { delta } => {
@@ -947,7 +963,7 @@ impl Engine {
                 let changed = self.colors != colors;
                 self.colors = colors;
                 if changed {
-                    self.rebuild_blocks()?;
+                    self.rebuild_due = Some(Instant::now() + REBUILD_DELAY);
                 }
             }
             Operation::RunCommand { command } => self.type_into_shell(command, b"\r")?,
@@ -969,7 +985,11 @@ impl Engine {
             }
             Operation::Shell => return Ok(Response::Shell(Box::new(self.shell.clone()))),
             Operation::Read { lines } => {
-                let mut text = self.blocks.as_ref().map(BlockLog::text).unwrap_or_default();
+                let mut text = self
+                    .blocks
+                    .as_ref()
+                    .map(|blocks| blocks.text(lines.min(SCROLLBACK_LINES)))
+                    .unwrap_or_default();
                 text.push_str(&search::screen_text(&self.terminal)?);
                 let lines: Vec<&str> = text
                     .lines()

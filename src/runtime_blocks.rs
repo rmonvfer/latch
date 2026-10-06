@@ -25,6 +25,10 @@ use crate::{
 /// this the oldest blocks give theirs up and keep their rows as captured.
 const OUTPUT_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Most raw output replayed to rebuild one block; a larger block keeps the
+/// rows it was captured with, so a rebuild's cost stays bounded.
+const MAX_REPLAY_BYTES: usize = 4 * 1024 * 1024;
+
 /// Most encoded bytes sent in one reply for a block's rows; the rest
 /// follows in later replies.
 const ROWS_REPLY_BYTES: usize = 2 * 1024 * 1024;
@@ -351,6 +355,9 @@ impl Blocks {
             let (Some(raw), false) = (&block.raw, block.is_running()) else {
                 continue;
             };
+            if raw.len() > MAX_REPLAY_BYTES {
+                continue;
+            }
             let mut terminal = new_terminal()?;
             terminal.vt_write(raw);
             block.rows = self.encoder.encode_all(&mut terminal)?;
@@ -399,21 +406,30 @@ impl Blocks {
         Some((block.version, rows))
     }
 
-    /// Every block as plain text: each command after a `$`, then its
-    /// output. A running command's live screen is not included.
-    pub fn text(&self) -> String {
-        let mut text = String::new();
-        for block in &self.blocks {
-            if !block.command.is_empty() {
-                text.push_str("$ ");
-                text.push_str(&block.command);
-                text.push('\n');
+    /// The newest `lines` non-empty lines of the blocks as plain text:
+    /// each command after a `$`, then its output. Only the lines kept are
+    /// read, newest first. A running command's live screen is not included.
+    pub fn text(&self, lines: usize) -> String {
+        let mut kept: Vec<String> = Vec::new();
+        'blocks: for block in self.blocks.iter().rev() {
+            for row in block.rows.iter().rev() {
+                if kept.len() >= lines {
+                    break 'blocks;
+                }
+                let line = plain_text(row).trim_end().to_string();
+                if !line.is_empty() {
+                    kept.push(line);
+                }
             }
-            for row in &block.rows {
-                text.push_str(plain_text(row).trim_end());
-                text.push('\n');
+            if !block.command.is_empty() {
+                if kept.len() >= lines {
+                    break;
+                }
+                kept.push(format!("$ {}", block.command));
             }
         }
+        let mut text: String = kept.into_iter().rev().map(|line| line + "\n").collect();
+        text.shrink_to_fit();
         text
     }
 }
@@ -468,7 +484,8 @@ mod tests {
         assert_eq!(rows.len(), 31);
         assert_eq!(rows[0], "1");
         assert_eq!(rows[30], "31");
-        assert!(blocks.text().starts_with("$ seq 1 30\n1\n2\n"));
+        assert!(blocks.text(100).starts_with("$ seq 1 30\n1\n2\n"));
+        assert_eq!(blocks.text(2), "30\n31\n");
     }
 
     #[test]
