@@ -52,6 +52,9 @@ pub struct Settings {
     /// Stack command blocks up from the input, as in a classic terminal,
     /// rather than down from the top of the pane.
     pub blocks_from_bottom: bool,
+    /// Copy text to the clipboard as soon as it is selected in the block
+    /// list.
+    pub copy_on_select: bool,
     /// Resume the coding agent session a pane was running when it is
     /// restored after the session runtime stopped.
     pub resume_agents: bool,
@@ -75,6 +78,7 @@ impl Default for Settings {
             command_blocks: true,
             resume_agents: true,
             blocks_from_bottom: true,
+            copy_on_select: true,
         }
     }
 }

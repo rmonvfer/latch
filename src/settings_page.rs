@@ -737,6 +737,20 @@ impl SettingsPage {
                         |on, _, cx| SettingsStore::update(cx, |settings| settings.blocks_from_bottom = on),
                     ))
                     .into_any_element(),
+                    row(
+                        "Copy on select",
+                        "Copy text to the clipboard as soon as you select it in a block.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "copy-on-select",
+                        settings.copy_on_select,
+                        settings.command_blocks,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.copy_on_select = on),
+                    ))
+                    .into_any_element(),
                 ],
                 theme,
             )
@@ -1334,12 +1348,28 @@ const SHORTCUT_GROUPS: [(&str, &[Shortcut]); 6] = [
                 action: "Open the block menu",
             },
             Shortcut {
+                keys: &[&["⌘", "↑"], &["⌘", "↓"]],
+                action: "Select the previous or next block",
+            },
+            Shortcut {
+                keys: &[&["⌘", "Click"], &["⇧", "Click"]],
+                action: "Add a block to the selection, or select a range",
+            },
+            Shortcut {
+                keys: &[&["⇧", "↑"], &["⇧", "↓"]],
+                action: "Extend the selection, with blocks selected",
+            },
+            Shortcut {
+                keys: &[&["⌘", "C"]],
+                action: "Copy the selected blocks' commands and output",
+            },
+            Shortcut {
                 keys: &[&["⌘", "⇧", "C"]],
-                action: "Copy the block's command and output",
+                action: "Copy the blocks' commands",
             },
             Shortcut {
                 keys: &[&["⌥", "⌘", "⇧", "C"]],
-                action: "Copy the block's output",
+                action: "Copy the blocks' output",
             },
             Shortcut {
                 keys: &[&["⌘", "⇧", "F"]],

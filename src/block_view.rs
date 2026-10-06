@@ -1,7 +1,8 @@
 //! Painting a pane's command blocks as a scrolling list. Each block shows
 //! a context line (environments, directory, branch, duration) and its
 //! command above its output, separated from the next block by a hairline;
-//! failed blocks are tinted red and selected ones take the accent color.
+//! failed blocks are tinted red and selected ones take the accent color,
+//! a run of adjacent selected blocks outlined as one box.
 
 use std::{
     cell::RefCell,
@@ -24,6 +25,7 @@ use crate::{
     grid::{CellMetrics, Frame, paint_rows},
     process_info::shorten_home,
     runtime_protocol::BlockContext,
+    selected_blocks::SelectionBorder,
     text_input::TextInput,
     theme::{self, Theme},
     tooltip::text_tooltip,
@@ -43,7 +45,13 @@ const BOTTOM_LINES: f32 = 1.0;
 /// The context line's text, relative to the terminal font.
 const CONTEXT_SCALE: f32 = 0.9;
 const FAILURE_STRIPE: f32 = 5.;
-const SELECTION_BORDER: f32 = 2.;
+/// Selected text, the same light blue in every theme, as in Warp.
+const TEXT_SELECTION: Hsla = Hsla {
+    h: 0.6,
+    s: 0.93,
+    l: 0.72,
+    a: 0.4,
+};
 const TOOLBELT_BUTTON: f32 = 26.;
 const FILTER_BAR_WIDTH: f32 = 380.;
 
@@ -60,7 +68,8 @@ pub struct Item {
     header: Option<Header>,
     content: ItemContent,
     collapsed: bool,
-    selected: bool,
+    /// The selection border, when the block is selected.
+    border: Option<SelectionBorder>,
     /// Text selected across blocks, painted where it covers this block.
     selection: Option<BlockSelection>,
     /// Whether a hairline divides the block from what is above it.
@@ -74,10 +83,17 @@ pub struct Item {
     matches: Vec<RowMatch>,
 }
 
-/// Where each visible block's output was last painted, for mapping the
-/// pointer to a cell.
+/// Where each visible block and its output were last painted, for mapping
+/// the pointer to a block and a cell.
 #[derive(Clone, Default)]
-pub struct PaintedOutputs(Rc<RefCell<Vec<PaintedOutput>>>);
+pub struct PaintedOutputs(Rc<RefCell<Painted>>);
+
+#[derive(Default)]
+struct Painted {
+    outputs: Vec<PaintedOutput>,
+    /// Each visible block's bounds, clipped to the list.
+    blocks: Vec<(usize, Bounds<Pixels>)>,
+}
 
 #[derive(Clone, Copy)]
 struct PaintedOutput {
@@ -89,17 +105,34 @@ struct PaintedOutput {
 
 impl PaintedOutputs {
     pub fn clear(&self) {
-        self.0.borrow_mut().clear();
+        let mut painted = self.0.borrow_mut();
+        painted.outputs.clear();
+        painted.blocks.clear();
     }
 
     fn record(&self, output: PaintedOutput) {
-        self.0.borrow_mut().push(output);
+        self.0.borrow_mut().outputs.push(output);
+    }
+
+    fn record_block(&self, block: usize, bounds: Bounds<Pixels>) {
+        self.0.borrow_mut().blocks.push((block, bounds));
+    }
+
+    /// The block under `position`, if the pointer is over one.
+    pub fn block_at(&self, position: Point<Pixels>) -> Option<usize> {
+        self.0
+            .borrow()
+            .blocks
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&position))
+            .map(|(block, _)| *block)
     }
 
     /// The cell at `position`, or for a point between or beyond blocks,
     /// the nearest cell of the nearest block, so drags keep selecting.
     pub fn hit(&self, position: Point<Pixels>, metrics: CellMetrics) -> Option<BlockPoint> {
-        let outputs = self.0.borrow();
+        let painted = self.0.borrow();
+        let outputs = &painted.outputs;
         let distance = |output: &PaintedOutput| {
             let top = output.origin.y;
             let bottom = top + metrics.height * output.rows as f32;
@@ -137,7 +170,6 @@ impl PaintedOutputs {
 /// Something done to a block from its toolbelt, its menu, or a shortcut.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BlockAction {
-    Select,
     ToggleCollapsed,
     /// The command and its output.
     CopyAll,
@@ -208,7 +240,7 @@ struct Header {
 }
 
 impl Item {
-    pub fn block(block: &Block, content: ItemContent, selected: bool) -> Self {
+    pub fn block(block: &Block, content: ItemContent, border: Option<SelectionBorder>) -> Self {
         Self {
             // Startup output has no command to show.
             header: (!block.command.is_empty()).then(|| Header {
@@ -223,7 +255,7 @@ impl Item {
             }),
             content,
             collapsed: block.collapsed,
-            selected,
+            border,
             selection: None,
             divider: true,
             bookmarked: block.bookmarked,
@@ -305,7 +337,7 @@ impl Palette {
             accent: theme.text_accent,
             error: theme::to_hsla(terminal.ansi[1]),
             bookmark: theme::to_hsla(terminal.ansi[4]),
-            selection: theme.text_accent.opacity(0.3),
+            selection: TEXT_SELECTION,
         }
     }
 }
@@ -379,6 +411,9 @@ fn render_sticky_header(
             .border_color(palette.outline)
             .cursor_pointer()
             .hover(move |this| this.bg(palette.surface))
+            // A click on the header scrolls; it neither selects nor starts
+            // selecting text.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_: &ClickEvent, window, cx| {
                 on_action(BlockAction::ScrollToTop, index, window, cx)
             })
@@ -421,6 +456,7 @@ fn render_item(
     let selection = item.selection;
     let matches = item.matches.clone();
     let gaps = item.gaps.clone();
+    let bounds_painted = painted.clone();
 
     let output = canvas(
         |_, _, _| {},
@@ -491,8 +527,10 @@ fn render_item(
     .h(output_height);
 
     let failed = item.failed();
-    let select = on_action.clone();
+    let selected = item.border.is_some();
     let has_output = row_count > 0;
+    // The selection's top edge replaces the hairline above the block.
+    let divider = item.divider && item.border.is_none_or(|border| border.top == 0.);
     div()
         .id(("block", index))
         .group("block")
@@ -500,14 +538,27 @@ fn render_item(
         .flex()
         .flex_col()
         .w_full()
-        .when(item.divider, |this| {
+        .when(divider, |this| {
             this.border_t_1().border_color(palette.outline)
         })
-        .when(failed, |this| this.bg(palette.error.opacity(0.1)))
-        .when(item.selected, |this| this.bg(palette.accent.opacity(0.25)))
+        .when(selected, |this| this.bg(palette.accent.opacity(0.25)))
         .pb(metrics.height * BOTTOM_LINES)
         .when(item.header.is_none(), |this| this.pt(metrics.height * 0.5))
-        .on_click(move |_: &ClickEvent, window, cx| select(BlockAction::Select, index, window, cx))
+        // Under the content, the failure tint over the selection's.
+        .when(failed, |this| {
+            this.child(div().absolute().inset_0().bg(palette.error.opacity(0.1)))
+        })
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, (), window, _| {
+                    let visible = window.content_mask().bounds.intersect(&bounds);
+                    bounds_painted.record_block(index, visible);
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
         .on_mouse_down(MouseButton::Right, {
             let on_action = on_action.clone();
             move |event: &MouseDownEvent, window, cx| {
@@ -531,7 +582,7 @@ fn render_item(
         .child(output)
         // The stripe and the selection border sit over the block, so they
         // never change its size.
-        .when(failed && !item.selected, |this| {
+        .when(failed && !selected, |this| {
             this.child(
                 div()
                     .absolute()
@@ -542,15 +593,16 @@ fn render_item(
                     .bg(palette.error),
             )
         })
-        .when(item.selected, |this| {
-            this.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .border(px(SELECTION_BORDER))
-                    .border_color(palette.accent),
-            )
-        })
+        .children(item.border.map(|border| {
+            div()
+                .absolute()
+                .inset_0()
+                .border_t(px(border.top))
+                .border_b(px(border.bottom))
+                .border_l(px(border.sides))
+                .border_r(px(border.sides))
+                .border_color(palette.accent)
+        }))
         .children(item.header.as_ref().map(|_| {
             render_toolbelt(
                 index,
@@ -609,6 +661,8 @@ fn render_filter_bar(
     div()
         .px(metrics.padding + HORIZONTAL_INSET)
         .pb(metrics.height * COMMAND_TO_OUTPUT_LINES)
+        // Pressing in the bar edits the filter, not the block's selection.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
             div()
                 .flex()
@@ -752,6 +806,7 @@ fn render_toolbelt(
             .hover(move |this| this.bg(palette.surface_raised))
             .tooltip(text_tooltip(vec![label.into()]))
             .child(icon(name, px(14.), color))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 on_action(action, index, window, cx);

@@ -107,7 +107,7 @@ impl Block {
 
 /// A cell in the block list: a block, a row of its output (scrollback and
 /// live screen together for a running block), and a column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BlockPoint {
     pub block: usize,
     pub row: usize,

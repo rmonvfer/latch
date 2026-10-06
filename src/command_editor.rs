@@ -168,6 +168,12 @@ impl CommandEditor {
         self.edited(cx);
     }
 
+    /// Put the cursor at the start of the text.
+    pub fn move_to_start(&mut self, cx: &mut Context<Self>) {
+        self.buffer.move_to(0, false);
+        self.moved(cx);
+    }
+
     pub fn set_highlights(&mut self, highlights: Vec<Highlight>, cx: &mut Context<Self>) {
         self.highlights = highlights;
         cx.notify();

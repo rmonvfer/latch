@@ -8,11 +8,11 @@ use std::{
 use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, AsyncApp, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
-    EventEmitter, FocusHandle, Focusable, FollowMode, KeyBinding, KeyDownEvent, KeyUpEvent,
-    ListAlignment, ListState, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent, SharedString,
-    Subscription, Task, WeakEntity, Window, actions, anchored, canvas, deferred, div, fill,
-    prelude::*, px,
+    EventEmitter, FocusHandle, Focusable, FollowMode, KeyBinding, KeyContext, KeyDownEvent,
+    KeyUpEvent, ListAlignment, ListState, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollDelta, ScrollWheelEvent,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, canvas, deferred, div,
+    fill, prelude::*, px,
 };
 use libghostty_vt::{
     Terminal, key, mouse,
@@ -49,6 +49,7 @@ use crate::{
         BlockContext, Blocks, Colors, Dimensions, Launch, Operation, SessionInfo, Snapshot,
     },
     search::SearchMatch,
+    selected_blocks::SelectedBlocks,
     settings::SettingsStore,
     shell_integration::{self, ShellIntegration},
     text_input::{TextInput, TextInputEvent},
@@ -67,8 +68,12 @@ actions!(
         SearchPrevious,
         PreviousPrompt,
         NextPrompt,
-        CopyBlock,
+        CopyBlockCommands,
         CopyBlockOutput,
+        SelectPreviousBlock,
+        SelectNextBlock,
+        ExtendBlockSelectionUp,
+        ExtendBlockSelectionDown,
         ToggleBlockBookmark,
         PreviousBookmark,
         NextBookmark,
@@ -81,6 +86,9 @@ actions!(
 );
 
 const SEARCH_CONTEXT: &str = "TerminalSearch";
+/// Key context of a pane with blocks selected, where arrows move the
+/// selection.
+const BLOCK_SELECTION_CONTEXT: &str = "BlockSelection";
 /// Key context of a pane showing blocks, where block shortcuts apply.
 const BLOCKS_CONTEXT: &str = "TerminalBlocks";
 
@@ -209,11 +217,12 @@ pub struct TerminalView {
     /// Whether the block list is anchored to the input, per the setting
     /// it was made with.
     blocks_from_bottom: bool,
-    /// The block picked by clicking or with ⌘↑ and ⌘↓.
-    selected_block: Option<usize>,
-    /// Text selected in the block list, and whether a drag is extending it.
+    /// The blocks picked by clicking or with ⌘↑ and ⌘↓.
+    selected_blocks: SelectedBlocks,
+    /// Text selected in the block list.
     block_selection: Option<BlockSelection>,
-    selecting_blocks: bool,
+    /// The press in the block list being held, until its release.
+    block_press: Option<BlockPress>,
     /// Where the block list last painted each block's rows.
     painted_outputs: PaintedOutputs,
     /// The block whose menu is open, and where.
@@ -355,6 +364,39 @@ impl BlockFilter {
         }
     }
 }
+
+/// A press of the left button over a block.
+struct BlockPress {
+    /// The block a release over it selects, when the press can select one.
+    block: Option<usize>,
+    origin: gpui::Point<Pixels>,
+    modifiers: Modifiers,
+    /// The pointer moved far enough to select text rather than the block.
+    dragged: bool,
+    /// What a drag selects by, from the click count.
+    unit: SelectionUnit,
+    /// The cells, word, or row first pressed, kept selected while dragging.
+    start: BlockPoint,
+    end: BlockPoint,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionUnit {
+    Cell,
+    Word,
+    Row,
+}
+
+/// What copying a block takes from it.
+#[derive(Clone, Copy)]
+enum BlockText {
+    Command,
+    Output,
+    CommandAndOutput,
+}
+
+/// How far the pointer moves before a press selects text, as in Warp.
+const DRAG_THRESHOLD: f32 = 0.5;
 
 struct MouseInput {
     pressed: Option<mouse::Button>,
@@ -616,9 +658,9 @@ impl TerminalView {
                 resize_task: None,
                 block_list: block_list_state(0, SettingsStore::get(cx).blocks_from_bottom),
                 blocks_from_bottom: SettingsStore::get(cx).blocks_from_bottom,
-                selected_block: None,
+                selected_blocks: SelectedBlocks::default(),
                 block_selection: None,
-                selecting_blocks: false,
+                block_press: None,
                 painted_outputs: PaintedOutputs::default(),
                 block_menu: None,
                 block_filter: None,
@@ -836,12 +878,21 @@ impl TerminalView {
             ListChange::Unchanged => {}
             ListChange::Shifted { dropped, added } => {
                 if dropped > 0 {
-                    // Block indices shift, so a selection would point elsewhere.
-                    self.block_selection = None;
                     self.block_list.splice(0..dropped, 0);
-                    self.selected_block = self
-                        .selected_block
-                        .and_then(|index| index.checked_sub(dropped));
+                    self.selected_blocks.shift(dropped);
+                    self.block_selection = self.block_selection.and_then(|selection| {
+                        let shift = |point: BlockPoint| {
+                            Some(BlockPoint {
+                                block: point.block.checked_sub(dropped)?,
+                                ..point
+                            })
+                        };
+                        Some(BlockSelection {
+                            anchor: shift(selection.anchor)?,
+                            head: shift(selection.head)?,
+                        })
+                    });
+                    self.block_press = None;
                 }
                 let count = self.block_list.item_count();
                 self.block_list.splice(count..count, added);
@@ -857,8 +908,9 @@ impl TerminalView {
             }
             ListChange::Reset => {
                 self.block_list.reset(blocks.blocks().len());
-                self.selected_block = None;
+                self.selected_blocks.clear();
                 self.block_selection = None;
+                self.block_press = None;
             }
         }
         let became_ready = self.prompt.is_none() && reported.prompt.is_some();
@@ -924,17 +976,26 @@ impl TerminalView {
         &self.metadata
     }
 
-    fn previous_prompt(&mut self, _: &PreviousPrompt, _: &mut Window, cx: &mut Context<Self>) {
+    fn previous_prompt(&mut self, _: &PreviousPrompt, window: &mut Window, cx: &mut Context<Self>) {
         if self.shows_blocks() {
-            self.select_adjacent_block(false, cx);
+            // In the input, ⌘↑ first moves to its start; from there it
+            // selects the newest block.
+            let editor = self.editor.clone();
+            if editor.focus_handle(cx).is_focused(window)
+                && !editor.read(cx).text_before_cursor().is_empty()
+            {
+                editor.update(cx, |editor, cx| editor.move_to_start(cx));
+                return;
+            }
+            self.select_adjacent_block(false, true, window, cx);
         } else {
             self.send(Operation::Prompt { forward: false }, cx);
         }
     }
 
-    fn next_prompt(&mut self, _: &NextPrompt, _: &mut Window, cx: &mut Context<Self>) {
+    fn next_prompt(&mut self, _: &NextPrompt, window: &mut Window, cx: &mut Context<Self>) {
         if self.shows_blocks() {
-            self.select_adjacent_block(true, cx);
+            self.select_adjacent_block(true, true, window, cx);
         } else {
             self.send(Operation::Prompt { forward: true }, cx);
         }
@@ -952,7 +1013,7 @@ impl TerminalView {
         if command.trim().is_empty() {
             return;
         }
-        self.selected_block = None;
+        self.selected_blocks.clear();
         self.history.push(command);
         if self.prompt.is_some() {
             self.send(
@@ -988,10 +1049,19 @@ impl TerminalView {
         if !matches!(action, BlockAction::OpenMenu(_)) {
             self.block_menu = None;
         }
+        // Copying and scrolling from a selected block's menu act on every
+        // selected block.
+        let targets: Vec<usize> = if self.selected_blocks.contains(index) {
+            self.selected_blocks.indices().collect()
+        } else {
+            vec![index]
+        };
         match action {
-            BlockAction::Select => self.selected_block = Some(index),
             BlockAction::OpenMenu(position) => {
-                self.selected_block = Some(index);
+                // The menu of an unselected block is for that block alone.
+                if !self.selected_blocks.contains(index) {
+                    self.select_blocks(|selection| selection.select(index), window, cx);
+                }
                 self.block_menu = Some((index, position));
             }
             BlockAction::ToggleCollapsed => {
@@ -1006,14 +1076,16 @@ impl TerminalView {
                 }
             }
             BlockAction::CopyAll => {
-                let text = format!("{command}\n{}", self.block_output_text(index, cx));
+                let text = self.blocks_text(&targets, BlockText::CommandAndOutput, cx);
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             BlockAction::CopyCommand => {
-                cx.write_to_clipboard(ClipboardItem::new_string(command));
+                let text = self.blocks_text(&targets, BlockText::Command, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             BlockAction::CopyOutput => {
-                cx.write_to_clipboard(ClipboardItem::new_string(self.block_output_text(index, cx)));
+                let text = self.blocks_text(&targets, BlockText::Output, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             BlockAction::CopyDirectory => {
                 if let Some(cwd) = cwd {
@@ -1026,8 +1098,13 @@ impl TerminalView {
                 }
             }
             BlockAction::Rerun => self.run_command(&command, cx),
-            BlockAction::ScrollToTop => self.block_list.scroll_to(block_view::block_start(index)),
-            BlockAction::ScrollToBottom => self.scroll_to_block_bottom(index),
+            BlockAction::ScrollToTop => {
+                let top = targets.first().copied().unwrap_or(index);
+                self.block_list.scroll_to(block_view::block_start(top));
+            }
+            BlockAction::ScrollToBottom => {
+                self.scroll_to_block_bottom(targets.last().copied().unwrap_or(index));
+            }
             BlockAction::ToggleFilter => self.toggle_block_filter(id, index, window, cx),
             BlockAction::Filter(change) => {
                 if let Some(filter) = self
@@ -1042,7 +1119,7 @@ impl TerminalView {
                 }
             }
             BlockAction::FindInBlock => {
-                self.selected_block = Some(index);
+                self.selected_blocks.select(index);
                 self.open_search(Some(id), window, cx);
             }
         }
@@ -1053,12 +1130,149 @@ impl TerminalView {
         self.blocks.as_mut()?.blocks_mut().get_mut(index)
     }
 
-    /// The block at which shortcuts act: the selected one, else the newest.
+    /// The block at which shortcuts act: the last selected, else the newest.
     fn target_block(&self) -> Option<usize> {
         let count = self.blocks.as_ref()?.blocks().len();
-        self.selected_block
+        self.selected_blocks
+            .tail()
             .filter(|index| *index < count)
             .or(count.checked_sub(1))
+    }
+
+    /// Change which blocks are selected. While any are, the pane takes the
+    /// keys from the input, as Warp's block list does.
+    fn select_blocks(
+        &mut self,
+        change: impl FnOnce(&mut SelectedBlocks),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.selected_blocks);
+        if self.selected_blocks.is_empty() {
+            self.focus_input(window, cx);
+        } else {
+            self.block_selection = None;
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    /// Drop the selected blocks and text, and give the keys back to the
+    /// input.
+    fn clear_block_selections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_blocks.clear();
+        self.block_selection = None;
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
+    fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shows_editor() {
+            window.focus(&self.editor.focus_handle(cx), cx);
+        }
+    }
+
+    /// The text of blocks `indices`, each as `kind` asks, skipping blank
+    /// ones, one block after another.
+    fn blocks_text(&self, indices: &[usize], kind: BlockText, cx: &App) -> String {
+        let Some(blocks) = &self.blocks else {
+            return String::new();
+        };
+        indices
+            .iter()
+            .filter_map(|&index| {
+                let command = blocks.blocks().get(index)?.command.as_str();
+                let text = match kind {
+                    BlockText::Command => command.to_string(),
+                    BlockText::Output => self.block_output_text(index, cx),
+                    BlockText::CommandAndOutput if command.is_empty() => {
+                        self.block_output_text(index, cx)
+                    }
+                    BlockText::CommandAndOutput => {
+                        format!("{command}\n{}", self.block_output_text(index, cx))
+                    }
+                };
+                (!text.trim().is_empty()).then_some(text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn copy_block_commands(
+        &mut self,
+        _: &CopyBlockCommands,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.act_on_target_block(BlockAction::CopyCommand, window, cx);
+    }
+
+    fn select_previous_block(
+        &mut self,
+        _: &SelectPreviousBlock,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_adjacent_block(false, false, window, cx);
+    }
+
+    fn select_next_block(
+        &mut self,
+        _: &SelectNextBlock,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_adjacent_block(true, false, window, cx);
+    }
+
+    fn extend_selection_up(
+        &mut self,
+        _: &ExtendBlockSelectionUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_block_selection(false, window, cx);
+    }
+
+    fn extend_selection_down(
+        &mut self,
+        _: &ExtendBlockSelectionDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_block_selection(true, window, cx);
+    }
+
+    /// Grow or shrink the selected range by a block from its last end.
+    fn extend_block_selection(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(tail), Some(count)) = (
+            self.selected_blocks.tail(),
+            self.blocks.as_ref().map(|blocks| blocks.blocks().len()),
+        ) else {
+            return;
+        };
+        let next = if down {
+            (tail + 1).min(count.saturating_sub(1))
+        } else {
+            tail.saturating_sub(1)
+        };
+        self.select_blocks(|selection| selection.extend_to(next), window, cx);
+        self.reveal_block(next);
+    }
+
+    /// Scroll so block `index` starts at the top of the list, unless its
+    /// top is already in view.
+    fn reveal_block(&mut self, index: usize) {
+        let viewport = self.block_list.viewport_bounds();
+        let top_visible = self
+            .block_list
+            .bounds_for_item(index)
+            .is_some_and(|bounds| {
+                bounds.top() >= viewport.top() && bounds.top() < viewport.bottom()
+            });
+        if !top_visible {
+            self.block_list.scroll_to(block_view::block_start(index));
+        }
     }
 
     fn act_on_target_block(
@@ -1071,10 +1285,6 @@ impl TerminalView {
             Some(index) if self.shows_blocks() => self.block_action(action, index, window, cx),
             _ => cx.propagate(),
         }
-    }
-
-    fn copy_block(&mut self, _: &CopyBlock, window: &mut Window, cx: &mut Context<Self>) {
-        self.act_on_target_block(BlockAction::CopyAll, window, cx);
     }
 
     fn copy_block_output(
@@ -1169,7 +1379,7 @@ impl TerminalView {
             .filter(|(_, block)| block.bookmarked)
             .map(|(index, _)| index)
             .collect();
-        let from = self.selected_block;
+        let from = self.selected_blocks.tail();
         let next = if forward {
             bookmarked
                 .iter()
@@ -1183,7 +1393,7 @@ impl TerminalView {
                 .find(|index| from.is_none_or(|from| *index < from))
         };
         if let Some(index) = next {
-            self.selected_block = Some(index);
+            self.selected_blocks.select(index);
             self.block_list.scroll_to(block_view::block_start(index));
             cx.notify();
         }
@@ -1387,6 +1597,10 @@ impl TerminalView {
         let bookmarked = block.bookmarked;
         let collapsed = block.collapsed;
         let running = block.is_running();
+        // For several selected blocks, the menu copies and scrolls them all
+        // and leaves out what only makes sense for one.
+        let several = self.selected_blocks.contains(index) && self.selected_blocks.len() > 1;
+        let single = !several;
         let item = |id: &'static str,
                     icon_name: &'static str,
                     label: &'static str,
@@ -1424,26 +1638,34 @@ impl TerminalView {
                 "block-copy",
                 "copy",
                 "Copy",
-                Some("⌘⇧C"),
+                Some("⌘C"),
                 BlockAction::CopyAll,
             ))
-            .when(has_command, |menu| {
+            .when(has_command || several, |menu| {
                 menu.child(item(
                     "block-copy-command",
                     "terminal",
-                    "Copy command",
-                    None,
+                    if several {
+                        "Copy commands"
+                    } else {
+                        "Copy command"
+                    },
+                    Some("⌘⇧C"),
                     BlockAction::CopyCommand,
                 ))
             })
             .child(item(
                 "block-copy-output",
                 "copy",
-                copy_output_label,
+                if several {
+                    "Copy outputs"
+                } else {
+                    copy_output_label
+                },
                 Some("⌥⌘⇧C"),
                 BlockAction::CopyOutput,
             ))
-            .when(has_cwd, |menu| {
+            .when(has_cwd && single, |menu| {
                 menu.child(item(
                     "block-copy-cwd",
                     "folder",
@@ -1452,7 +1674,7 @@ impl TerminalView {
                     BlockAction::CopyDirectory,
                 ))
             })
-            .when(has_branch, |menu| {
+            .when(has_branch && single, |menu| {
                 menu.child(item(
                     "block-copy-branch",
                     "git-branch",
@@ -1462,20 +1684,22 @@ impl TerminalView {
                 ))
             })
             .child(components::menu_separator(&theme))
-            .child(item(
-                "block-find",
-                "search",
-                "Find within block",
-                Some("⌘⇧F"),
-                BlockAction::FindInBlock,
-            ))
-            .child(item(
-                "block-filter",
-                "list-filter",
-                "Toggle block filter",
-                Some("⌥⇧F"),
-                BlockAction::ToggleFilter,
-            ))
+            .when(single, |menu| {
+                menu.child(item(
+                    "block-find",
+                    "search",
+                    "Find within block",
+                    Some("⌘⇧F"),
+                    BlockAction::FindInBlock,
+                ))
+                .child(item(
+                    "block-filter",
+                    "list-filter",
+                    "Toggle block filter",
+                    Some("⌥⇧F"),
+                    BlockAction::ToggleFilter,
+                ))
+            })
             .child(item(
                 "block-bookmark",
                 "bookmark",
@@ -1491,18 +1715,26 @@ impl TerminalView {
             .child(item(
                 "block-top",
                 "arrow-up-to-line",
-                "Scroll to top of block",
+                if several {
+                    "Scroll to top of blocks"
+                } else {
+                    "Scroll to top of block"
+                },
                 Some("⌘⇧↑"),
                 BlockAction::ScrollToTop,
             ))
             .child(item(
                 "block-bottom",
                 "arrow-down-to-line",
-                "Scroll to bottom of block",
+                if several {
+                    "Scroll to bottom of blocks"
+                } else {
+                    "Scroll to bottom of block"
+                },
                 Some("⌘⇧↓"),
                 BlockAction::ScrollToBottom,
             ))
-            .when(has_command, |menu| {
+            .when(has_command && single, |menu| {
                 menu.child(components::menu_separator(&theme))
                     .when(!running, |menu| {
                         menu.child(item(
@@ -1532,23 +1764,44 @@ impl TerminalView {
         )
     }
 
-    /// Select the block before (or after) the selected one, or the newest,
-    /// and scroll to it.
-    fn select_adjacent_block(&mut self, forward: bool, cx: &mut Context<Self>) {
+    /// Select the block before (or after) the last selected one, or with
+    /// none selected, the newest, and bring its top into view. Past the
+    /// newest block, the newest is scrolled fully into view, and once it
+    /// is, `to_input` hands the keys back to the input.
+    fn select_adjacent_block(
+        &mut self,
+        forward: bool,
+        to_input: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(count) = self.blocks.as_ref().map(|blocks| blocks.blocks().len()) else {
             return;
         };
-        let next = match (self.selected_block, forward) {
+        let next = match (self.selected_blocks.tail(), forward) {
             (None, false) => count.checked_sub(1),
             (None, true) => None,
             (Some(index), false) => Some(index.saturating_sub(1)),
-            (Some(index), true) => (index + 1 < count).then_some(index + 1),
+            (Some(index), true) if index + 1 < count => Some(index + 1),
+            (Some(index), true) => {
+                let viewport = self.block_list.viewport_bounds();
+                let fully_visible = self
+                    .block_list
+                    .bounds_for_item(index)
+                    .is_some_and(|bounds| bounds.bottom() <= viewport.bottom());
+                if !fully_visible {
+                    self.scroll_to_block_bottom(index);
+                    cx.notify();
+                } else if to_input && self.shows_editor() {
+                    self.clear_block_selections(window, cx);
+                }
+                return;
+            }
         };
-        self.selected_block = next;
         if let Some(index) = next {
-            self.block_list.scroll_to_reveal_item(index);
+            self.select_blocks(|selection| selection.select(index), window, cx);
+            self.reveal_block(index);
         }
-        cx.notify();
     }
 
     /// Ask for completions of the word before the cursor: from zsh's own
@@ -1956,7 +2209,7 @@ impl TerminalView {
                 } else if self.completion.take().is_some() || self.history_search.take().is_some() {
                     self.sync_editor_menu(cx);
                 } else {
-                    self.selected_block = None;
+                    self.selected_blocks.clear();
                     self.block_selection = None;
                 }
                 cx.notify();
@@ -2013,7 +2266,7 @@ impl TerminalView {
             } else {
                 ItemContent::Finished(rows)
             };
-            let selected = self.selected_block == Some(index);
+            let border = self.selected_blocks.border(index);
             // Started at the top, the first block sits against the pane's
             // edge, where a divider would read as a second border; stacked
             // up from the input, it divides the blocks from the space above.
@@ -2051,7 +2304,7 @@ impl TerminalView {
                 .unwrap_or_default();
             let block_matches = filter_matches.into_iter().chain(search_matches).collect();
             items.push(
-                Item::block(block, content, selected)
+                Item::block(block, content, border)
                     .with_selection(self.block_selection)
                     .with_divider(divider)
                     .with_filter(filter, gaps)
@@ -2064,6 +2317,20 @@ impl TerminalView {
             self.block_list.remeasure_items(last..items.len());
         }
         Some(items)
+    }
+
+    /// The pane's key context: block shortcuts apply where blocks show,
+    /// and arrows move the selection while blocks are selected.
+    fn key_context(&self) -> KeyContext {
+        let mut context = KeyContext::default();
+        context.add("Terminal");
+        if self.shows_blocks() {
+            context.add(BLOCKS_CONTEXT);
+            if !self.selected_blocks.is_empty() {
+                context.add(BLOCK_SELECTION_CONTEXT);
+            }
+        }
+        context
     }
 
     /// Whether the pane shows its block list rather than a single terminal
@@ -2208,6 +2475,22 @@ impl TerminalView {
         // Command shortcuts belong to the app, never to the shell, and keys
         // typed into the find bar bubble through here without being sent.
         if event.keystroke.modifiers.platform || !self.focus_handle.is_focused(window) {
+            return;
+        }
+        // With blocks selected, a key drops the selection and goes back to
+        // the input, carrying a typed character with it.
+        if self.shows_editor() && !self.selected_blocks.is_empty() {
+            self.clear_block_selections(window, cx);
+            let modifiers = event.keystroke.modifiers;
+            if !modifiers.control
+                && !modifiers.function
+                && let Some(text) = event.keystroke.key_char.as_deref()
+                && !text.chars().any(char::is_control)
+            {
+                self.editor
+                    .update(cx, |editor, cx| editor.replace_before_cursor(0, text, cx));
+            }
+            cx.stop_propagation();
             return;
         }
         let action = if event.is_held {
@@ -2591,41 +2874,113 @@ impl TerminalView {
             .into_any_element()
     }
 
+    /// Copy the selected text, else the selected blocks, each command with
+    /// its output.
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.block_selection_text(cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            return;
+        }
+        if self.shows_blocks() && !self.selected_blocks.is_empty() {
+            let selected: Vec<usize> = self.selected_blocks.indices().collect();
+            let text = self.blocks_text(&selected, BlockText::CommandAndOutput, cx);
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
         self.send(Operation::Copy, cx);
     }
 
-    /// Begin selecting at the pointer: a cell, or with a double or triple
-    /// click a word or a whole row.
-    fn start_block_selection(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let Some(point) = self
+    /// The span a press at `point` selects first: the cell, or the word or
+    /// row under it.
+    fn selection_span(
+        &self,
+        point: BlockPoint,
+        unit: SelectionUnit,
+        cx: &App,
+    ) -> (BlockPoint, BlockPoint) {
+        let (from, to) = match unit {
+            SelectionUnit::Cell => (point.col, point.col),
+            SelectionUnit::Row => (0, usize::MAX),
+            SelectionUnit::Word => {
+                let text = self
+                    .block_row_texts(point.block, cx)
+                    .into_iter()
+                    .nth(point.row)
+                    .unwrap_or_default();
+                blocks::word_columns(&text, point.col)
+            }
+        };
+        (
+            BlockPoint { col: from, ..point },
+            BlockPoint { col: to, ..point },
+        )
+    }
+
+    /// Begin a press over block `block`: it starts selecting text, and a
+    /// release without a drag selects the block.
+    fn press_block(&mut self, block: usize, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let had_text = self
+            .block_selection
+            .is_some_and(|selection| !selection.is_empty());
+        // A press that only dismisses selected text, or picks a word or a
+        // row, leaves the blocks unselected.
+        let selects_block = event.click_count == 1 && !had_text;
+        if !selects_block {
+            self.selected_blocks.clear();
+        }
+        let unit = match event.click_count {
+            1 => SelectionUnit::Cell,
+            2 => SelectionUnit::Word,
+            _ => SelectionUnit::Row,
+        };
+        let point = self
             .metrics
-            .and_then(|metrics| self.painted_outputs.hit(event.position, metrics))
-        else {
-            self.block_selection = None;
+            .and_then(|metrics| self.painted_outputs.hit(event.position, metrics));
+        let (start, end) = match point {
+            Some(point) => self.selection_span(point, unit, cx),
+            None => Default::default(),
+        };
+        self.block_selection = point.map(|_| BlockSelection {
+            anchor: start,
+            head: end,
+        });
+        self.block_press = Some(BlockPress {
+            block: selects_block.then_some(block),
+            origin: event.position,
+            modifiers: event.modifiers,
+            dragged: unit != SelectionUnit::Cell,
+            unit,
+            start,
+            end,
+        });
+        cx.notify();
+    }
+
+    /// Extend the pressed selection to the pointer, by the press's unit.
+    fn drag_block_selection(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let (Some(press), Some(metrics)) = (&self.block_press, self.metrics) else {
             return;
         };
-        let text = self
-            .block_row_texts(point.block, cx)
-            .into_iter()
-            .nth(point.row)
-            .unwrap_or_default();
-        let (from, to) = match event.click_count {
-            2 => blocks::word_columns(&text, point.col),
-            count if count >= 3 => (0, usize::MAX),
-            _ => (point.col, point.col),
+        let Some(point) = self.painted_outputs.hit(position, metrics) else {
+            return;
         };
-        let at = |col| BlockPoint { col, ..point };
-        self.block_selection = Some(BlockSelection {
-            anchor: at(from),
-            head: at(to),
-        });
-        self.selecting_blocks = true;
-        cx.notify();
+        let (start, end, unit) = (press.start, press.end, press.unit);
+        let (head_start, head_end) = self.selection_span(point, unit, cx);
+        let selection = if point < start {
+            BlockSelection {
+                anchor: end,
+                head: head_start,
+            }
+        } else {
+            BlockSelection {
+                anchor: start,
+                head: head_end,
+            }
+        };
+        if self.block_selection != Some(selection) {
+            self.block_selection = Some(selection);
+            cx.notify();
+        }
     }
 
     /// Each row of a block's output as text: its rows, and for a running
@@ -2684,7 +3039,15 @@ impl TerminalView {
         }
     }
 
-    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shows_blocks() {
+            let count = self
+                .blocks
+                .as_ref()
+                .map_or(0, |blocks| blocks.blocks().len());
+            self.select_blocks(|selection| selection.select_all(count), window, cx);
+            return;
+        }
         self.send(Operation::SelectAll, cx);
     }
 
@@ -2703,19 +3066,38 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.shows_blocks() {
+            let block = self.painted_outputs.block_at(event.position);
+            // A press elsewhere than a block, such as in the input, drops
+            // the selection and lands in the input.
+            let Some(block) = block else {
+                self.block_press = None;
+                self.selected_blocks.clear();
+                self.block_selection = None;
+                if self.shows_editor() {
+                    window.focus(&self.editor.focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.focus_handle, cx);
+                }
+                cx.notify();
+                return;
+            };
+            if !self.focus_handle.contains_focused(window, cx) {
+                if self.shows_editor() {
+                    window.focus(&self.editor.focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.focus_handle, cx);
+                }
+            }
+            if event.button == MouseButton::Left {
+                self.press_block(block, event, cx);
+            }
+            return;
+        }
         if self.shows_editor() {
             window.focus(&self.editor.focus_handle(cx), cx);
         } else {
             window.focus(&self.focus_handle, cx);
-        }
-        if self.shows_blocks() {
-            if event.button == MouseButton::Left {
-                // A click anywhere deselects the block; a click on a block
-                // selects it again when the click completes.
-                self.selected_block = None;
-                self.start_block_selection(event, cx);
-            }
-            return;
         }
         let Some(bounds) = self.bounds else {
             return;
@@ -2759,18 +3141,12 @@ impl TerminalView {
         self.send_mouse(mouse::Action::Press, Some(button), local, mods, cx);
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.shows_blocks() {
-            if event.button == MouseButton::Left && self.selecting_blocks {
-                self.selecting_blocks = false;
-                // A plain click selects the block, not an empty range.
-                if self
-                    .block_selection
-                    .is_some_and(|selection| selection.is_empty())
-                {
-                    self.block_selection = None;
-                }
-                cx.notify();
+            if event.button == MouseButton::Left
+                && let Some(press) = self.block_press.take()
+            {
+                self.release_block_press(press, event, window, cx);
             }
             return;
         }
@@ -2806,6 +3182,48 @@ impl TerminalView {
         );
     }
 
+    /// Finish a press in the block list: selected text stays selected
+    /// (and is copied, with copy on select), and a click without a drag
+    /// selects its block: alone, toggled with ⌘, or as a range with ⇧.
+    fn release_block_press(
+        &mut self,
+        press: BlockPress,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .block_selection
+            .is_some_and(|selection| selection.is_empty())
+        {
+            self.block_selection = None;
+        }
+        if self.block_selection.is_some() {
+            self.selected_blocks.clear();
+            if SettingsStore::get(cx).copy_on_select
+                && let Some(text) = self.block_selection_text(cx)
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            cx.notify();
+            return;
+        }
+        let Some(block) = press
+            .block
+            .filter(|block| self.painted_outputs.block_at(event.position) == Some(*block))
+        else {
+            cx.notify();
+            return;
+        };
+        if press.modifiers.platform {
+            self.select_blocks(|selection| selection.toggle(block), window, cx);
+        } else if press.modifiers.shift && !self.selected_blocks.is_empty() {
+            self.select_blocks(|selection| selection.extend_to(block), window, cx);
+        } else {
+            self.select_blocks(|selection| selection.select(block), window, cx);
+        }
+    }
+
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -2813,14 +3231,25 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if self.shows_blocks() {
-            if self.selecting_blocks
-                && let (Some(metrics), Some(selection)) = (self.metrics, &mut self.block_selection)
-                && let Some(point) = self.painted_outputs.hit(event.position, metrics)
-                && selection.head != point
-            {
-                selection.head = point;
-                cx.notify();
+            let Some(press) = &mut self.block_press else {
+                return;
+            };
+            // ⌘ and ⇧ presses pick blocks, so moving during one selects no
+            // text.
+            if press.modifiers.platform || press.modifiers.shift {
+                return;
             }
+            if !press.dragged {
+                let moved = event.position - press.origin;
+                if f32::from(moved.x).abs() <= DRAG_THRESHOLD
+                    && f32::from(moved.y).abs() <= DRAG_THRESHOLD
+                {
+                    return;
+                }
+                press.dragged = true;
+                self.selected_blocks.clear();
+            }
+            self.drag_block_selection(event.position, cx);
             return;
         }
         let Some(bounds) = self.bounds else {
@@ -2972,7 +3401,7 @@ impl Render for TerminalView {
         // otherwise, wherever the pane's focus was put.
         let editor_focus = self.editor.focus_handle(cx);
         if self.shows_editor() {
-            if self.focus_handle.is_focused(window) {
+            if self.focus_handle.is_focused(window) && self.selected_blocks.is_empty() {
                 window.focus(&editor_focus, cx);
             }
         } else if editor_focus.is_focused(window) {
@@ -3036,17 +3465,6 @@ impl Render for TerminalView {
                 let content = div()
                     .absolute()
                     .inset_0()
-                    .key_context(BLOCKS_CONTEXT)
-                    .on_action(cx.listener(Self::copy_block))
-                    .on_action(cx.listener(Self::copy_block_output))
-                    .on_action(cx.listener(Self::toggle_block_bookmark))
-                    .on_action(cx.listener(Self::previous_bookmark))
-                    .on_action(cx.listener(Self::next_bookmark))
-                    .on_action(cx.listener(Self::scroll_to_block_top))
-                    .on_action(cx.listener(Self::scroll_to_block_end))
-                    .on_action(cx.listener(Self::toggle_target_filter))
-                    .on_action(cx.listener(Self::find_in_target_block))
-                    .on_action(cx.listener(Self::open_target_menu))
                     .children(block_menu)
                     .flex()
                     .flex_col()
@@ -3072,7 +3490,23 @@ impl Render for TerminalView {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
-            .key_context("Terminal")
+            .key_context(self.key_context())
+            .when(self.shows_blocks(), |this| {
+                this.on_action(cx.listener(Self::copy_block_commands))
+                    .on_action(cx.listener(Self::copy_block_output))
+                    .on_action(cx.listener(Self::toggle_block_bookmark))
+                    .on_action(cx.listener(Self::previous_bookmark))
+                    .on_action(cx.listener(Self::next_bookmark))
+                    .on_action(cx.listener(Self::scroll_to_block_top))
+                    .on_action(cx.listener(Self::scroll_to_block_end))
+                    .on_action(cx.listener(Self::toggle_target_filter))
+                    .on_action(cx.listener(Self::find_in_target_block))
+                    .on_action(cx.listener(Self::open_target_menu))
+                    .on_action(cx.listener(Self::select_previous_block))
+                    .on_action(cx.listener(Self::select_next_block))
+                    .on_action(cx.listener(Self::extend_selection_up))
+                    .on_action(cx.listener(Self::extend_selection_down))
+            })
             .cursor(if self.link_hover.is_some() {
                 CursorStyle::PointingHand
             } else if self.shows_blocks() {
@@ -3225,7 +3659,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-shift-g", SearchPrevious, Some("Terminal")),
         KeyBinding::new("shift-enter", SearchPrevious, Some(SEARCH_CONTEXT)),
         // Warp's block shortcuts, where blocks show.
-        KeyBinding::new("cmd-shift-c", CopyBlock, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("cmd-shift-c", CopyBlockCommands, Some(BLOCKS_CONTEXT)),
         KeyBinding::new("alt-cmd-shift-c", CopyBlockOutput, Some(BLOCKS_CONTEXT)),
         KeyBinding::new("cmd-shift-b", ToggleBlockBookmark, Some(BLOCKS_CONTEXT)),
         KeyBinding::new("alt-up", PreviousBookmark, Some(BLOCKS_CONTEXT)),
@@ -3235,6 +3669,18 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-shift-f", ToggleBlockFilter, Some(BLOCKS_CONTEXT)),
         KeyBinding::new("cmd-shift-f", FindInBlock, Some(BLOCKS_CONTEXT)),
         KeyBinding::new("ctrl-m", OpenBlockMenu, Some(BLOCKS_CONTEXT)),
+        KeyBinding::new("up", SelectPreviousBlock, Some(BLOCK_SELECTION_CONTEXT)),
+        KeyBinding::new("down", SelectNextBlock, Some(BLOCK_SELECTION_CONTEXT)),
+        KeyBinding::new(
+            "shift-up",
+            ExtendBlockSelectionUp,
+            Some(BLOCK_SELECTION_CONTEXT),
+        ),
+        KeyBinding::new(
+            "shift-down",
+            ExtendBlockSelectionDown,
+            Some(BLOCK_SELECTION_CONTEXT),
+        ),
     ]
 }
 

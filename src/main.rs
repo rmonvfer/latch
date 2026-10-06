@@ -36,6 +36,7 @@ mod runtime_display;
 mod runtime_engine;
 mod runtime_protocol;
 mod search;
+mod selected_blocks;
 mod session;
 mod settings;
 mod settings_page;
