@@ -27,7 +27,6 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    control,
     hooks::Bootstrapped,
     process_info,
     runtime_engine::{self, SessionHandle},
@@ -259,8 +258,20 @@ fn same_token(expected: &str, candidate: &str) -> bool {
 /// program. Clients check it before presenting the runtime's secret, so a
 /// program that swaps in its own socket cannot collect the secret, and the
 /// runtime checks it before serving a connection.
+///
+/// The peer is identified by the audit token the kernel recorded when it
+/// connected. Its pid version changes whenever a process execs, so a
+/// program cannot connect, pass the socket on, and then exec this binary to
+/// pass the check.
 fn peer_is_this_program(stream: &UnixStream) -> bool {
-    let Some(peer) = control::peer_pid(stream).and_then(process_info::executable_path) else {
+    let Some((pid, version)) = peer_audit(stream) else {
+        return false;
+    };
+    let still_connected_process = || pid_version(pid) == Some(version);
+    if !still_connected_process() {
+        return false;
+    }
+    let Some(peer) = process_info::executable_path(pid) else {
         return false;
     };
     let (Ok(peer), Ok(own)) = (
@@ -269,7 +280,61 @@ fn peer_is_this_program(stream: &UnixStream) -> bool {
     ) else {
         return false;
     };
-    peer == own
+    // Checked again: the path must belong to the process that connected.
+    peer == own && still_connected_process()
+}
+
+/// The pid and pid version of the process that connected `stream`, from
+/// the audit token the kernel recorded at connection.
+fn peer_audit(stream: &UnixStream) -> Option<(i32, i32)> {
+    // audit_token_t: eight words, the pid at index 5 and its version at 7.
+    let mut token = [0u32; 8];
+    let mut size = std::mem::size_of_val(&token) as libc::socklen_t;
+    // SAFETY: the descriptor is a live socket and `token`/`size` describe a
+    // buffer of the size LOCAL_PEERTOKEN writes.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            token.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    (result == 0 && size as usize == std::mem::size_of_val(&token))
+        .then(|| (token[5] as i32, token[7] as i32))
+}
+
+/// `struct proc_uniqidentifierinfo` from XNU's `sys/proc_info.h`.
+#[repr(C)]
+struct ProcessIdentity {
+    uuid: [u8; 16],
+    unique_id: u64,
+    parent_unique_id: u64,
+    pid_version: i32,
+    original_parent_pid_version: i32,
+    reserved: [u64; 2],
+}
+
+/// `PROC_PIDUNIQIDENTIFIERINFO` from `sys/proc_info.h`.
+const PROC_PID_UNIQUE_IDENTIFIER_INFO: libc::c_int = 17;
+
+/// The current pid version of process `pid`.
+fn pid_version(pid: i32) -> Option<i32> {
+    let mut identity = std::mem::MaybeUninit::<ProcessIdentity>::zeroed();
+    let size = std::mem::size_of::<ProcessIdentity>() as libc::c_int;
+    // SAFETY: `identity` is a zeroed ProcessIdentity of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PID_UNIQUE_IDENTIFIER_INFO,
+            0,
+            identity.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: proc_pidinfo filled the whole struct.
+    (written == size).then(|| unsafe { identity.assume_init() }.pid_version)
 }
 
 fn same_user(stream: &UnixStream) -> bool {
