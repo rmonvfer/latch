@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, FontWeight, Hsla, ListOffset, ListState, Pixels, Point, SharedString,
-    Window, canvas, div, fill, list, point, prelude::*, px, size,
+    AnyElement, App, Bounds, ClickEvent, FontWeight, Hsla, ListOffset, ListState, Pixels, Point,
+    SharedString, Window, canvas, div, fill, list, point, prelude::*, px, size,
 };
 use libghostty_vt::style::RgbColor;
 
@@ -382,8 +382,11 @@ fn render_item(
         .flex()
         .flex_col()
         .w_full()
-        .border_t_1()
-        .border_color(palette.outline)
+        // The first block has nothing above it to divide from; a line there
+        // would read as a second border.
+        .when(index > 0, |this| {
+            this.border_t_1().border_color(palette.outline)
+        })
         .when(failed, |this| this.bg(palette.error.opacity(0.1)))
         .when(item.selected, |this| this.bg(palette.accent.opacity(0.25)))
         .pb(metrics.height * BOTTOM_LINES)

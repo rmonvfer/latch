@@ -184,6 +184,9 @@ pub struct TerminalView {
     duration_tick: Option<Task<()>>,
     /// Scroll and layout state of the block list, one item per block.
     block_list: ListState,
+    /// Whether the block list is anchored to the input, per the setting
+    /// it was made with.
+    blocks_from_bottom: bool,
     /// The block picked by clicking or with ⌘↑ and ⌘↓.
     selected_block: Option<usize>,
     /// Text selected in the block list, and whether a drag is extending it.
@@ -473,6 +476,12 @@ impl TerminalView {
                 // Font and padding changes take effect on the next frame.
                 _settings_subscription: cx.observe_global::<SettingsStore>(|view, cx| {
                     view.metrics = None;
+                    let from_bottom = SettingsStore::get(cx).blocks_from_bottom;
+                    if from_bottom != view.blocks_from_bottom {
+                        view.blocks_from_bottom = from_bottom;
+                        view.block_list =
+                            block_list_state(view.block_list.item_count(), from_bottom);
+                    }
                     cx.notify();
                 }),
                 _theme_subscription: cx.observe_global::<ActiveTheme>(|view, cx| {
@@ -495,11 +504,8 @@ impl TerminalView {
                 background: [0, 0, 0],
                 full_screen: false,
                 duration_tick: None,
-                block_list: {
-                    let state = ListState::new(0, ListAlignment::Top, px(400.));
-                    state.set_follow_mode(FollowMode::Tail);
-                    state
-                },
+                block_list: block_list_state(0, SettingsStore::get(cx).blocks_from_bottom),
+                blocks_from_bottom: SettingsStore::get(cx).blocks_from_bottom,
                 selected_block: None,
                 block_selection: None,
                 selecting_blocks: false,
@@ -2387,6 +2393,19 @@ const HISTORY_MENU_ENTRIES: usize = 200;
 
 /// How long a command runs before the editor hides and keys go to it.
 const EDITOR_GRACE: Duration = Duration::from_millis(50);
+
+/// Scroll state for a block list of `count` blocks that follows new
+/// output, anchored to the input or to the top of the pane.
+fn block_list_state(count: usize, from_bottom: bool) -> ListState {
+    let alignment = if from_bottom {
+        ListAlignment::Bottom
+    } else {
+        ListAlignment::Top
+    };
+    let state = ListState::new(count, alignment, px(400.));
+    state.set_follow_mode(FollowMode::Tail);
+    state
+}
 
 /// What the pane's canvas paints.
 enum Screen {

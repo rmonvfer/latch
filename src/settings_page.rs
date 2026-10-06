@@ -723,6 +723,20 @@ impl SettingsPage {
                         |on, _, cx| SettingsStore::update(cx, |settings| settings.command_blocks = on),
                     ))
                     .into_any_element(),
+                    row(
+                        "Blocks start at the bottom",
+                        "Stack blocks up from the input, so new output appears next to where you type. Off, they start at the top of the pane.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "blocks-from-bottom",
+                        settings.blocks_from_bottom,
+                        settings.command_blocks,
+                        theme,
+                        cx,
+                        |on, _, cx| SettingsStore::update(cx, |settings| settings.blocks_from_bottom = on),
+                    ))
+                    .into_any_element(),
                 ],
                 theme,
             )

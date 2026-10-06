@@ -49,6 +49,9 @@ pub struct Settings {
     /// Show each command and its output as a block, with an input editor,
     /// in shells with integration. Applies to new terminals.
     pub command_blocks: bool,
+    /// Stack command blocks up from the input, as in a classic terminal,
+    /// rather than down from the top of the pane.
+    pub blocks_from_bottom: bool,
     /// Resume the coding agent session a pane was running when it is
     /// restored after the session runtime stopped.
     pub resume_agents: bool,
@@ -71,6 +74,7 @@ impl Default for Settings {
             control_api: true,
             command_blocks: true,
             resume_agents: true,
+            blocks_from_bottom: true,
         }
     }
 }
