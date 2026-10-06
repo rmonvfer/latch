@@ -2291,6 +2291,10 @@ impl Render for TerminalView {
             .key_context("Terminal")
             .cursor(if self.link_hover.is_some() {
                 CursorStyle::PointingHand
+            } else if self.shows_blocks() {
+                // Over blocks there is nothing to type into; the editor
+                // sets its own text cursor.
+                CursorStyle::Arrow
             } else {
                 CursorStyle::IBeam
             })
