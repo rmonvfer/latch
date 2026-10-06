@@ -194,6 +194,19 @@ fn write_token(paths: &Paths) -> Result<String> {
     Ok(token)
 }
 
+/// Remove secrets left by runtimes that stopped without removing theirs.
+/// Called before this runtime writes its own, under the runtime lock.
+fn forget_stale_secrets(paths: &Paths) {
+    let Ok(entries) = fs::read_dir(&paths.directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("secret-") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Remove the running runtime's secret.
 fn forget_token(paths: &Paths) {
     if let Ok(id) = read_token_id(paths) {
@@ -759,6 +772,8 @@ impl Server {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("cannot inspect runtime socket"),
         }
+        // A runtime that was stopped outright leaves its secret behind.
+        forget_stale_secrets(&paths);
         let token = write_token(&paths)?;
         let listener =
             UnixListener::bind(paths.socket()).context("cannot bind session runtime socket")?;
