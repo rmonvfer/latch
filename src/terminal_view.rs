@@ -1203,10 +1203,10 @@ impl TerminalView {
             .relative()
             .flex()
             .flex_col()
-            .gap(metrics.height * 0.5)
+            .gap(metrics.height * 0.4)
             .px(metrics.padding + block_view::HORIZONTAL_INSET)
-            .pt(metrics.height)
-            .pb(metrics.height * 1.2)
+            .pt(metrics.height * 0.5)
+            .pb(metrics.height * 0.8)
             .border_t_1()
             .border_color(foreground.opacity(0.1))
             .children(menu.map(|menu| {
@@ -1222,7 +1222,7 @@ impl TerminalView {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(6.))
                     .children(chips),
             )
             .child(self.editor.clone())
