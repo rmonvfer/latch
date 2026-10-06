@@ -197,7 +197,16 @@ pub struct Blocks {
     /// Most blocks kept; the oldest are dropped beyond this.
     limit: usize,
     encoder: RowEncoder,
+    /// The running command erased the scrollback (`clear`, `reset`), so
+    /// the blocks are cleared when it finishes.
+    clear_requested: bool,
+    /// The end of the last output, for spotting the erase sequence across
+    /// reads.
+    output_tail: Vec<u8>,
 }
+
+/// The sequence that erases scrollback (CSI 3 J), which `clear` sends.
+const ERASE_SCROLLBACK: &[u8] = b"\x1b[3J";
 
 impl Blocks {
     pub fn new(limit: usize) -> Result<Self> {
@@ -207,6 +216,8 @@ impl Blocks {
             context: BlockContext::default(),
             limit: limit.max(1),
             encoder: RowEncoder::new()?,
+            clear_requested: false,
+            output_tail: Vec::new(),
         })
     }
 
@@ -276,6 +287,17 @@ impl Blocks {
 
     /// Keep `bytes` the running command wrote, for rebuilding its rows.
     pub fn record(&mut self, bytes: &[u8]) {
+        if self.is_running() {
+            let mut window = std::mem::take(&mut self.output_tail);
+            window.extend_from_slice(&bytes[..bytes.len().min(ERASE_SCROLLBACK.len())]);
+            let erased = window
+                .windows(ERASE_SCROLLBACK.len())
+                .chain(bytes.windows(ERASE_SCROLLBACK.len()))
+                .any(|candidate| candidate == ERASE_SCROLLBACK);
+            self.clear_requested |= erased;
+            let keep = bytes.len().min(ERASE_SCROLLBACK.len() - 1);
+            self.output_tail = bytes[bytes.len() - keep..].to_vec();
+        }
         let Some(raw) = self.running_mut().and_then(|block| block.raw.as_mut()) else {
             return;
         };
@@ -315,14 +337,26 @@ impl Blocks {
         Ok(())
     }
 
+    /// Remove every finished block, as `clear` or Cmd-K do; a running
+    /// command keeps its block.
+    pub fn clear(&mut self) {
+        self.blocks.retain(Block::is_running);
+    }
+
     /// Close the running block with `exit_code`, capturing all of its
-    /// output from `terminal`.
+    /// output from `terminal`. A command that erased the scrollback clears
+    /// every block, its own included.
     pub fn finish(
         &mut self,
         exit_code: i32,
         terminal: &mut Terminal<'static, 'static>,
     ) -> Result<()> {
         if !self.is_running() {
+            return Ok(());
+        }
+        self.output_tail.clear();
+        if std::mem::take(&mut self.clear_requested) {
+            self.blocks.clear();
             return Ok(());
         }
         let rows = self.encoder.encode_all(terminal)?;
@@ -530,6 +564,26 @@ mod tests {
         blocks.push_startup(&mut startup).unwrap();
         assert_eq!(blocks.summaries()[0].command, "");
         assert!(!blocks.is_running());
+    }
+
+    #[test]
+    fn clearing_the_scrollback_clears_the_blocks() {
+        let mut blocks = Blocks::new(10).unwrap();
+        let mut output = terminal(20, 5);
+        blocks.start("ls".into());
+        blocks.record(b"a\r\n");
+        blocks.finish(0, &mut output).unwrap();
+        blocks.start("clear".into());
+        // The sequence may arrive split across reads.
+        blocks.record(b"\x1b[H\x1b[2J\x1b[");
+        blocks.record(b"3J");
+        blocks.finish(0, &mut terminal(20, 5)).unwrap();
+        assert!(blocks.summaries().is_empty());
+        blocks.start("echo".into());
+        blocks.finish(0, &mut terminal(20, 5)).unwrap();
+        assert_eq!(blocks.summaries().len(), 1);
+        blocks.clear();
+        assert!(blocks.summaries().is_empty());
     }
 
     #[test]

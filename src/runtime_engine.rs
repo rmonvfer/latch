@@ -921,6 +921,9 @@ impl Engine {
                 self.terminal.set_selection(None)?;
             }
             Operation::ClearScrollback => {
+                if let Some(blocks) = &mut self.blocks {
+                    blocks.clear();
+                }
                 // Erase scrollback (CSI 3 J), then ask the shell to redraw its prompt.
                 self.terminal.vt_write(b"\x1b[3J");
                 if self.pty.exit_status().is_none() {
