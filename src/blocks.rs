@@ -35,6 +35,8 @@ pub struct Block {
     pub outcome: Option<Outcome>,
     /// When this view first saw the block running.
     pub started: Instant,
+    /// When the command started, in milliseconds since the Unix epoch.
+    pub started_at_ms: u64,
     /// Whether only the header shows.
     pub collapsed: bool,
     rows: Vec<Rc<FrameRow>>,
@@ -51,6 +53,7 @@ impl Block {
             context: BlockContext::default(),
             outcome: None,
             started: Instant::now(),
+            started_at_ms: summary.started_at_ms,
             collapsed: false,
             rows: Vec::new(),
             shared: Rows::default(),
@@ -75,8 +78,11 @@ impl Block {
         self.outcome.is_none()
     }
 
+    /// Whether the command failed. Exiting on Ctrl-C (130) or a closed
+    /// pipe (141) is how commands are stopped, not a failure.
     pub fn failed(&self) -> bool {
-        self.outcome.is_some_and(|outcome| outcome.exit_code != 0)
+        self.outcome
+            .is_some_and(|outcome| !matches!(outcome.exit_code, 0 | 130 | 141))
     }
 
     /// The block's rows: all of them once finished; while running, those
@@ -334,6 +340,7 @@ mod tests {
             context: BlockContext::default(),
             exit_code: (!running).then_some(0),
             duration_ms: (!running).then_some(5),
+            started_at_ms: 0,
             running,
             rows,
         }
@@ -403,10 +410,16 @@ mod tests {
             "\x1b[0m\x1b]8;;\x1b\\\x1b[0;38;2;200;0;0;48;2;0;0;0mred \x1b[0mtext".to_string(),
             "second".to_string(),
         ];
-        assert_eq!(list.apply_rows(7, 1, 0, &rows, 20, [0, 0, 0]).unwrap(), Some(0));
+        assert_eq!(
+            list.apply_rows(7, 1, 0, &rows, 20, [0, 0, 0]).unwrap(),
+            Some(0)
+        );
         assert_eq!(list.blocks()[0].output_text(), "red text\nsecond");
         list.apply_rows(7, 2, 0, &rows[1..], 20, [0, 0, 0]).unwrap();
         assert_eq!(list.blocks()[0].output_text(), "second");
-        assert_eq!(list.apply_rows(99, 1, 0, &rows, 20, [0, 0, 0]).unwrap(), None);
+        assert_eq!(
+            list.apply_rows(99, 1, 0, &rows, 20, [0, 0, 0]).unwrap(),
+            None
+        );
     }
 }

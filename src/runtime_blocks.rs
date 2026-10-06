@@ -5,7 +5,7 @@
 //! Each block also keeps its raw output, within a budget, so its rows can
 //! be rebuilt when the session's width or colors change.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use libghostty_vt::{
@@ -16,6 +16,7 @@ use libghostty_vt::{
 
 use crate::{
     hooks::Precmd,
+    process_info,
     runtime_engine::encode_row,
     runtime_protocol::{BlockContext, BlockSummary},
 };
@@ -32,6 +33,8 @@ impl From<&Precmd> for BlockContext {
     fn from(precmd: &Precmd) -> Self {
         Self {
             cwd: precmd.cwd.clone(),
+            // Read from the repository's files, never by running git.
+            git_branch: precmd.cwd.as_deref().and_then(process_info::git_branch),
             virtualenv: precmd.virtualenv.clone(),
             conda_env: precmd.conda_env.clone(),
         }
@@ -166,6 +169,7 @@ struct Block {
     command: String,
     context: BlockContext,
     started: Instant,
+    started_at: SystemTime,
     outcome: Option<(i32, Duration)>,
     /// All rows once finished; while running, the rows that scrolled off
     /// its terminal.
@@ -237,6 +241,7 @@ impl Blocks {
             command: String::new(),
             context: self.context.clone(),
             started: Instant::now(),
+            started_at: SystemTime::now(),
             outcome: Some((0, Duration::ZERO)),
             rows,
             raw: None,
@@ -258,6 +263,7 @@ impl Blocks {
             command,
             context: self.context.clone(),
             started: Instant::now(),
+            started_at: SystemTime::now(),
             outcome: None,
             rows: Vec::new(),
             raw: Some(Vec::new()),
@@ -365,6 +371,10 @@ impl Blocks {
                 duration_ms: block
                     .outcome
                     .map(|(_, duration)| duration.as_millis() as u64),
+                started_at_ms: block
+                    .started_at
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64),
                 running: block.is_running(),
                 rows: block.rows.len(),
             })

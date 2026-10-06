@@ -42,6 +42,7 @@ mod tabs;
 mod terminal_view;
 mod text_input;
 mod theme;
+mod tooltip;
 mod workspace;
 
 use gpui::{

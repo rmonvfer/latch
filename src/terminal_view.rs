@@ -178,6 +178,8 @@ pub struct TerminalView {
     background: [u8; 3],
     /// A program has the alternate screen, so it gets the whole pane.
     full_screen: bool,
+    /// Repaints a running block's duration once a second.
+    duration_tick: Option<Task<()>>,
     /// Scroll and layout state of the block list, one item per block.
     block_list: ListState,
     /// The block picked by clicking or with ⌘↑ and ⌘↓.
@@ -453,6 +455,7 @@ impl TerminalView {
                 blocks: None,
                 background: [0, 0, 0],
                 full_screen: false,
+                duration_tick: None,
                 block_list: {
                     let state = ListState::new(0, ListAlignment::Top, px(400.));
                     state.set_follow_mode(FollowMode::Tail);
@@ -820,6 +823,7 @@ impl TerminalView {
         };
         match action {
             BlockAction::Select => self.selected_block = Some(index),
+            BlockAction::ScrollToTop => self.block_list.scroll_to(block_view::block_start(index)),
             BlockAction::ToggleCollapsed => {
                 block.collapsed = !block.collapsed;
                 self.block_list.remeasure_items(index..index + 1);
@@ -1081,7 +1085,11 @@ impl TerminalView {
     fn render_editor_panel(&self, metrics: CellMetrics, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let context = self.prompt.clone().unwrap_or_default();
-        let chips = block_view::context_chips(&context, self.branch.as_deref(), theme);
+        let mut context = context;
+        if context.git_branch.is_none() {
+            context.git_branch.clone_from(&self.branch);
+        }
+        let chips = block_view::context_chips(&context, self.diff, metrics, theme);
         // Ctrl-R matches, best at the bottom, next to the editor.
         let search = self.history_search.as_ref().map(|search| {
             let rows = search
@@ -2099,6 +2107,19 @@ impl Render for TerminalView {
         let focused = self.focus_handle.is_focused(window);
         self.painted_outputs.clear();
         let block_items = self.block_items();
+        let running = self
+            .blocks
+            .as_ref()
+            .is_some_and(|blocks| blocks.running().is_some());
+        if running && self.duration_tick.is_none() {
+            self.duration_tick = Some(cx.spawn(async move |view, cx| {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let _ = view.update(cx, |view, cx| {
+                    view.duration_tick = None;
+                    cx.notify();
+                });
+            }));
+        }
         let frame = match self.renderer.build_frame(&self.terminal, focused) {
             Ok(mut frame) => {
                 if let Some(link) = &self.link_hover {
