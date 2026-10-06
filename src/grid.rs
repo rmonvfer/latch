@@ -386,6 +386,11 @@ impl FrameRow {
         self.texts.is_empty() && self.backgrounds.is_empty()
     }
 
+    #[cfg(test)]
+    pub fn paints_background(&self) -> bool {
+        !self.backgrounds.is_empty()
+    }
+
     /// The row's characters, with spaces for empty cells before the last
     /// character.
     pub fn text(&self) -> String {

@@ -312,11 +312,16 @@ fn decode(rows: &[String], cols: u16, background: [u8; 3]) -> Result<Vec<Rc<Fram
             max_scrollback: 0,
         })?;
         // Cells in the session's own background are then left unpainted.
-        terminal.set_default_bg_color(Some(RgbColor {
-            r: background[0],
-            g: background[1],
-            b: background[2],
-        }))?;
+        // The renderer takes a default background only alongside a default
+        // foreground; rows carry their own foreground colors, so any does.
+        let [r, g, b] = background;
+        terminal
+            .set_default_fg_color(Some(RgbColor {
+                r: 255 - r,
+                g: 255 - g,
+                b: 255 - b,
+            }))?
+            .set_default_bg_color(Some(RgbColor { r, g, b }))?;
         // Rows are exactly one line each; wrapping would shift the rest.
         terminal.vt_write(b"\x1b[?7l");
         for (index, row) in page.iter().enumerate() {
@@ -374,6 +379,13 @@ mod tests {
         assert_eq!(slice_columns("short", 10, 20), "");
         assert_eq!(word_columns("git commit --amend", 6), (4, 10));
         assert_eq!(word_columns("a  b", 1), (1, 2));
+    }
+
+    #[test]
+    fn cells_in_the_session_background_are_left_unpainted() {
+        let rows = vec!["\x1b[0;38;2;0;0;0;48;2;250;250;250m   ".to_string()];
+        assert!(!decode(&rows, 10, [250, 250, 250]).unwrap()[0].paints_background());
+        assert!(decode(&rows, 10, [0, 0, 0]).unwrap()[0].paints_background());
     }
 
     #[test]
