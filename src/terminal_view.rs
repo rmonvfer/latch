@@ -193,8 +193,6 @@ pub struct TerminalView {
     painted_outputs: PaintedOutputs,
     /// Where commands are typed while the shell waits at its prompt.
     editor: Entity<CommandEditor>,
-    /// Whether the editor had focus at the last render.
-    editor_focused: bool,
     _editor_subscription: Subscription,
     /// Context of the shell's prompt, once it has drawn one; commands are
     /// typed into it only then.
@@ -401,7 +399,7 @@ impl TerminalView {
             }
         };
         Ok(cx.new(|cx| {
-            let editor = cx.new(|cx| CommandEditor::new("Run a command", cx));
+            let editor = cx.new(|cx| CommandEditor::new("", cx));
             let output_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 while let Ok(event) = events.recv().await {
                     if this.update(cx, |view, cx| view.receive(event, cx)).is_err() {
@@ -507,7 +505,6 @@ impl TerminalView {
                 selecting_blocks: false,
                 painted_outputs: PaintedOutputs::default(),
                 _editor_subscription: cx.subscribe(&editor, Self::on_editor_event),
-                editor_focused: false,
                 editor,
                 prompt: None,
                 queued_command: None,
@@ -1199,22 +1196,19 @@ impl TerminalView {
             })
         };
         let foreground = theme::to_hsla(theme.terminal.foreground);
-        let focused = self.editor_focused;
+        // Like Warp's input: set off from the blocks by a hairline, with the
+        // chips and the command lined up with the blocks' text.
         div()
             .flex_none()
             .relative()
-            .mx(px(6.))
-            .mb(px(6.))
             .flex()
             .flex_col()
-            .gap(px(10.))
-            .px(metrics.padding + block_view::HORIZONTAL_INSET - px(6.))
-            .pt(px(10.))
-            .pb(px(16.))
-            .rounded(px(8.))
-            .border_1()
+            .gap(metrics.height * 0.5)
+            .px(metrics.padding + block_view::HORIZONTAL_INSET)
+            .pt(metrics.height)
+            .pb(metrics.height * 1.2)
+            .border_t_1()
             .border_color(foreground.opacity(0.1))
-            .when(focused, |card| card.bg(foreground.opacity(0.03)))
             .children(menu.map(|menu| {
                 div()
                     .absolute()
@@ -2195,7 +2189,6 @@ impl Render for TerminalView {
             window.focus(&self.focus_handle, cx);
         }
         let focused = self.focus_handle.is_focused(window);
-        self.editor_focused = editor_focus.is_focused(window);
         self.painted_outputs.clear();
         let block_items = self.block_items();
         let running = self

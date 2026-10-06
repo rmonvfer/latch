@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, FontWeight, Hsla, ListOffset, ListState, Pixels, Point,
-    SharedString, Window, canvas, div, fill, list, point, prelude::*, px, size,
+    AnyElement, App, Bounds, ClickEvent, Hsla, ListOffset, ListState, Pixels, Point, SharedString,
+    Window, canvas, div, fill, list, point, prelude::*, px, size,
 };
 use libghostty_vt::style::RgbColor;
 
@@ -573,15 +573,15 @@ pub fn context_chips(
             .flex()
             .flex_none()
             .items_center()
-            .gap(px(4.))
-            .px(px(4.))
-            .py(px(2.))
-            .rounded(px(4.))
+            .gap(px(5.))
+            .px(px(6.))
+            .py(px(3.))
+            .rounded(px(5.))
             .border_1()
-            .border_color(palette.outline)
+            .border_color(palette.outline.opacity(2.))
             .bg(palette.surface)
             .text_color(color)
-            .child(icon(icon_name, metrics.font_size - px(1.), color))
+            .child(icon(icon_name, metrics.font_size, color))
             .child(label)
             .into_any_element()
     };
@@ -622,8 +622,7 @@ pub fn context_chips(
         .map(|chip| {
             div()
                 .font_family(theme::FONT_FAMILY)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_size(metrics.font_size - px(1.))
+                .text_size(metrics.font_size)
                 .child(chip)
                 .into_any_element()
         })
