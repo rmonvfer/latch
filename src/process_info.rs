@@ -82,6 +82,34 @@ fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// The parent of a running process.
+#[cfg(target_os = "macos")]
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: `info` is a zeroed proc_bsdinfo of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: proc_pidinfo filled the whole struct.
+    (written == size).then(|| unsafe { info.assume_init() }.pbi_ppid as i32)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn parent_pid(pid: i32) -> Option<i32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|ppid| ppid.trim().parse().ok())
+}
+
 /// The path of a running process's executable.
 #[cfg(target_os = "macos")]
 pub fn executable_path(pid: i32) -> Option<PathBuf> {

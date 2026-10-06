@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_badge,
-    agent_resume::{AgentSession, ResumableAgent},
+    agent_resume::{self, AgentSession, ResumableAgent},
     notifications,
     pane_tree::Axis,
     process_info, runtime,
@@ -270,7 +270,13 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
                 }
             };
             if let Request::ReportAgentSession { agent, session_id } = &request {
+                // Only a hook its agent started may report a session.
                 let session = ResumableAgent::parse(agent)
+                    .filter(|agent| {
+                        caller
+                            .peer
+                            .is_some_and(|pid| agent_resume::reported_by(*agent, pid))
+                    })
                     .and_then(|agent| AgentSession::new(agent, session_id));
                 let result = match (session, caller.token.clone()) {
                     (Some(session), Some(token)) => cx
@@ -280,7 +286,9 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
                             })
                         })
                         .unwrap_or_else(|_| Err("the window is closed".to_string())),
-                    (None, _) => Err("not a resumable agent session".to_string()),
+                    (None, _) => Err(
+                        "not a session reported by a running Claude Code or Codex".to_string(),
+                    ),
                     (_, None) => Err("only programs inside a pane can report sessions".to_string()),
                 };
                 let _ = reply.send(result);

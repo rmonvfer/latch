@@ -9,12 +9,19 @@
 
 use std::{
     fs,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+use crate::{
+    agents::{self, Agent},
+    process_info,
+};
 
 /// Longest session id accepted from a hook.
 const MAX_SESSION_ID_LEN: usize = 128;
@@ -33,6 +40,14 @@ impl ResumableAgent {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             _ => None,
+        }
+    }
+
+    /// The running agent this resumes, as process detection names it.
+    pub fn running_as(self) -> Agent {
+        match self {
+            Self::Claude => Agent::ClaudeCode,
+            Self::Codex => Agent::Codex,
         }
     }
 
@@ -88,6 +103,30 @@ pub fn session_from_hook(agent: ResumableAgent, payload: &Value) -> Option<Agent
     }
     AgentSession::new(agent, payload.get("session_id")?.as_str()?)
 }
+
+/// Whether `agent` runs among the ancestors of process `pid`. A hook is
+/// started by its agent, so a report claiming a session must come from
+/// below that agent; a program merely running in the pane cannot plant
+/// one.
+pub fn reported_by(agent: ResumableAgent, pid: i32) -> bool {
+    let mut current = Some(pid);
+    for _ in 0..MAX_HOOK_DEPTH {
+        let Some(pid) = current.filter(|pid| *pid > 1) else {
+            return false;
+        };
+        if process_info::process_args(pid)
+            .and_then(|args| agents::detect(&args))
+            .is_some_and(|running| running == agent.running_as())
+        {
+            return true;
+        }
+        current = process_info::parent_pid(pid);
+    }
+    false
+}
+
+/// How far above a hook its agent may be (hook, shell, wrapper, agent).
+const MAX_HOOK_DEPTH: usize = 8;
 
 /// The command agents run as their hook.
 fn hook_command(agent: ResumableAgent) -> Result<String> {
@@ -181,17 +220,30 @@ fn enable_codex_hooks(config: &str) -> String {
 }
 
 /// Write `contents` to `path` through a temporary file, keeping a copy of
-/// what was there.
+/// what was there. The file keeps its permissions (agent configs can hold
+/// credentials); a new one is readable by its owner only.
 fn replace_file(path: &Path, contents: &str) -> Result<()> {
     // Dotfile managers link configs elsewhere; write through the link.
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if path.exists() {
-        fs::copy(&path, path.with_extension("terminal-backup"))
-            .with_context(|| format!("failed to back up {}", path.display()))?;
-    }
+    let permissions = match fs::metadata(&path) {
+        Ok(metadata) => {
+            fs::copy(&path, path.with_extension("terminal-backup"))
+                .with_context(|| format!("failed to back up {}", path.display()))?;
+            metadata.permissions()
+        }
+        Err(_) => fs::Permissions::from_mode(0o600),
+    };
     let temporary = path.with_extension("terminal-tmp");
-    fs::write(&temporary, contents)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
+    file.write_all(contents.as_bytes())?;
+    file.set_permissions(permissions)?;
+    drop(file);
     fs::rename(&temporary, &path).with_context(|| format!("failed to replace {}", path.display()))
 }
 
@@ -303,6 +355,34 @@ mod tests {
             "'/new/terminal' agent-hook claude"
         );
         assert_eq!(config["model"], "opus");
+    }
+
+    #[test]
+    fn rewritten_configs_keep_their_permissions() {
+        let dir = std::env::temp_dir().join(format!("terminal-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let private = dir.join("settings.json");
+        fs::write(&private, "{}").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        replace_file(&private, "{\"a\": 1}").unwrap();
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let created = dir.join("hooks.json");
+        replace_file(&created, "{}").unwrap();
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_from_outside_an_agent_are_refused() {
+        // launchd, and a process that does not exist, have no agent above.
+        assert!(!reported_by(ResumableAgent::Codex, 1));
+        assert!(!reported_by(ResumableAgent::Claude, i32::MAX));
     }
 
     #[test]
