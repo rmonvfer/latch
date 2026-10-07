@@ -20,7 +20,7 @@ use gpui::{
 use libghostty_vt::style::RgbColor;
 use serde::Deserialize;
 
-use crate::settings::SettingsStore;
+use crate::{paths, settings::SettingsStore};
 
 /// Primary terminal font family, with fallbacks that ship with macOS.
 pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
@@ -209,7 +209,7 @@ fn load_all_themes() -> Vec<Arc<Theme>> {
 }
 
 pub fn user_theme_dir() -> PathBuf {
-    SettingsStore::config_dir().join("themes")
+    paths::config_dir().join("themes")
 }
 
 /// Load a directory of theme files: `.json` files in Zed's format and any

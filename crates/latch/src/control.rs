@@ -51,7 +51,7 @@ use latch_platform::{
 use crate::{
     agent_badge, notifications,
     pane_tree::Axis,
-    runtime,
+    paths, runtime,
     settings::SettingsStore,
     tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
@@ -169,11 +169,11 @@ pub fn new_token() -> Result<String> {
 }
 
 pub fn socket_path() -> PathBuf {
-    SettingsStore::config_dir().join("control.sock")
+    paths::config_dir().join("control.sock")
 }
 
 fn bin_dir() -> PathBuf {
-    SettingsStore::config_dir().join("bin")
+    paths::config_dir().join("bin")
 }
 
 /// Give a shell what it needs to reach the app: the socket path, and the
@@ -359,7 +359,7 @@ fn link_cli() -> Result<()> {
     let executable = std::env::current_exe()?;
     let bin = bin_dir();
     fs::create_dir_all(&bin)?;
-    let link = bin.join(env!("CARGO_PKG_NAME"));
+    let link = bin.join(paths::PROGRAM_NAME);
     if fs::read_link(&link).ok().as_deref() == Some(executable.as_path()) {
         return Ok(());
     }

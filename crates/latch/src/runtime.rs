@@ -36,12 +36,12 @@ use crate::{
     blocks::decode,
     grid::FrameRow,
     hooks::Bootstrapped,
+    paths,
     runtime_engine::{self, SessionHandle},
     runtime_protocol::{
         AgentReport, Blocks, Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request,
         Response, SessionInfo, Snapshot, VERSION,
     },
-    settings::SettingsStore,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -62,7 +62,7 @@ struct Paths {
 impl Paths {
     fn configured() -> Self {
         Self {
-            directory: SettingsStore::config_dir().join("runtime"),
+            directory: paths::config_dir().join("runtime"),
         }
     }
 

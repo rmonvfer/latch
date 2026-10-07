@@ -72,8 +72,6 @@ impl Pty {
 
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        command.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
-        command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         let initial_cwd = cwd
             .filter(|cwd| cwd.is_dir())
             .map(Path::to_path_buf)

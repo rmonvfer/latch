@@ -18,7 +18,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::control::{ControlClient, NewTab, PaneTarget, Request, SplitDirection};
+use crate::{
+    control::{ControlClient, NewTab, PaneTarget, Request, SplitDirection},
+    paths::PROGRAM_NAME,
+};
 
 const INSTRUCTIONS: &str = "Controls the terminal app the user is running. Tabs and panes \
 have numeric ids from list_tabs. Pane-targeted tools take either a pane id or a tab id \
@@ -300,10 +303,7 @@ impl TerminalServer {
 impl ServerHandler for TerminalServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(Implementation::new(PROGRAM_NAME, env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
 }

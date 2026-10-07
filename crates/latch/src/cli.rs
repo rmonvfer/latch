@@ -16,13 +16,15 @@ use crate::{
     agent_events,
     agent_resume::{self, ResumableAgent},
     control::{self, NewTab, PaneTarget, Request, SplitDirection},
-    mcp, runtime,
+    mcp,
+    paths::PROGRAM_NAME,
+    runtime,
     runtime_protocol::AgentReport,
     terminal_view::PANE_ID_VARIABLE,
 };
 
 #[derive(Parser)]
-#[command(name = env!("CARGO_PKG_NAME"), version, about = "Control the terminal app")]
+#[command(name = PROGRAM_NAME, version, about = "Control the terminal app")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -150,7 +152,7 @@ pub fn run_from_args() -> Option<i32> {
     Some(match run(cli.command) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("{}: {error:#}", env!("CARGO_PKG_NAME"));
+            eprintln!("{PROGRAM_NAME}: {error:#}");
             1
         }
     })

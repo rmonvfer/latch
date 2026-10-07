@@ -5,7 +5,7 @@ use std::{
     fmt::Write as _,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, RwLock, mpsc},
+    sync::{Arc, LazyLock, RwLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -43,6 +43,7 @@ use crate::{
     agents::{self, Activity, Agent, AgentStatus},
     hooks::{Bootstrapped, Hook},
     osc::{OscEvent, OscScanner, Piece},
+    paths::PROGRAM_NAME,
     runtime_blocks::{self, Blocks as BlockLog},
     runtime_protocol::{
         AgentReport, Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions,
@@ -50,6 +51,10 @@ use crate::{
     },
     search, shell_integration,
 };
+
+/// The reply to an XTVERSION query: the program's name and version.
+static XTVERSION: LazyLock<String> =
+    LazyLock::new(|| format!("{PROGRAM_NAME} {}", env!("CARGO_PKG_VERSION")));
 
 /// Scrollback kept per terminal. libghostty measures it in bytes of its
 /// page storage, not lines: this keeps roughly 17,000 rows at 200 columns.
@@ -264,6 +269,8 @@ impl Engine {
         if launch.command_blocks {
             command.env(shell_integration::COMMAND_BLOCKS_VARIABLE, "1");
         }
+        command.env("TERM_PROGRAM", PROGRAM_NAME);
+        command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         let (pty, output) = Pty::spawn(
             command,
             pty_dimensions(launch.dimensions),
@@ -1595,13 +1602,7 @@ fn register_effects(
                 tertiary: Default::default(),
             })
         })?
-        .on_xtversion(|_| {
-            Some(concat!(
-                env!("CARGO_PKG_NAME"),
-                " ",
-                env!("CARGO_PKG_VERSION")
-            ))
-        })?
+        .on_xtversion(|_| Some(XTVERSION.as_str()))?
         .on_color_scheme(move |_| {
             Some(if dark.get() {
                 ColorScheme::Dark

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     pane_group::PaneState,
-    settings::SettingsStore,
+    paths,
     tabs::{TabColor, TabStyle},
     theme,
 };
@@ -99,7 +99,7 @@ fn default_sidebar_width() -> f32 {
 }
 
 pub fn session_path() -> PathBuf {
-    SettingsStore::config_dir().join("session.json")
+    paths::config_dir().join("session.json")
 }
 
 /// The saved session, if there is a readable one this build understands.
@@ -156,11 +156,11 @@ pub fn save(state: &SessionState) -> Result<()> {
 }
 
 fn backups_dir() -> PathBuf {
-    SettingsStore::config_dir().join("session-backups")
+    paths::config_dir().join("session-backups")
 }
 
 fn snapshots_dir() -> PathBuf {
-    SettingsStore::config_dir().join("session-snapshots")
+    paths::config_dir().join("session-snapshots")
 }
 
 /// Keep `contents` as a timestamped copy in `dir`, keeping the newest

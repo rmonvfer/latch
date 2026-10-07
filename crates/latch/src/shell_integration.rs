@@ -16,7 +16,7 @@ use anyhow::{Context as _, Result, bail};
 use gpui::{App, Global};
 use portable_pty::CommandBuilder;
 
-use crate::settings::SettingsStore;
+use crate::{paths, settings::SettingsStore};
 
 /// Environment variable telling the scripts that commands show as blocks,
 /// so the shell's prompt is never drawn.
@@ -56,7 +56,7 @@ impl Global for ShellIntegration {}
 impl ShellIntegration {
     /// Write the scripts to the config directory for shells to load.
     pub fn init(cx: &mut App) {
-        let dir = SettingsStore::config_dir().join("shell-integration");
+        let dir = paths::config_dir().join("shell-integration");
         let installed = match install(&dir) {
             Ok(()) => Some(dir),
             Err(error) => {

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agents::{self, AgentProfile},
+    paths,
     sidebar::SidebarSettings,
     status_bar::StatusBarSettings,
 };
@@ -157,15 +158,6 @@ impl SettingsStore {
         .detach();
     }
 
-    /// The app's configuration directory, e.g. `~/.config/terminal`.
-    pub fn config_dir() -> PathBuf {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(env!("CARGO_PKG_NAME"))
-    }
-
     pub fn get(cx: &App) -> &Settings {
         &cx.global::<Self>().settings
     }
@@ -221,7 +213,7 @@ impl SettingsStore {
 }
 
 fn settings_path() -> PathBuf {
-    SettingsStore::config_dir().join("settings.json")
+    paths::config_dir().join("settings.json")
 }
 
 fn modified_time(path: &Path) -> Option<SystemTime> {

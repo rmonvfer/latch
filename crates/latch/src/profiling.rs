@@ -12,7 +12,7 @@ use std::{
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::prelude::*;
 
-use crate::settings::SettingsStore;
+use crate::paths;
 
 /// Environment variable that turns tracing on; programs started from a
 /// traced app (the session runtime) inherit it.
@@ -30,7 +30,7 @@ pub fn init(process: &str) {
     if std::env::var_os(TRACE_VARIABLE).is_none() {
         return;
     }
-    let dir = SettingsStore::config_dir().join("traces");
+    let dir = paths::config_dir().join("traces");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         log::warn!("cannot record a trace in {}: {error}", dir.display());
         return;
