@@ -44,6 +44,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_SESSIONS: usize = 128;
 const MAX_CONNECTIONS: usize = 160;
+const FILE_DESCRIPTOR_BUDGET: libc::rlim_t = 1024;
 const MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const CLIENT_QUEUE_BYTES: usize = 512 * 1024;
 const CLIENT_QUEUE_CAPACITY: usize = 128;
@@ -540,7 +541,35 @@ pub fn ensure_running() -> Result<()> {
 
 /// Run the headless owner of the PTYs until explicitly shut down with no running sessions.
 pub fn serve() -> Result<()> {
+    configure_file_limit()?;
     Server::bind(Paths::configured())?.run()
+}
+
+fn configure_file_limit() -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read runtime file limit");
+    }
+    // Each PTY owns a master, reader, and writer; connections and shell
+    // startup also need descriptors beyond the persistent session handles.
+    let target = FILE_DESCRIPTOR_BUDGET.min(limit.rlim_max);
+    if limit.rlim_cur < target {
+        limit.rlim_cur = target;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to raise runtime file limit");
+        }
+    }
+    if limit.rlim_cur < FILE_DESCRIPTOR_BUDGET {
+        log::warn!(
+            "runtime file limit is {}; the hard limit may restrict session capacity",
+            limit.rlim_cur
+        );
+    }
+    Ok(())
 }
 
 pub fn create_session(launch: Launch) -> Result<SessionInfo> {
@@ -1362,6 +1391,10 @@ mod tests {
 
     impl TestRuntime {
         fn start() -> Self {
+            Self::start_with_file_limit(None)
+        }
+
+        fn start_with_file_limit(file_limit: Option<libc::rlim_t>) -> Self {
             let paths = temporary_paths();
             paths.prepare().unwrap();
             let mut command = Command::new(std::env::current_exe().unwrap());
@@ -1377,7 +1410,20 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
+                    if let Some(file_limit) = file_limit {
+                        let mut limit = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        limit.rlim_cur = file_limit.min(limit.rlim_max);
+                        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -1499,6 +1545,7 @@ mod tests {
         let Some(directory) = std::env::var_os(TEST_DIRECTORY) else {
             return;
         };
+        configure_file_limit().unwrap();
         Server::bind(Paths {
             directory: PathBuf::from(directory),
         })
@@ -1603,6 +1650,41 @@ mod tests {
             runtime.rpc().request(Request::Ping).unwrap(),
             Response::Ready { .. }
         ));
+    }
+
+    #[test]
+    fn runtime_supports_many_sessions_with_a_low_inherited_file_limit() {
+        let runtime = TestRuntime::start_with_file_limit(Some(256));
+        let sessions: Vec<_> = (0..96)
+            .map(|_| {
+                runtime
+                    .create("printf 'READY\\n'; IFS= read -r line; printf 'INPUT:%s\\n' \"$line\"")
+            })
+            .collect();
+        let _views: Vec<_> = sessions
+            .iter()
+            .map(|session| SessionClient::attach_at(session.id, runtime.paths.clone()).unwrap())
+            .collect();
+        assert_eq!(runtime.list().len(), sessions.len());
+        assert!(runtime.list().iter().all(|session| !session.exited));
+        let id = sessions.last().unwrap().id;
+        let mut client = runtime.rpc();
+        assert!(matches!(
+            client
+                .request(Request::Operate {
+                    session: id,
+                    operation: Operation::Input {
+                        bytes: b"available\n".to_vec(),
+                    },
+                })
+                .unwrap(),
+            Response::Done
+        ));
+        wait_until(|| {
+            read_session_at(&runtime.paths, id, 100)
+                .unwrap()
+                .contains("INPUT:available")
+        });
     }
 
     #[test]
