@@ -45,7 +45,7 @@ use crate::{
     hooks::{Bootstrapped, Completion},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
-    process_info,
+    paths,
     runtime::{self, ClientEvent, SessionClient},
     runtime_display::DisplayState,
     runtime_protocol::{
@@ -571,9 +571,9 @@ impl TerminalView {
                     let (diff, branch) = match cwd.clone() {
                         Some(cwd) => {
                             cx.background_executor()
-                                .spawn(async move {
-                                    (git::diff_stats(&cwd), process_info::git_branch(&cwd))
-                                })
+                                .spawn(
+                                    async move { (git::diff_stats(&cwd), git::git_branch(&cwd)) },
+                                )
                                 .await
                         }
                         None => (None, None),
@@ -619,7 +619,7 @@ impl TerminalView {
                     directory: info
                         .cwd
                         .as_deref()
-                        .map(|path| process_info::shorten_home(path).into()),
+                        .map(|path| paths::shorten_home(path).into()),
                     cwd: info.cwd.clone(),
                     ..Default::default()
                 },
@@ -1581,7 +1581,7 @@ impl TerminalView {
             directory: info
                 .cwd
                 .as_deref()
-                .map(|path| process_info::shorten_home(path).into()),
+                .map(|path| paths::shorten_home(path).into()),
             cwd: info.cwd.clone(),
             branch: self.branch.clone().map(Into::into),
             process: info.process.clone().map(Into::into),
@@ -1994,7 +1994,7 @@ impl TerminalView {
         let theme = cx.theme().clone();
         let destination = match &link.target {
             LinkTarget::Url(url) => url.clone(),
-            LinkTarget::Path(path) => process_info::shorten_home(path),
+            LinkTarget::Path(path) => paths::shorten_home(path),
         };
         let left = metrics.padding + metrics.width * link.start_col as f32;
         let rows = self.dimensions.rows;

@@ -9,6 +9,7 @@ name = "terminal"
 path = "src/main.rs"
 
 [dependencies]
+latch-platform.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 async-channel.workspace = true

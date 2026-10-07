@@ -262,7 +262,7 @@ mod tests {
         std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
         let mut child = std::process::Command::new(&fake).arg("5").spawn().unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        let args = crate::process_info::process_args(child.id() as i32).unwrap();
+        let args = latch_platform::process::process_args(child.id() as i32).unwrap();
         child.kill().unwrap();
         let _ = child.wait();
         std::fs::remove_dir_all(&dir).unwrap();

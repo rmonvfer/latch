@@ -22,7 +22,7 @@ use crate::{
     notifications,
     pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
     pane_tree::PaneNode,
-    process_info::shorten_home,
+    paths::shorten_home,
     runtime,
     runtime_protocol::SessionInfo,
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},

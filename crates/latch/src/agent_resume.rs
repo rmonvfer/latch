@@ -20,10 +20,11 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use latch_platform::process;
+
 use crate::{
     agent_events::{CLAUDE_EVENTS, CODEX_EVENTS},
     agents::{self, Agent},
-    process_info,
 };
 
 /// Longest session id accepted from a hook.
@@ -117,13 +118,13 @@ pub fn reported_by(agent: ResumableAgent, pid: i32) -> bool {
         let Some(pid) = current.filter(|pid| *pid > 1) else {
             return false;
         };
-        if process_info::process_args(pid)
+        if process::process_args(pid)
             .and_then(|args| agents::detect(&args))
             .is_some_and(|running| running == agent.running_as())
         {
             return true;
         }
-        current = process_info::parent_pid(pid);
+        current = process::parent_pid(pid);
     }
     false
 }

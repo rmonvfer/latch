@@ -1,6 +1,7 @@
 //! The git operations the app needs, through libgit2.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -147,6 +148,39 @@ fn to_base36(mut value: u64) -> String {
     String::from_utf8(out).expect("ascii digits")
 }
 
+/// The checked-out branch of the git repository containing `directory`,
+/// or a short commit hash when HEAD is detached.
+pub fn git_branch(directory: &Path) -> Option<String> {
+    let git_dir = find_git_dir(directory)?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(reference) => Some(
+            reference
+                .strip_prefix("refs/heads/")
+                .unwrap_or(reference)
+                .to_string(),
+        ),
+        None => Some(head.chars().take(7).collect()),
+    }
+}
+
+fn find_git_dir(directory: &Path) -> Option<PathBuf> {
+    for ancestor in directory.ancestors() {
+        let candidate = ancestor.join(".git");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        // Worktrees and submodules use a `.git` file pointing at the real dir.
+        if candidate.is_file() {
+            let contents = fs::read_to_string(&candidate).ok()?;
+            let target = contents.trim().strip_prefix("gitdir: ")?;
+            return Some(ancestor.join(target));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use git2::{IndexAddOption, Signature};
@@ -220,5 +254,21 @@ mod tests {
         assert!(!worktree.exists());
         remove_worktree(&nested).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn reads_branch_from_head_file() {
+        let root = std::env::temp_dir().join(format!("git-branch-test-{}", std::process::id()));
+        let nested = root.join("src/deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/feature/tabs\n").unwrap();
+
+        assert_eq!(git_branch(&nested).as_deref(), Some("feature/tabs"));
+
+        fs::write(root.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(git_branch(&nested).as_deref(), Some("0123456"));
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

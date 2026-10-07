@@ -23,7 +23,7 @@ use crate::{
     components::icon,
     git::DiffStats,
     grid::{CellMetrics, Frame, paint_rows},
-    process_info::shorten_home,
+    paths::shorten_home,
     runtime_protocol::BlockContext,
     selected_blocks::SelectionBorder,
     text_input::TextInput,

@@ -32,14 +32,17 @@ use libghostty_vt::{
 };
 use portable_pty::CommandBuilder;
 
+use latch_platform::{
+    process,
+    pty::{MAX_INPUT_BYTES, Pty, PtyDimensions},
+};
+
 use crate::{
     agent_events::{self, AgentEvent, AgentTurn, TurnState},
     agent_resume::AgentSession,
     agents::{self, Activity, Agent, AgentStatus},
     hooks::{Bootstrapped, Hook},
     osc::{OscEvent, OscScanner, Piece},
-    process_info,
-    pty::{MAX_INPUT_BYTES, Pty, PtyDimensions},
     runtime_blocks::{self, Blocks as BlockLog},
     runtime_protocol::{
         AgentReport, Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions,
@@ -295,11 +298,11 @@ impl Engine {
                     let metadata = Metadata {
                         requested_at,
                         foreground,
-                        process: foreground.and_then(process_info::process_name),
-                        cwd: shell.and_then(process_info::working_directory),
+                        process: foreground.and_then(process::process_name),
+                        cwd: shell.and_then(process::working_directory),
                         agent: foreground
                             .filter(|pid| Some(*pid) != shell)
-                            .and_then(process_info::process_args)
+                            .and_then(process::process_args)
                             .and_then(|args| agents::detect(&args)),
                     };
                     if results.send(metadata).is_err() {

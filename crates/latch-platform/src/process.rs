@@ -1,9 +1,10 @@
-use std::{
-    ffi::OsString,
-    fs,
-    os::unix::ffi::OsStringExt,
-    path::{Path, PathBuf},
-};
+//! What the system reports about running processes.
+
+#[cfg(not(target_os = "macos"))]
+use std::fs;
+use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+
+use anyhow::Result;
 
 /// The short name of a running process (e.g. "zsh", "nvim").
 #[cfg(target_os = "macos")]
@@ -173,71 +174,67 @@ pub fn working_directory(pid: i32) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-/// The checked-out branch of the git repository containing `directory`,
-/// or a short commit hash when HEAD is detached.
-pub fn git_branch(directory: &Path) -> Option<String> {
-    let git_dir = find_git_dir(directory)?;
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    match head.strip_prefix("ref: ") {
-        Some(reference) => Some(
-            reference
-                .strip_prefix("refs/heads/")
-                .unwrap_or(reference)
-                .to_string(),
-        ),
-        None => Some(head.chars().take(7).collect()),
-    }
+/// `struct proc_uniqidentifierinfo` from XNU's `sys/proc_info.h`.
+#[repr(C)]
+struct ProcessIdentity {
+    uuid: [u8; 16],
+    unique_id: u64,
+    parent_unique_id: u64,
+    pid_version: i32,
+    original_parent_pid_version: i32,
+    reserved: [u64; 2],
 }
 
-fn find_git_dir(directory: &Path) -> Option<PathBuf> {
-    for ancestor in directory.ancestors() {
-        let candidate = ancestor.join(".git");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        // Worktrees and submodules use a `.git` file pointing at the real dir.
-        if candidate.is_file() {
-            let contents = fs::read_to_string(&candidate).ok()?;
-            let target = contents.trim().strip_prefix("gitdir: ")?;
-            return Some(ancestor.join(target));
-        }
-    }
-    None
+/// `PROC_PIDUNIQIDENTIFIERINFO` from `sys/proc_info.h`.
+const PROC_PID_UNIQUE_IDENTIFIER_INFO: libc::c_int = 17;
+
+/// The current pid version of process `pid`.
+pub fn pid_version(pid: i32) -> Option<i32> {
+    let mut identity = std::mem::MaybeUninit::<ProcessIdentity>::zeroed();
+    let size = std::mem::size_of::<ProcessIdentity>() as libc::c_int;
+    // SAFETY: `identity` is a zeroed ProcessIdentity of exactly `size` bytes.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PID_UNIQUE_IDENTIFIER_INFO,
+            0,
+            identity.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: proc_pidinfo filled the whole struct.
+    (written == size).then(|| unsafe { identity.assume_init() }.pid_version)
 }
 
-/// Replace the home directory prefix with `~`.
-pub fn shorten_home(path: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        && let Ok(rest) = path.strip_prefix(&home)
-    {
-        if rest.as_os_str().is_empty() {
-            return "~".to_string();
-        }
-        return format!("~/{}", rest.display());
-    }
-    path.display().to_string()
+/// Every process id on the system.
+#[cfg(target_os = "macos")]
+pub fn process_ids() -> Result<Vec<i32>> {
+    // SAFETY: the null buffer requests the process count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    anyhow::ensure!(count > 0, "cannot enumerate session processes");
+    let mut processes = vec![0i32; count as usize + 256];
+    // SAFETY: the vector has exactly the writable byte capacity passed here.
+    let count = unsafe {
+        libc::proc_listallpids(
+            processes.as_mut_ptr().cast(),
+            std::mem::size_of_val(processes.as_slice()) as i32,
+        )
+    };
+    anyhow::ensure!(count >= 0, "cannot enumerate session processes");
+    processes.truncate(count as usize);
+    Ok(processes)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_ids() -> Result<Vec<i32>> {
+    Ok(std::fs::read_dir("/proc")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reads_branch_from_head_file() {
-        let root = std::env::temp_dir().join(format!("git-branch-test-{}", std::process::id()));
-        let nested = root.join("src/deep");
-        fs::create_dir_all(&nested).unwrap();
-        fs::create_dir_all(root.join(".git")).unwrap();
-        fs::write(root.join(".git/HEAD"), "ref: refs/heads/feature/tabs\n").unwrap();
-
-        assert_eq!(git_branch(&nested).as_deref(), Some("feature/tabs"));
-
-        fs::write(root.join(".git/HEAD"), "0123456789abcdef\n").unwrap();
-        assert_eq!(git_branch(&nested).as_deref(), Some("0123456"));
-
-        fs::remove_dir_all(&root).unwrap();
-    }
 
     #[test]
     fn decodes_procargs_layout() {

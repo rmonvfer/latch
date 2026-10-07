@@ -13,6 +13,8 @@ use std::{
 use anyhow::{Context as _, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use crate::process::process_ids;
+
 /// Maximum bytes read from a PTY before passing output to its consumer.
 pub const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 /// Maximum queued output chunks per PTY, totaling at most 512 KiB.
@@ -257,31 +259,6 @@ impl Drop for Pty {
             let _ = self.killer.kill();
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn process_ids() -> Result<Vec<i32>> {
-    // SAFETY: the null buffer requests the process count.
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    anyhow::ensure!(count > 0, "cannot enumerate session processes");
-    let mut processes = vec![0i32; count as usize + 256];
-    // SAFETY: the vector has exactly the writable byte capacity passed here.
-    let count = unsafe {
-        libc::proc_listallpids(
-            processes.as_mut_ptr().cast(),
-            std::mem::size_of_val(processes.as_slice()) as i32,
-        )
-    };
-    anyhow::ensure!(count >= 0, "cannot enumerate session processes");
-    processes.truncate(count as usize);
-    Ok(processes)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_ids() -> Result<Vec<i32>> {
-    Ok(std::fs::read_dir("/proc")?
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-        .collect())
 }
 
 fn read_output(

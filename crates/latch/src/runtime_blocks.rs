@@ -15,8 +15,8 @@ use libghostty_vt::{
 };
 
 use crate::{
+    git,
     hooks::Precmd,
-    process_info,
     runtime_engine::encode_row,
     runtime_protocol::{BlockContext, BlockSummary},
 };
@@ -41,7 +41,7 @@ impl From<&Precmd> for BlockContext {
         Self {
             cwd: precmd.cwd.clone(),
             // Read from the repository's files, never by running git.
-            git_branch: precmd.cwd.as_deref().and_then(process_info::git_branch),
+            git_branch: precmd.cwd.as_deref().and_then(git::git_branch),
             virtualenv: precmd.virtualenv.clone(),
             conda_env: precmd.conda_env.clone(),
         }

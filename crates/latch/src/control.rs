@@ -25,12 +25,9 @@ use std::{
     collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::PermissionsExt,
-            net::{UnixListener, UnixStream},
-        },
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
     sync::{
@@ -46,10 +43,15 @@ use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use latch_platform::{
+    peer::{peer_pid, same_user},
+    process,
+};
+
 use crate::{
     agent_badge, notifications,
     pane_tree::Axis,
-    process_info, runtime,
+    runtime,
     settings::SettingsStore,
     tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
@@ -384,33 +386,6 @@ fn accept_connections(listener: UnixListener, requests: async_channel::Sender<Me
     }
 }
 
-fn same_user(stream: &UnixStream) -> bool {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: the descriptor is a live socket and both out-pointers are valid.
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    // SAFETY: getuid has no preconditions.
-    result == 0 && uid == unsafe { libc::getuid() }
-}
-
-/// The process on the other end of a local socket.
-pub(crate) fn peer_pid(stream: &UnixStream) -> Option<i32> {
-    let mut pid: libc::pid_t = 0;
-    let mut size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: the descriptor is a live socket and `pid`/`size` describe a
-    // valid buffer for LOCAL_PEERPID.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut size,
-        )
-    };
-    (result == 0 && pid > 0).then_some(pid)
-}
-
 fn connection_key(connection: u64) -> String {
     format!("connection:{connection}")
 }
@@ -577,7 +552,7 @@ impl Workspace {
         }
         let name = caller
             .peer
-            .and_then(process_info::process_name)
+            .and_then(process::process_name)
             .map(|name| {
                 format!("A program outside this app's tabs (calling itself “{name}”) wants")
             })

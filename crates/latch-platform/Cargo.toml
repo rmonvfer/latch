@@ -1,0 +1,12 @@
+[package]
+name = "latch-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+libc.workspace = true
+log.workspace = true
+portable-pty.workspace = true

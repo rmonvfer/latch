@@ -13,7 +13,7 @@ use gpui::{
 use crate::{
     agent_resume::{self, ResumableAgent},
     components::{button, icon},
-    process_info::{self, shorten_home},
+    paths::{self, shorten_home},
     session,
     settings::{
         FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, Settings, SettingsStore, TERMINAL_PADDING_RANGE,
@@ -348,7 +348,7 @@ impl SettingsPage {
                                             agent.display_name(),
                                             paths
                                                 .iter()
-                                                .map(|path| process_info::shorten_home(path))
+                                                .map(|path| paths::shorten_home(path))
                                                 .collect::<Vec<_>>()
                                                 .join(", ")
                                         ),
