@@ -95,6 +95,8 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo build
 ./target/debug/terminal
 ```
 
+The code is a Cargo workspace. `latch-platform` holds the system services that differ most between platforms: process inspection, pseudo-terminals, and socket peer identity. `latch-core` is the domain shared by the other crates, covering coding agents, shell hooks and integration scripts, git, and the program's paths. `latch-runtime` is the detached session runtime with its protocol, terminal engine, and client. `latch-ui` holds every GPUI view, and `latch` is the `terminal` executable: startup, the command line, and the MCP server. Only `latch-ui` and `latch` depend on GPUI.
+
 `.cargo/config.toml` builds Ghostty's Zig core with `ReleaseFast` even in dev builds. In Debug mode, parsing terminal output is dozens of times slower.
 
 Notifications only show up when the app runs from a bundle. `script/bundle-mac` builds `target/release/Latch.app`, or a debug bundle with `--debug`. Keep its bundle location stable because the session runtime authenticates connections by executable path. The script uses the available Developer ID certificate, or an ad-hoc signature when none is installed. Set `LATCH_SIGNING_IDENTITY` to select a certificate, or `-` for ad-hoc signing; `LATCH_SIGNING_KEYCHAIN` selects its keychain.
@@ -103,7 +105,7 @@ Notifications only show up when the app runs from a bundle. `script/bundle-mac` 
 
 ## Releases
 
-The [macOS release workflow](.github/workflows/release.yml) checks formatting, runs Clippy and tests, then builds native Apple Silicon and Intel bundles. A push to `dev` publishes a beta prerelease tagged `v<VERSION>-beta.<RUN_NUMBER>`. A push to `main` publishes `v<VERSION>` as the latest production release, where `VERSION` is the package version in `Cargo.toml`. Published versions are never moved to another commit; bump the version in both `Cargo.toml` and `Cargo.lock` for the next production release. Pull requests run the same checks and packaging without publishing.
+The [macOS release workflow](.github/workflows/release.yml) checks formatting, runs Clippy and tests, then builds native Apple Silicon and Intel bundles. A push to `dev` publishes a beta prerelease tagged `v<VERSION>-beta.<RUN_NUMBER>`. A push to `main` publishes `v<VERSION>` as the latest production release, where `VERSION` is the workspace package version in the root `Cargo.toml`. Published versions are never moved to another commit; bump that version, and the matching entries in `Cargo.lock`, for the next production release. Pull requests run the same checks and packaging without publishing.
 
 Develop on `dev` and merge it into `main` to promote a version. The workflow creates tags at the built commit, uploads both ZIPs and their checksums to a draft release, and publishes only after both architecture builds succeed. Manual runs on either branch can retry a release; beta run numbers distinguish builds. Publishing requires the Developer ID signing credentials configured in the repository's Actions secrets. Pull requests use ad-hoc signatures.
 
