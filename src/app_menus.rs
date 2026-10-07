@@ -15,7 +15,7 @@ use crate::{
     terminal_view::{ClearScrollback, Copy, Find, Paste, SearchNext, SearchPrevious, SelectAll},
     workspace::{
         ActivateTab, CloseTab, CloseWindow, NewAgent, NewTab, NextAttention, NextTab, OpenSettings,
-        PreviousTab, Quit, RenameTab, StopTab, ToggleSidebar,
+        PreviousTab, Quit, RenameTab, StopTab, ToggleCommandPalette, ToggleSidebar,
     },
 };
 
@@ -165,6 +165,8 @@ pub fn app_menus(cx: &App) -> Vec<Menu> {
             MenuItem::action("Clear Scrollback", ClearScrollback),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Command Palette…", ToggleCommandPalette),
+            MenuItem::separator(),
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action(status_bar_label, ToggleStatusBar),
             MenuItem::submenu(Menu::new("Tab Density").items([

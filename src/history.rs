@@ -160,8 +160,8 @@ pub fn fuzzy_positions(text: &str, query: &str) -> Vec<usize> {
 }
 
 /// Start and end character positions of the tightest match of `query` in
-/// `text`. An empty query matches at the start.
-fn fuzzy_match(text: &str, query: &[char]) -> Option<(usize, usize)> {
+/// `text`. `query` must be lowercase. An empty query matches at the start.
+pub(crate) fn fuzzy_match(text: &str, query: &[char]) -> Option<(usize, usize)> {
     if query.is_empty() {
         return Some((0, 0));
     }

@@ -7,12 +7,15 @@ use std::{
 use gpui::{
     Action, AnyElement, App, AsyncApp, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
     Focusable, Modifiers, MouseButton, MouseMoveEvent, Pixels, Point, PromptLevel, ScrollHandle,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, deferred, div, prelude::*, px,
 };
 
 use crate::{
     agent_events::AgentTurn,
     agents::AgentProfile,
+    command_palette::{
+        self, CommandPalette, CommandPaletteEvent, PaletteItem, PaletteTarget, Section,
+    },
     components::{self, icon, icon_button, keybinding},
     confirm::confirm_close,
     git::{self, DiffStats},
@@ -46,6 +49,7 @@ actions!(
         ToggleSidebar,
         OpenSettings,
         RenameTab,
+        ToggleCommandPalette,
         Quit
     ]
 );
@@ -147,6 +151,14 @@ pub(crate) struct ContextMenu {
     pub position: Point<Pixels>,
 }
 
+/// The open command palette and the element focused before it opened,
+/// which gets focus back when it closes.
+struct OpenPalette {
+    palette: Entity<CommandPalette>,
+    restore_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+}
+
 pub(crate) struct Renaming {
     pub target: Target,
     pub input: Entity<TextInput>,
@@ -199,6 +211,7 @@ pub struct Workspace {
     pub(crate) sidebar_drop: Option<SidebarDrop>,
     pub(crate) renaming: Option<Renaming>,
     pub(crate) tab_search: Entity<TextInput>,
+    command_palette: Option<OpenPalette>,
     focus_handle: FocusHandle,
     save_task: Option<Task<()>>,
     /// Background tabs that rang the bell, notified, or finished a command.
@@ -257,6 +270,7 @@ impl Workspace {
             sidebar_drop: None,
             renaming: None,
             tab_search,
+            command_palette: None,
             focus_handle: cx.focus_handle(),
             save_task: None,
             attention: HashSet::new(),
@@ -1792,6 +1806,90 @@ impl Workspace {
         }
     }
 
+    fn toggle_command_palette(
+        &mut self,
+        _: &ToggleCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_palette.is_some() {
+            self.close_command_palette(window, cx);
+            return;
+        }
+        // Commands and their shortcuts are read while the previous element
+        // still has focus, so they reflect what the palette will act on.
+        let mut items = self.palette_tab_items(cx);
+        items.extend(command_palette::command_items(window, cx));
+        items.extend(command_palette::theme_items(cx));
+        let palette = cx.new(|cx| CommandPalette::new(items, window, cx));
+        let subscription = cx.subscribe_in(
+            &palette,
+            window,
+            |this, _, event: &CommandPaletteEvent, window, cx| match event {
+                CommandPaletteEvent::Dismissed => this.close_command_palette(window, cx),
+                CommandPaletteEvent::Chosen(target) => {
+                    let target = target.clone();
+                    this.close_command_palette(window, cx);
+                    this.run_palette_target(target, window, cx);
+                }
+            },
+        );
+        self.command_palette = Some(OpenPalette {
+            restore_focus: window.focused(cx),
+            palette: palette.clone(),
+            _subscription: subscription,
+        });
+        self.context_menu = None;
+        window.focus(&palette.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn palette_tab_items(&self, cx: &App) -> Vec<PaletteItem> {
+        self.ordered_open_tabs()
+            .into_iter()
+            .filter_map(|id| {
+                let display = self.display(id, cx)?;
+                Some(PaletteItem {
+                    section: Section::Tabs,
+                    icon: display.icon,
+                    label: display.title,
+                    detail: display.directory,
+                    keystroke: None,
+                    current: self.active == Some(id),
+                    target: PaletteTarget::Tab(id),
+                })
+            })
+            .collect()
+    }
+
+    fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.command_palette.take() else {
+            return;
+        };
+        match open.restore_focus {
+            Some(handle) => window.focus(&handle, cx),
+            None => self.focus_content(window, cx),
+        }
+        cx.notify();
+    }
+
+    fn run_palette_target(
+        &mut self,
+        target: PaletteTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            PaletteTarget::Tab(id) => self.activate(id, window, cx),
+            // Dispatched from the restored focus, so pane and terminal
+            // commands reach the pane the palette was opened over.
+            PaletteTarget::Action(action) => window.dispatch_action(action, cx),
+            PaletteTarget::Theme(name) => {
+                SettingsStore::update(cx, |settings| settings.theme = name.to_string());
+            }
+        }
+    }
+
     #[tracing::instrument(skip_all)]
     fn render_titlebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let display = self.active.and_then(|id| self.display(id, cx));
@@ -1800,6 +1898,7 @@ impl Workspace {
         let status_bar = &SettingsStore::get(cx).status_bar;
         let toggle_in_titlebar =
             !status_bar.visible || status_bar.side_of(StatusItem::SidebarToggle).is_none();
+        let settings_open = self.active.is_some() && self.active == self.settings_tab();
 
         div()
             .id("titlebar")
@@ -1858,6 +1957,16 @@ impl Workspace {
                             .map(|directory| titlebar_label(directory, theme.text_muted)),
                     )
             }))
+            .child(div().flex_1())
+            .child(
+                icon_button("titlebar-settings", "settings", theme)
+                    .size(px(26.))
+                    .rounded(px(6.))
+                    .when(settings_open, |button| button.bg(theme.ghost_selected))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_settings(&OpenSettings, window, cx);
+                    })),
+            )
     }
 
     fn render_empty_state(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1957,6 +2066,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::quit))
             .when(self.sidebar_resizing, |root| {
                 root.cursor(CursorStyle::ResizeLeftRight)
@@ -1993,6 +2103,11 @@ impl Render for Workspace {
             )
             .children(self.render_status_bar(&theme, cx))
             .children(self.render_context_menu(&theme, cx))
+            .children(
+                self.command_palette
+                    .as_ref()
+                    .map(|open| deferred(open.palette.clone()).with_priority(1)),
+            )
     }
 }
 

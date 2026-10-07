@@ -101,7 +101,6 @@ impl Default for StatusBarSettings {
                 StatusItem::GitBranch,
                 StatusItem::Theme,
                 StatusItem::GridSize,
-                StatusItem::Settings,
             ],
         }
     }

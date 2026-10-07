@@ -9,6 +9,7 @@ mod block_view;
 mod blocks;
 mod cli;
 mod command_editor;
+mod command_palette;
 mod completion;
 mod components;
 mod confirm;
@@ -64,7 +65,7 @@ use crate::{
     terminal_view::{ClearScrollback, Copy, Paste, SelectAll},
     workspace::{
         ActivateTab, CloseTab, CloseWindow, NewTab, NextAttention, NextTab, OpenSettings,
-        PreviousTab, Quit, RenameTab, ToggleSidebar, Workspace,
+        PreviousTab, Quit, RenameTab, ToggleCommandPalette, ToggleSidebar, Workspace,
     },
 };
 
@@ -170,12 +171,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, Some("Workspace")),
         KeyBinding::new("cmd-shift-j", NextAttention, Some("Workspace")),
         KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
+        KeyBinding::new("cmd-k", ToggleCommandPalette, Some("Workspace")),
         KeyBinding::new("f2", RenameTab, Some("Workspace")),
         KeyBinding::new("cmd-9", ActivateTab(usize::MAX), Some("Workspace")),
         KeyBinding::new("cmd-c", Copy, Some("Terminal")),
         KeyBinding::new("cmd-v", Paste, Some("Terminal")),
         KeyBinding::new("cmd-a", SelectAll, Some("Terminal")),
-        KeyBinding::new("cmd-k", ClearScrollback, Some("Terminal")),
+        KeyBinding::new("cmd-shift-k", ClearScrollback, Some("Terminal")),
     ];
     for index in 0..8 {
         bindings.push(KeyBinding::new(
@@ -186,6 +188,7 @@ fn bind_keys(cx: &mut App) {
     }
     bindings.extend(text_input::key_bindings());
     bindings.extend(command_editor::key_bindings());
+    bindings.extend(command_palette::key_bindings());
     bindings.extend(pane_group::key_bindings());
     bindings.extend(terminal_view::key_bindings());
     cx.bind_keys(bindings);
