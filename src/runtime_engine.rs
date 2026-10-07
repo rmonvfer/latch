@@ -1793,7 +1793,7 @@ mod tests {
         session.operate(Operation::Input {
             bytes: b"go\n".to_vec(),
         });
-        thread::sleep(Duration::from_millis(100));
+        session.wait_text("output while detached");
         let reattached = session.0.clone();
         assert_eq!(reattached.info().shell_pid, Some(pid));
         assert!(session.text().contains("output while detached"));
