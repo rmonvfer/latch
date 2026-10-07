@@ -71,7 +71,7 @@ use crate::{
 
 /// Bundle identifier, matching the app bundle built by script/bundle-mac.
 const APP_IDENTIFIER: &str = "me.egrati.terminal";
-const APP_NAME: &str = "Terminal";
+const APP_NAME: &str = "Latch";
 
 fn main() {
     if std::env::args_os()
@@ -115,7 +115,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(env!("CARGO_PKG_NAME").into()),
+                    title: Some(APP_NAME.into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(9.), px(9.))),
                 }),

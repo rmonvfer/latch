@@ -1,0 +1,49 @@
+{
+  "fill" : {
+    "solid" : "srgb:0.96863,0.95686,0.91765,1.00000"
+  },
+  "fill-specializations" : [
+    {
+      "appearance" : "dark",
+      "value" : {
+        "solid" : "srgb:0.12549,0.13725,0.17647,1.00000"
+      }
+    }
+  ],
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "fill-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : {
+                "solid" : "srgb:0.96863,0.95686,0.91765,1.00000"
+              }
+            }
+          ],
+          "glass" : false,
+          "image-name" : "ring.svg",
+          "name" : "ring"
+        },
+        {
+          "glass" : false,
+          "image-name" : "latch.svg",
+          "name" : "latch"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [],
+    "squares" : "shared"
+  }
+}

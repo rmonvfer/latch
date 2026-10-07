@@ -17,15 +17,24 @@ fi
 
 cargo build "${cargo_flags[@]+"${cargo_flags[@]}"}"
 
-name="Terminal"
+name="Latch"
 identifier="me.egrati.terminal"
 executable="terminal"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-bundle="target/$profile/$name.app"
+# The runtime authenticates peers by executable path, so the bundle location is stable.
+bundle="target/$profile/Terminal.app"
 
-rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-cp "target/$profile/$executable" "$bundle/Contents/MacOS/$executable"
+cp "target/$profile/$executable" "$bundle/Contents/MacOS/$executable.tmp"
+mv "$bundle/Contents/MacOS/$executable.tmp" "$bundle/Contents/MacOS/$executable"
+xcrun actool assets/app-icon/Latch.icon \
+  --compile "$bundle/Contents/Resources" \
+  --app-icon Latch \
+  --platform macosx \
+  --minimum-deployment-target 13.0 \
+  --output-partial-info-plist "target/$profile/latch-icon-info.plist" \
+  --output-format human-readable-text \
+  --warnings --errors
 
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -36,6 +45,8 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>$name</string>
   <key>CFBundleIdentifier</key><string>$identifier</string>
   <key>CFBundleExecutable</key><string>$executable</string>
+  <key>CFBundleIconFile</key><string>Latch.icns</string>
+  <key>CFBundleIconName</key><string>Latch</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
