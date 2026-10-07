@@ -36,15 +36,15 @@ pub const COMPLETE_KEY: &[u8] = b"\x1b[9877~";
 const SCRIPTS: [(&str, &str); 3] = [
     (
         "zsh/.zshenv",
-        include_str!("../assets/shell-integration/zsh/.zshenv"),
+        include_str!("../../../assets/shell-integration/zsh/.zshenv"),
     ),
     (
         "zsh/integration.zsh",
-        include_str!("../assets/shell-integration/zsh/integration.zsh"),
+        include_str!("../../../assets/shell-integration/zsh/integration.zsh"),
     ),
     (
         "bash/integration.bash",
-        include_str!("../assets/shell-integration/bash/integration.bash"),
+        include_str!("../../../assets/shell-integration/bash/integration.bash"),
     ),
 ];
 

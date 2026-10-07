@@ -14,7 +14,9 @@ class ReleasePlanTests(unittest.TestCase):
         shutil.copy2(
             pathlib.Path(__file__).with_name("release-plan"), self.root / "script"
         )
-        (self.root / "Cargo.toml").write_text('[package]\nversion = "1.2.3"\n')
+        (self.root / "Cargo.toml").write_text(
+            '[workspace.package]\nversion = "1.2.3"\n'
+        )
         self.git("init", "--quiet")
         self.git("config", "user.name", "Release test")
         self.git("config", "user.email", "release@example.invalid")
@@ -79,7 +81,9 @@ class ReleasePlanTests(unittest.TestCase):
     def test_invalid_release_inputs(self):
         self.plan("feature", succeeds=False)
         self.plan(run="0", succeeds=False)
-        (self.root / "Cargo.toml").write_text('[package]\nversion = "1.2.3-beta.1"\n')
+        (self.root / "Cargo.toml").write_text(
+            '[workspace.package]\nversion = "1.2.3-beta.1"\n'
+        )
         self.plan(succeeds=False)
 
 

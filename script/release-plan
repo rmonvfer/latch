@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 branch=${1:?usage: script/release-plan branch run-number event}
 run_number=${2:?run number is required}
 event=${3:?event is required}
-version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "$run_number" =~ ^[1-9][0-9]*$ ]]; then
   echo "Releases require a numeric Cargo version and a positive run number" >&2
   exit 1

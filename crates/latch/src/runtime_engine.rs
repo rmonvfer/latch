@@ -1740,12 +1740,12 @@ mod tests {
             fs::create_dir_all(dir.join("zsh")).unwrap();
             fs::write(
                 dir.join("zsh/.zshenv"),
-                include_str!("../assets/shell-integration/zsh/.zshenv"),
+                include_str!("../../../assets/shell-integration/zsh/.zshenv"),
             )
             .unwrap();
             fs::write(
                 dir.join("zsh/integration.zsh"),
-                include_str!("../assets/shell-integration/zsh/integration.zsh"),
+                include_str!("../../../assets/shell-integration/zsh/integration.zsh"),
             )
             .unwrap();
             command.env("ZDOTDIR", dir.join("zsh"));

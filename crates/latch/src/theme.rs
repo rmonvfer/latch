@@ -50,9 +50,9 @@ pub const RADIUS_LG: Pixels = px(8.);
 pub const DEFAULT_THEME: &str = "One Dark";
 
 const BUNDLED_THEME_FILES: [&str; 3] = [
-    include_str!("../assets/themes/one.json"),
-    include_str!("../assets/themes/ayu.json"),
-    include_str!("../assets/themes/gruvbox.json"),
+    include_str!("../../../assets/themes/one.json"),
+    include_str!("../../../assets/themes/ayu.json"),
+    include_str!("../../../assets/themes/gruvbox.json"),
 ];
 const GHOSTTY_THEME_DIRS: [&str; 1] =
     ["/Applications/Ghostty.app/Contents/Resources/ghostty/themes"];

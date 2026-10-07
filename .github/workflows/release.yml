@@ -70,7 +70,7 @@ jobs:
       - name: Check lints
         run: cargo clippy --locked --release --all-targets -- -D warnings
       - name: Run tests
-        run: cargo test --locked --release --bin terminal
+        run: cargo test --locked --release --workspace
       - name: Import Developer ID certificate
         if: github.event_name != 'pull_request'
         env:
