@@ -71,10 +71,49 @@ jobs:
         run: cargo clippy --locked --release --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked --release --bin terminal
+      - name: Import Developer ID certificate
+        if: github.event_name != 'pull_request'
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [[ -z "$CERTIFICATE" || -z "$CERTIFICATE_PASSWORD" || -z "$SIGNING_IDENTITY" ]]; then
+            echo "Developer ID signing secrets are required for release builds." >&2
+            exit 1
+          fi
+          certificate_path="$RUNNER_TEMP/latch-signing.p12"
+          keychain_path="$RUNNER_TEMP/latch-signing.keychain-db"
+          keychain_password=$(openssl rand -hex 32)
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$certificate_path"
+          chmod 600 "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -P "$CERTIFICATE_PASSWORD" \
+            -t cert -f pkcs12 -k "$keychain_path" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain_path" > /dev/null
+          security list-keychains -d user -s "$keychain_path" "$HOME/Library/Keychains/login.keychain-db"
+          rm "$certificate_path"
+          echo "LATCH_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "LATCH_SIGNING_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
+      - name: Select pull request signing
+        if: github.event_name == 'pull_request'
+        run: echo 'LATCH_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
       - name: Build and package
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: script/package-mac "$RELEASE_TAG"
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          keychain_path="$RUNNER_TEMP/latch-signing.keychain-db"
+          if [[ -f "$keychain_path" ]]; then
+            security delete-keychain "$keychain_path"
+          fi
+          rm -f "$RUNNER_TEMP/latch-signing.p12"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ matrix.architecture }}
@@ -120,9 +159,9 @@ jobs:
             title="Latch $RELEASE_TAG (Beta)"
           fi
           cat > notes.md <<'NOTES'
-          Download the ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`), unzip it, and move `Terminal.app` to Applications. The app displays as Latch. Keep it at that location across upgrades so the session runtime can reconnect.
+          Download the ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`), unzip it, and move `Latch.app` to Applications. Keep it at that location across upgrades so the session runtime can reconnect.
 
-          Builds are ad-hoc signed, without Apple notarization. macOS may require approval under System Settings > Privacy & Security on first launch.
+          Builds are signed with an Apple Developer ID certificate and hardened runtime, without Apple notarization. macOS may require approval under System Settings > Privacy & Security on first launch.
 
           Each ZIP has a SHA-256 checksum. The app bundle includes the application and theme licenses.
           NOTES

@@ -2,8 +2,8 @@
 # Build the app and wrap it in a macOS .app bundle. Running from the bundle
 # is what lets macOS deliver the app's notifications.
 #
-#   script/bundle-mac            release build → target/release/Terminal.app
-#   script/bundle-mac --debug    debug build   → target/debug/Terminal.app
+#   script/bundle-mac            release build → target/release/Latch.app
+#   script/bundle-mac --debug    debug build   → target/debug/Latch.app
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -13,6 +13,24 @@ cargo_flags=(--release)
 if [[ "${1:-}" == "--debug" ]]; then
   profile=debug
   cargo_flags=()
+fi
+
+signing_identity=${LATCH_SIGNING_IDENTITY:-}
+signing_keychain=()
+identity_keychain=()
+if [[ -n "${LATCH_SIGNING_KEYCHAIN:-}" ]]; then
+  signing_keychain=(--keychain "$LATCH_SIGNING_KEYCHAIN")
+  identity_keychain=("$LATCH_SIGNING_KEYCHAIN")
+fi
+if [[ -z "$signing_identity" ]]; then
+  identities=$(security find-identity -v -p codesigning "${identity_keychain[@]+"${identity_keychain[@]}"}" | \
+    sed -n 's/.*) \([A-F0-9]*\) "Developer ID Application:.*"/\1/p')
+  identity_count=$(printf '%s\n' "$identities" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [[ "$identity_count" -gt 1 ]]; then
+    echo "Multiple Developer ID identities are available; set LATCH_SIGNING_IDENTITY" >&2
+    exit 1
+  fi
+  signing_identity=${identities:--}
 fi
 
 cargo build --locked "${cargo_flags[@]+"${cargo_flags[@]}"}"
@@ -27,7 +45,7 @@ if [[ ! "$build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
   exit 1
 fi
 # The runtime authenticates peers by executable path, so the bundle location is stable.
-bundle="target/$profile/Terminal.app"
+bundle="target/$profile/Latch.app"
 
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp LICENSE "$bundle/Contents/Resources/LICENSE"
@@ -63,6 +81,13 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature so macOS treats the bundle as one app across launches.
-codesign --force --deep --sign - "$bundle" >/dev/null
+# The signature lets macOS treat the bundle as one app across launches.
+signing_options=()
+if [[ "$signing_identity" != "-" ]]; then
+  signing_options=(--timestamp --options runtime)
+fi
+codesign --force --sign "$signing_identity" \
+  "${signing_keychain[@]+"${signing_keychain[@]}"}" \
+  "${signing_options[@]+"${signing_options[@]}"}" "$bundle" >/dev/null
+codesign --verify --deep --strict "$bundle"
 echo "$bundle"

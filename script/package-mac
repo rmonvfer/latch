@@ -8,9 +8,13 @@ if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
   echo "Expected a version tag such as v0.1.0 or v0.1.0-beta.1" >&2
   exit 1
 fi
+if [[ "${LATCH_REQUIRE_NOTARIZATION:-0}" == 1 && -z "${LATCH_NOTARY_PROFILE:-}" ]]; then
+  echo "LATCH_NOTARY_PROFILE is required for notarized packaging" >&2
+  exit 1
+fi
 
 script/bundle-mac
-bundle=target/release/Terminal.app
+bundle=target/release/Latch.app
 plutil -lint "$bundle/Contents/Info.plist"
 codesign --verify --deep --strict "$bundle"
 architecture=$(uname -m)
@@ -27,5 +31,30 @@ fi
 mkdir -p target/dist
 archive="Latch-$tag-macos-$architecture.zip"
 ditto -c -k --sequesterRsrc --keepParent "$bundle" "target/dist/$archive"
+if [[ -n "${LATCH_NOTARY_PROFILE:-}" ]]; then
+  notary_keychain=()
+  if [[ -n "${LATCH_NOTARY_KEYCHAIN:-}" ]]; then
+    notary_keychain=(--keychain "$LATCH_NOTARY_KEYCHAIN")
+  fi
+  notary_result=$(mktemp)
+  trap 'rm "$notary_result"' EXIT
+  xcrun notarytool submit "target/dist/$archive" \
+    --keychain-profile "$LATCH_NOTARY_PROFILE" \
+    "${notary_keychain[@]+"${notary_keychain[@]}"}" \
+    --wait --output-format json > "$notary_result"
+  python3 - "$notary_result" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as result_file:
+    result = json.load(result_file)
+if result.get("status") != "Accepted":
+    raise SystemExit(f"Notarization was not accepted: {result.get('status', 'unknown')}")
+PY
+  xcrun stapler staple "$bundle"
+  xcrun stapler validate "$bundle"
+  spctl --assess --type execute --verbose "$bundle"
+  ditto -c -k --sequesterRsrc --keepParent "$bundle" "target/dist/$archive"
+fi
 (cd target/dist && shasum -a 256 "$archive" > "$archive.sha256")
 echo "target/dist/$archive"

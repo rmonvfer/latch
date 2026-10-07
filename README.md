@@ -15,7 +15,7 @@ It's early and macOS only.
 
 ## Installing
 
-[Production releases](https://github.com/rmonvfer/latch/releases/latest) include macOS ZIPs for Apple Silicon (`arm64`) and Intel (`x86_64`), with SHA-256 checksums. Unzip the matching download and move `Terminal.app` to Applications; it displays as Latch. Keep the bundle at the same location across upgrades so its session runtime can reconnect. Builds are ad-hoc signed without Apple notarization; macOS may require approval in System Settings → Privacy & Security on first launch.
+[Production releases](https://github.com/rmonvfer/latch/releases/latest) include macOS ZIPs for Apple Silicon (`arm64`) and Intel (`x86_64`), with SHA-256 checksums. Unzip the matching download and move `Latch.app` to Applications. Keep the bundle at the same location across upgrades so its session runtime can reconnect. Releases are signed with an Apple Developer ID certificate; the release notes state whether Apple notarization is included.
 
 [Beta releases](https://github.com/rmonvfer/latch/releases) are marked as prereleases. They use the same settings and sessions as production, so install one channel at a time.
 
@@ -95,13 +95,15 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo build
 
 `.cargo/config.toml` builds Ghostty's Zig core with `ReleaseFast` even in dev builds. In Debug mode, parsing terminal output is dozens of times slower.
 
-Notifications only show up when the app runs from a bundle. `script/bundle-mac` builds `target/release/Terminal.app`, or a debug bundle with `--debug`. The app displays as Latch; its bundle location stays stable because the session runtime authenticates connections by executable path.
+Notifications only show up when the app runs from a bundle. `script/bundle-mac` builds `target/release/Latch.app`, or a debug bundle with `--debug`. Keep its bundle location stable because the session runtime authenticates connections by executable path. The script uses the available Developer ID certificate, or an ad-hoc signature when none is installed. Set `LATCH_SIGNING_IDENTITY` to select a certificate, or `-` for ad-hoc signing; `LATCH_SIGNING_KEYCHAIN` selects its keychain.
+
+`script/package-mac v0.1.1` builds a release ZIP and checksum. Set `LATCH_NOTARY_PROFILE` to a stored `notarytool` credential profile to submit the app to Apple, staple its accepted ticket, and validate it before packaging. `LATCH_NOTARY_KEYCHAIN` selects the profile's keychain, and `LATCH_REQUIRE_NOTARIZATION=1` requires a profile.
 
 ## Releases
 
 The [macOS release workflow](.github/workflows/release.yml) checks formatting, runs Clippy and tests, then builds native Apple Silicon and Intel bundles. A push to `dev` publishes a beta prerelease tagged `v<VERSION>-beta.<RUN_NUMBER>`. A push to `main` publishes `v<VERSION>` as the latest production release, where `VERSION` is the package version in `Cargo.toml`. Published versions are never moved to another commit; bump the version in both `Cargo.toml` and `Cargo.lock` for the next production release. Pull requests run the same checks and packaging without publishing.
 
-Develop on `dev` and merge it into `main` to promote a version. The workflow creates tags at the built commit, uploads both ZIPs and their checksums to a draft release, and publishes only after both architecture builds succeed. Manual runs on either branch can retry a release; beta run numbers distinguish builds. Apple Developer ID signing and notarization are not configured.
+Develop on `dev` and merge it into `main` to promote a version. The workflow creates tags at the built commit, uploads both ZIPs and their checksums to a draft release, and publishes only after both architecture builds succeed. Manual runs on either branch can retry a release; beta run numbers distinguish builds. Publishing requires the Developer ID signing credentials configured in the repository's Actions secrets. Pull requests use ad-hoc signatures.
 
 ## Profiling
 
