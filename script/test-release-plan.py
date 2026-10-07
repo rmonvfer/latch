@@ -11,7 +11,9 @@ class ReleasePlanTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = pathlib.Path(self.directory.name)
         (self.root / "script").mkdir()
-        shutil.copy2(pathlib.Path(__file__).with_name("release-plan"), self.root / "script")
+        shutil.copy2(
+            pathlib.Path(__file__).with_name("release-plan"), self.root / "script"
+        )
         (self.root / "Cargo.toml").write_text('[package]\nversion = "1.2.3"\n')
         self.git("init", "--quiet")
         self.git("config", "user.name", "Release test")
@@ -20,7 +22,11 @@ class ReleasePlanTests(unittest.TestCase):
 
     def git(self, *arguments):
         return subprocess.run(
-            ["git", *arguments], cwd=self.root, check=True, capture_output=True, text=True
+            ["git", *arguments],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
     def commit(self, message):
@@ -31,6 +37,7 @@ class ReleasePlanTests(unittest.TestCase):
         result = subprocess.run(
             [str(self.root / "script/release-plan"), branch, run, event],
             cwd=self.root,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -47,7 +54,9 @@ class ReleasePlanTests(unittest.TestCase):
 
     def test_pull_requests_cannot_publish(self):
         for branch in ("main", "dev"):
-            self.assertEqual(self.plan(branch, event="pull_request")["publish"], "false")
+            self.assertEqual(
+                self.plan(branch, event="pull_request")["publish"], "false"
+            )
 
     def test_same_commit_can_retry(self):
         self.git("tag", "-a", "v1.2.3", "-m", "Production")
