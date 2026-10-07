@@ -3,7 +3,7 @@
 use anyhow::Result;
 use libghostty_vt::{Terminal, style::RgbColor, terminal::CursorStyle};
 
-use crate::runtime_protocol::{Cursor, Dimensions, Snapshot};
+use crate::protocol::{Cursor, Dimensions, Snapshot};
 
 #[derive(Default)]
 pub struct DisplayState {
@@ -77,7 +77,7 @@ fn rgb([r, g, b]: [u8; 3]) -> RgbColor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime_protocol::SessionInfo, search};
+    use crate::{protocol::SessionInfo, search};
     use libghostty_vt::render::{CursorVisualStyle, RenderState};
     use libghostty_vt::terminal::Options;
 

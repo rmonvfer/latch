@@ -20,11 +20,11 @@ use latch_core::{
     environment::{PANE_ID_VARIABLE, TOKEN_VARIABLE},
     paths::PROGRAM_NAME,
 };
+use latch_runtime::protocol::AgentReport;
 
 use crate::{
     control::{self, NewTab, PaneTarget, Request, SplitDirection},
-    mcp, runtime,
-    runtime_protocol::AgentReport,
+    mcp,
 };
 
 #[derive(Parser)]
@@ -194,7 +194,7 @@ fn report_agent_hook(agent: &str) {
     } else {
         return;
     };
-    let _ = runtime::report_agent(token, report);
+    let _ = latch_runtime::report_agent(token, report);
 }
 
 fn run(command: Command) -> Result<()> {

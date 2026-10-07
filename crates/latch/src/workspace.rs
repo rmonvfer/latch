@@ -15,6 +15,7 @@ use latch_core::{
     git::{self, DiffStats},
     paths::shorten_home,
 };
+use latch_runtime::protocol::SessionInfo;
 
 use crate::{
     agent_profiles::AgentProfile,
@@ -26,8 +27,6 @@ use crate::{
     notifications,
     pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
     pane_tree::PaneNode,
-    runtime,
-    runtime_protocol::SessionInfo,
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
     settings::SettingsStore,
     settings_page::SettingsPage,
@@ -299,7 +298,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { runtime::replace_outdated() })
+                .spawn(async move { latch_runtime::replace_outdated() })
                 .await;
             let _ = this.update_in(cx, |workspace, window, cx| {
                 workspace.restarting_runtime = false;
@@ -360,7 +359,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let sessions = cx
                 .background_executor()
-                .spawn(async move { runtime::list_sessions() })
+                .spawn(async move { latch_runtime::list_sessions() })
                 .await;
             let _ =
                 this.update_in(cx, |workspace, window, cx| {
@@ -418,7 +417,7 @@ impl Workspace {
                             }
                         }
                         Err(error) => {
-                            if runtime::is_outdated(&error) {
+                            if latch_runtime::is_outdated(&error) {
                                 workspace.outdated_runtime = true;
                             }
                             log::warn!("failed to list sessions: {error:#}");
@@ -956,9 +955,9 @@ impl Workspace {
             let removed = cx
                 .background_executor()
                 .spawn(async move {
-                    let sessions = runtime::list_sessions()?;
+                    let sessions = latch_runtime::list_sessions()?;
                     for session in sessions_using_worktree(&sessions, &owned, &worktree) {
-                        runtime::stop_session(session)?;
+                        latch_runtime::stop_session(session)?;
                     }
                     git::remove_worktree(&worktree)
                 })
@@ -1536,14 +1535,14 @@ impl Workspace {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let available: HashMap<u64, SessionInfo> = runtime::list_sessions()?
+                    let available: HashMap<u64, SessionInfo> = latch_runtime::list_sessions()?
                         .into_iter()
                         .map(|session| (session.id, session))
                         .collect();
                     for session in sessions {
                         if let Some(info) = available.get(&session) {
                             anyhow::ensure!(info.exited, "stop the session before removing it");
-                            runtime::remove_session(session)?;
+                            latch_runtime::remove_session(session)?;
                         }
                     }
                     anyhow::Ok(())

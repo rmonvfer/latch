@@ -10,6 +10,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 latch-core = { path = "crates/latch-core" }
 latch-platform = { path = "crates/latch-platform" }
+latch-runtime = { path = "crates/latch-runtime" }
 
 anyhow = "1.0.86"
 clap = { version = "4.6.7", features = ["derive"] }

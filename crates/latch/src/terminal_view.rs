@@ -33,6 +33,14 @@ use latch_core::{
         integration,
     },
 };
+use latch_runtime::{
+    ClientEvent, SessionClient,
+    display::DisplayState,
+    protocol::{
+        BlockContext, Blocks, Colors, Dimensions, Launch, Operation, SessionInfo, Snapshot,
+    },
+    search::SearchMatch,
+};
 
 use crate::{
     block_filter::{self, FilterOptions},
@@ -46,17 +54,11 @@ use crate::{
     components::{self, elevated_shadow, icon, icon_button, keybinding},
     control, editor_buffer,
     editor_menus::{self, HistoryMenu, HistorySearch},
-    grid::{CellMetrics, Frame, GridRenderer},
+    grid::{CellMetrics, Frame, FrameRow, GridRenderer},
     highlight::{self, CommandIndex, TokenKind},
     history::{self, History},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
-    runtime::{self, ClientEvent, SessionClient},
-    runtime_display::DisplayState,
-    runtime_protocol::{
-        BlockContext, Blocks, Colors, Dimensions, Launch, Operation, SessionInfo, Snapshot,
-    },
-    search::SearchMatch,
     selected_blocks::SelectedBlocks,
     settings::SettingsStore,
     shell_integration::ShellIntegration,
@@ -427,7 +429,7 @@ impl Focusable for TerminalView {
 impl TerminalView {
     /// Start a persistent shell in `cwd`. `startup` is typed once its prompt is ready.
     pub fn build(cwd: Option<&Path>, startup: Option<&str>, cx: &mut App) -> Result<Entity<Self>> {
-        let launch = launch(runtime::new_session_id()?, cwd, startup, cx)?;
+        let launch = launch(latch_runtime::new_session_id()?, cwd, startup, cx)?;
         let view = Self::from_session(
             SessionInfo {
                 id: launch.id,
@@ -486,7 +488,7 @@ impl TerminalView {
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { runtime::create_session(launch) })
+                .spawn(async move { latch_runtime::create_session(launch) })
                 .await;
             let _ = view.update(cx, |view, cx| match result {
                 Ok(_) => {
@@ -549,13 +551,14 @@ impl TerminalView {
         })?;
         configure_colors(&mut terminal, &cx.theme().terminal)?;
         let renderer = GridRenderer::new()?;
-        let (client, events, connection_error) = match SessionClient::attach(info.id) {
-            Ok((client, events)) => (Some(client), events, None),
-            Err(error) => {
-                let (_, events) = async_channel::bounded(1);
-                (None, events, Some(error.to_string()))
-            }
-        };
+        let (client, events, connection_error) =
+            match SessionClient::attach(info.id, blocks::decode) {
+                Ok((client, events)) => (Some(client), events, None),
+                Err(error) => {
+                    let (_, events) = async_channel::bounded(1);
+                    (None, events, Some(error.to_string()))
+                }
+            };
         Ok(cx.new(|cx| {
             let editor = cx.new(|cx| CommandEditor::new("", cx));
             let output_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -727,7 +730,7 @@ impl TerminalView {
     }
 
     #[tracing::instrument(skip_all)]
-    fn receive(&mut self, event: ClientEvent, cx: &mut Context<Self>) {
+    fn receive(&mut self, event: ClientEvent<FrameRow>, cx: &mut Context<Self>) {
         match event {
             ClientEvent::Frame(frame) => self.apply_frame(*frame, cx),
             ClientEvent::BlockRows {
@@ -814,21 +817,21 @@ impl TerminalView {
         self.refresh_metadata(cx);
         if attention_changed && let Some(event) = &self.info.attention {
             let attention = match event {
-                crate::runtime_protocol::Attention::Bell => Some(Attention::Bell),
-                crate::runtime_protocol::Attention::Notification { title, body } => {
+                latch_runtime::protocol::Attention::Bell => Some(Attention::Bell),
+                latch_runtime::protocol::Attention::Notification { title, body } => {
                     Some(Attention::Notification {
                         title: title.clone(),
                         body: body.clone(),
                     })
                 }
-                crate::runtime_protocol::Attention::CommandFinished {
+                latch_runtime::protocol::Attention::CommandFinished {
                     exit_code,
                     duration_ms,
                 } => Some(Attention::CommandFinished(CommandOutcome {
                     exit_code: *exit_code,
                     duration: Duration::from_millis(*duration_ms),
                 })),
-                crate::runtime_protocol::Attention::AgentTurn {
+                latch_runtime::protocol::Attention::AgentTurn {
                     agent,
                     turn,
                     prompt,
@@ -840,12 +843,12 @@ impl TerminalView {
                     message: message.clone(),
                 }),
                 // An agent with hooks reports its own turns.
-                crate::runtime_protocol::Attention::AgentWaiting { .. }
+                latch_runtime::protocol::Attention::AgentWaiting { .. }
                     if self.info.agent_turn.is_some() =>
                 {
                     None
                 }
-                crate::runtime_protocol::Attention::AgentWaiting { needs_input, .. } => self
+                latch_runtime::protocol::Attention::AgentWaiting { needs_input, .. } => self
                     .metadata
                     .agent
                     .as_ref()
@@ -1975,7 +1978,7 @@ impl TerminalView {
         };
         self.send(
             Operation::SelectMatch {
-                found: crate::runtime_protocol::Match {
+                found: latch_runtime::protocol::Match {
                     row: found.row,
                     start_col: found.start_col,
                     end_col: found.end_col,

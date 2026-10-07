@@ -2986,6 +2986,7 @@ dependencies = [
  "gpui_platform",
  "latch-core",
  "latch-platform",
+ "latch-runtime",
  "libc",
  "libghostty-vt",
  "log",
@@ -3025,6 +3026,24 @@ dependencies = [
  "libc",
  "log",
  "portable-pty",
+]
+
+[[package]]
+name = "latch-runtime"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "latch-core",
+ "latch-platform",
+ "libc",
+ "libghostty-vt",
+ "log",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "tracing",
+ "unicode-width",
 ]
 
 [[package]]

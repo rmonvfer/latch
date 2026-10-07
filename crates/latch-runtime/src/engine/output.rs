@@ -43,11 +43,12 @@ mod tests {
     use super::*;
     use std::thread;
 
-    use latch_platform::pty::{OUTPUT_CHUNK_BYTES, OUTPUT_QUEUE_CAPACITY};
     use libghostty_vt::{Terminal, terminal::Options};
 
+    use latch_platform::pty::{OUTPUT_CHUNK_BYTES, OUTPUT_QUEUE_CAPACITY};
+
     use crate::{
-        osc::{OscScanner, Piece},
+        engine::osc::{OscScanner, Piece},
         search,
     };
 

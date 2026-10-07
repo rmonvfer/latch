@@ -673,8 +673,16 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
-    use std::{hint::black_box, time::Instant};
+    use std::{
+        hint::black_box,
+        time::{Duration, Instant},
+    };
 
+    use latch_runtime::{
+        display::DisplayState,
+        protocol::{Dimensions, Operation},
+        test_support::{TestSession, wait_until},
+    };
     use libghostty_vt::{
         selection::Selection,
         terminal::{Options, Point as TerminalPoint, PointCoordinate, ScrollViewport},
@@ -895,5 +903,67 @@ mod tests {
         }
         let partial = started.elapsed() / iterations;
         eprintln!("160x48 frame extraction: full={full:?}, clean={clean:?}, one_row={partial:?}");
+    }
+
+    #[test]
+    #[ignore = "prints the cost of each step of a window resize; run with --release"]
+    fn resize_benchmark() {
+        // A dense, colored screen with scrollback, as after a build log.
+        let session = TestSession::new(
+            "awk 'BEGIN { for (i = 0; i < 3000; i++) { printf \"\\033[3%dm\", i % 7 + 1; \
+             for (j = 0; j < 190; j++) printf \"%c\", 65 + (i + j) % 26; printf \"\\033[0m\\n\" } }'; \
+             sleep 30",
+        );
+        let dimensions = |cols| Dimensions {
+            cols,
+            rows: 60,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        session.operate(Operation::Resize {
+            dimensions: dimensions(200),
+        });
+        wait_until(|| session.snapshot().rows.iter().any(|row| row.contains("Z")));
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut display = Terminal::new(Options {
+            cols: 200,
+            rows: 60,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let mut mirror = DisplayState::default();
+        let mut renderer = GridRenderer::new().unwrap();
+        let (mut resize, mut snapshot, mut apply, mut frame) = (
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let steps = 40;
+        for step in 0..steps {
+            let started = Instant::now();
+            session.operate(Operation::Resize {
+                dimensions: dimensions(160 + (step % 40) as u16),
+            });
+            resize += started.elapsed();
+            let started = Instant::now();
+            let captured = session.snapshot();
+            snapshot += started.elapsed();
+            let started = Instant::now();
+            mirror.apply(&mut display, &captured).unwrap();
+            apply += started.elapsed();
+            let started = Instant::now();
+            renderer.build_frame(&display, true).unwrap();
+            frame += started.elapsed();
+        }
+        let per = |total: Duration| total / steps;
+        eprintln!(
+            "per resize step: resize {:?}, snapshot {:?}, mirror {:?}, grid {:?}",
+            per(resize),
+            per(snapshot),
+            per(apply),
+            per(frame)
+        );
     }
 }

@@ -11,10 +11,9 @@ use libghostty_vt::{Terminal, style::RgbColor, terminal::Options};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{
-    grid::{FrameRow, GridRenderer},
-    runtime_protocol::{BlockContext, BlockSummary},
-};
+use latch_runtime::protocol::{BlockContext, BlockSummary};
+
+use crate::grid::{FrameRow, GridRenderer};
 
 pub type Rows = Rc<Vec<Rc<FrameRow>>>;
 
@@ -440,6 +439,22 @@ mod tests {
         assert_eq!(
             list.apply_rows(99, 1, 0, decode(&rows, 20, [0, 0, 0]).unwrap()),
             None
+        );
+    }
+
+    #[test]
+    #[ignore = "prints the cost of decoding a long block's rows; run with --release"]
+    fn decode_benchmark() {
+        let bytes: String = (0..10_000)
+            .map(|line| format!("\x1b[3{}m{}\x1b[0m\r\n", line % 7 + 1, "x".repeat(150)))
+            .collect();
+        let rows = latch_runtime::test_support::block_rows(bytes.as_bytes(), 180);
+        let started = std::time::Instant::now();
+        decode(&rows, 180, [0, 0, 0]).unwrap();
+        eprintln!(
+            "10k-row block: decode {:?} ({} rows sent)",
+            started.elapsed(),
+            rows.len()
         );
     }
 }

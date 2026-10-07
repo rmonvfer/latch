@@ -17,8 +17,8 @@ use libghostty_vt::{
 use latch_core::{git, shell::hooks::Precmd};
 
 use crate::{
-    runtime_engine::encode_row,
-    runtime_protocol::{BlockContext, BlockSummary},
+    engine::encode_row,
+    protocol::{BlockContext, BlockSummary},
 };
 
 /// Most raw output kept across all blocks for rebuilding their rows. Past
@@ -668,12 +668,8 @@ mod tests {
         let rebuild = started.elapsed();
         let id = blocks.summaries()[0].id;
         let rows = blocks.rows(id, 0).unwrap().1;
-        let started = std::time::Instant::now();
-        crate::blocks::decode(&rows, 180, [0, 0, 0]).unwrap();
-        let decode = started.elapsed();
         eprintln!(
-            "10k-row block: capture {finish:?}, rebuild {rebuild:?}, decode {:?} ({} rows sent)",
-            decode,
+            "10k-row block: capture {finish:?}, rebuild {rebuild:?} ({} rows sent)",
             rows.len()
         );
     }

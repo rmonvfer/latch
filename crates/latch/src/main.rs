@@ -21,17 +21,9 @@ mod input;
 mod links;
 mod mcp;
 mod notifications;
-mod osc;
-mod output;
 mod pane_group;
 mod pane_tree;
 mod profiling;
-mod runtime;
-mod runtime_blocks;
-mod runtime_display;
-mod runtime_engine;
-mod runtime_protocol;
-mod search;
 mod selected_blocks;
 mod session;
 mod settings;
@@ -74,7 +66,7 @@ fn main() {
     {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
         profiling::init("runtime");
-        if let Err(error) = runtime::serve() {
+        if let Err(error) = latch_runtime::serve() {
             log::error!("session runtime: {error:#}");
             std::process::exit(1);
         }

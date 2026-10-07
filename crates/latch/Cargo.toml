@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 latch-core.workspace = true
 latch-platform.workspace = true
+latch-runtime.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 async-channel.workspace = true
@@ -37,3 +38,4 @@ regex.workspace = true
 
 [dev-dependencies]
 latch-core = { workspace = true, features = ["test-support"] }
+latch-runtime = { workspace = true, features = ["test-support"] }

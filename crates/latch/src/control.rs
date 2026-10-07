@@ -52,7 +52,6 @@ use latch_platform::{
 use crate::{
     agent_badge, notifications,
     pane_tree::Axis,
-    runtime,
     settings::SettingsStore,
     tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
@@ -304,7 +303,7 @@ pub fn start(window: WindowHandle<Workspace>, cx: &mut App) {
             match result {
                 Ok(ControlResponse::Read { session, lines }) => {
                     cx.background_executor().spawn(async move {
-                        let result = runtime::read_session(session, lines)
+                        let result = latch_runtime::read_session(session, lines)
                             .map(|text| json!({ "text": text }))
                             .map_err(|error| error.to_string());
                         let _ = reply.send(result);

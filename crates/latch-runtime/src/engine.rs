@@ -1,5 +1,9 @@
 //! Persistent terminal sessions, each owned by a dedicated runtime thread.
 
+pub(crate) mod blocks;
+mod osc;
+mod output;
+
 use std::{
     cell::Cell,
     fmt::Write as _,
@@ -51,9 +55,11 @@ use latch_platform::{
 };
 
 use crate::{
-    osc::{OscEvent, OscScanner, Piece},
-    runtime_blocks::{self, Blocks as BlockLog},
-    runtime_protocol::{
+    engine::{
+        blocks::Blocks as BlockLog,
+        osc::{OscEvent, OscScanner, Piece},
+    },
+    protocol::{
         AgentReport, Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions,
         Launch, Match, Operation, Request, Response, SessionInfo, Snapshot,
     },
@@ -69,7 +75,7 @@ static XTVERSION: LazyLock<String> =
 /// Pages are allocated as output arrives, so it is a ceiling, not a cost.
 const SCROLLBACK_BYTES: usize = 32 * 1024 * 1024;
 /// Most lines `read_output` returns.
-const MAX_READ_LINES: usize = 10_000;
+pub(crate) const MAX_READ_LINES: usize = 10_000;
 const COMMAND_CAPACITY: usize = 32;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_INTERVAL: Duration = Duration::from_millis(2);
@@ -88,12 +94,12 @@ const REBUILD_SLICE: Duration = Duration::from_millis(8);
 /// Most command blocks a session keeps; older ones are dropped.
 const MAX_BLOCKS: usize = 1000;
 
-type Command = (Request, mpsc::SyncSender<Result<Response>>);
+pub(crate) type Command = (Request, mpsc::SyncSender<Result<Response>>);
 
 /// A handle to a runtime-owned session; releasing a client does not end it.
 #[derive(Clone)]
 pub struct SessionHandle {
-    id: u64,
+    pub(crate) id: u64,
     commands: mpsc::SyncSender<Command>,
     info: Arc<RwLock<SessionInfo>>,
     worker: thread::Thread,
@@ -113,7 +119,7 @@ impl SessionHandle {
                 Request::Poll { session, .. } | Request::Operate { session, .. } =>
                     *session == self.id,
                 Request::ReportAgent { token, .. } =>
-                    crate::runtime::same_token(&self.info().control_token, token),
+                    crate::token::same_token(&self.info().control_token, token),
                 _ => false,
             },
             "request targets another session"
@@ -436,7 +442,7 @@ impl Engine {
     #[tracing::instrument(skip_all)]
     fn consume_output(&mut self) {
         let output = self.output.clone();
-        for chunk in crate::output::OutputBatch::new(&output) {
+        for chunk in crate::engine::output::OutputBatch::new(&output) {
             for piece in self.osc.scan(&chunk) {
                 let event = match piece {
                     Piece::Output(bytes) => {
@@ -1265,7 +1271,7 @@ impl Engine {
     #[tracing::instrument(skip_all)]
     fn capture(&mut self) -> Result<Snapshot> {
         self.refresh_info();
-        let full_screen = runtime_blocks::is_full_screen(&self.terminal);
+        let full_screen = blocks::is_full_screen(&self.terminal);
         if let Some(blocks) = &mut self.blocks
             && !full_screen
         {
@@ -1623,100 +1629,13 @@ fn register_effects(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::fs;
 
     use super::*;
 
     use latch_core::shell::integration;
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(8);
-
-    fn launch(script: &str) -> Launch {
-        Launch {
-            id: 51,
-            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
-            env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
-            cwd: Some(std::env::temp_dir()),
-            startup: None,
-            agent_session: None,
-            dimensions: Dimensions {
-                cols: 60,
-                rows: 8,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            colors: Colors {
-                foreground: [230, 230, 230],
-                background: [20, 20, 20],
-                cursor: [255, 255, 255],
-                palette: [[100, 100, 100]; 16],
-                dark: true,
-            },
-            control_token: "test-control-capability".into(),
-            command_blocks: false,
-        }
-    }
-
-    struct Session(SessionHandle);
-
-    impl Drop for Session {
-        fn drop(&mut self) {
-            let _ = self.0.request(Request::Operate {
-                session: self.0.id,
-                operation: Operation::Stop,
-            });
-        }
-    }
-
-    impl Session {
-        fn new(script: &str) -> Self {
-            Self(spawn(51, launch(script)).unwrap())
-        }
-
-        fn operate(&self, operation: Operation) -> Response {
-            self.0
-                .request(Request::Operate {
-                    session: self.0.id,
-                    operation,
-                })
-                .unwrap()
-        }
-
-        fn snapshot(&self) -> Snapshot {
-            match self
-                .0
-                .request(Request::Poll {
-                    session: self.0.id,
-                    revision: None,
-                })
-                .unwrap()
-            {
-                Response::Snapshot(snapshot) => snapshot,
-                response => panic!("expected snapshot: {response:?}"),
-            }
-        }
-
-        fn text(&self) -> String {
-            match self.operate(Operation::Read {
-                lines: MAX_READ_LINES,
-            }) {
-                Response::Text(text) => text,
-                response => panic!("expected text: {response:?}"),
-            }
-        }
-
-        fn wait_text(&self, expected: &str) {
-            wait_until(|| self.text().contains(expected));
-        }
-    }
-
-    fn wait_until(mut predicate: impl FnMut() -> bool) {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-        while !predicate() {
-            assert!(Instant::now() < deadline, "session condition timed out");
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
+    use crate::test_support::{TestSession, launch, wait_until};
 
     fn display_text(snapshot: &Snapshot) -> String {
         let mut mirror = Terminal::new(Options {
@@ -1725,7 +1644,7 @@ mod tests {
             max_scrollback: 0,
         })
         .unwrap();
-        crate::runtime_display::DisplayState::default()
+        crate::display::DisplayState::default()
             .apply(&mut mirror, snapshot)
             .unwrap();
         search::screen_text(&mirror).unwrap()
@@ -1781,7 +1700,7 @@ mod tests {
     fn assert_default_login_shell(integration: bool) {
         let home = ShellHome(std::env::temp_dir().join(format!(
             "terminal-login-{}",
-            crate::runtime::new_session_id().unwrap()
+            crate::sessions::new_session_id().unwrap()
         )));
         fs::create_dir(&home.0).unwrap();
         fs::write(home.0.join(".zshenv"), "export TERMINAL_USER_ENV=loaded\n").unwrap();
@@ -1803,7 +1722,7 @@ mod tests {
         let mut request = zsh_launch(&home, integration);
         request.startup = Some("printf 'DEFAULT:%s:%s:%s:%s\\n' \"$options[login]\" \"$options[interactive]\" \"$TERMINAL_LOGIN_PROFILE\" \"$TERMINAL_USER_ENV\"; exit 23".into());
         let request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
-        let session = Session(spawn(51, request).unwrap());
+        let session = TestSession::spawn(51, request);
         wait_until(|| session.0.info().exited);
         assert_eq!(session.0.info().exit_code, Some(23));
         assert_eq!(
@@ -1825,78 +1744,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "prints the cost of each step of a window resize; run with --release"]
-    fn resize_benchmark() {
-        // A dense, colored screen with scrollback, as after a build log.
-        let session = Session::new(
-            "awk 'BEGIN { for (i = 0; i < 3000; i++) { printf \"\\033[3%dm\", i % 7 + 1; \
-             for (j = 0; j < 190; j++) printf \"%c\", 65 + (i + j) % 26; printf \"\\033[0m\\n\" } }'; \
-             sleep 30",
-        );
-        let dimensions = |cols| Dimensions {
-            cols,
-            rows: 60,
-            cell_width: 8,
-            cell_height: 16,
-        };
-        session.operate(Operation::Resize {
-            dimensions: dimensions(200),
-        });
-        wait_until(|| session.snapshot().rows.iter().any(|row| row.contains("Z")));
-        thread::sleep(Duration::from_millis(500));
-
-        let mut display = Terminal::new(Options {
-            cols: 200,
-            rows: 60,
-            max_scrollback: 0,
-        })
-        .unwrap();
-        let mut mirror = crate::runtime_display::DisplayState::default();
-        let mut renderer = crate::grid::GridRenderer::new().unwrap();
-        let (mut resize, mut snapshot, mut apply, mut frame) = (
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-        );
-        let steps = 40;
-        for step in 0..steps {
-            let started = Instant::now();
-            session.operate(Operation::Resize {
-                dimensions: dimensions(160 + (step % 40) as u16),
-            });
-            resize += started.elapsed();
-            let started = Instant::now();
-            let captured = session.snapshot();
-            snapshot += started.elapsed();
-            let started = Instant::now();
-            mirror.apply(&mut display, &captured).unwrap();
-            apply += started.elapsed();
-            let started = Instant::now();
-            renderer.build_frame(&display, true).unwrap();
-            frame += started.elapsed();
-        }
-        let per = |total: Duration| total / steps;
-        eprintln!(
-            "per resize step: resize {:?}, snapshot {:?}, mirror {:?}, grid {:?}",
-            per(resize),
-            per(snapshot),
-            per(apply),
-            per(frame)
-        );
-    }
-
-    #[test]
     fn command_blocks_hold_each_command_and_its_output() {
         let home = ShellHome(std::env::temp_dir().join(format!(
             "terminal-blocks-{}",
-            crate::runtime::new_session_id().unwrap()
+            crate::sessions::new_session_id().unwrap()
         )));
         fs::create_dir(&home.0).unwrap();
         fs::write(home.0.join(".zshrc"), "echo welcome\n").unwrap();
         let mut request = zsh_launch(&home, true);
         request.command_blocks = true;
-        let session = Session(spawn(52, request).unwrap());
+        let session = TestSession::spawn(52, request);
         let blocks = || session.snapshot().blocks;
         wait_until(|| blocks().is_some_and(|blocks| blocks.prompt.is_some()));
         session.operate(Operation::RunCommand {
@@ -1924,7 +1781,7 @@ mod tests {
         let text: Vec<String> = rows
             .iter()
             .map(|row| {
-                crate::runtime_blocks::plain_text(row)
+                crate::engine::blocks::plain_text(row)
                     .trim_end()
                     .to_string()
             })
@@ -1935,7 +1792,7 @@ mod tests {
 
     #[test]
     fn detached_clients_keep_the_same_process_and_receive_output() {
-        let session = Session::new(
+        let session = TestSession::new(
             "stty -echo; printf 'ready\\n'; read first; sleep 0.05; printf 'output while detached\\n'; read last",
         );
         session.wait_text("ready");
@@ -1960,7 +1817,7 @@ mod tests {
 
     #[test]
     fn reconnect_preserves_both_screens_and_incomplete_escape_sequences() {
-        let session = Session::new(
+        let session = TestSession::new(
             "stty -echo; printf 'primary history\\r\\n'; read first; printf '\x1b[?1049h\x1b[2J\x1b[HALTERNATE'; read second; printf '\x1b[?1049l\x1b['; sleep 0.05; printf '32mAFTER\x1b[0m\\r\\n'; read last",
         );
         session.wait_text("primary history");
@@ -1982,7 +1839,7 @@ mod tests {
 
     #[test]
     fn device_queries_are_answered_without_polling_or_a_gui() {
-        let session = Session::new(
+        let session = TestSession::new(
             "stty -echo -icanon min 1 time 0; printf '\x1b[6n'; reply=$(dd bs=1 count=6 2>/dev/null | od -An -tx1); printf 'REPLY:%s\\n' \"$reply\"; exit 9",
         );
         wait_until(|| session.0.info().exited);
@@ -2003,7 +1860,7 @@ mod tests {
             "stty -echo; printf '\x1b]133;A\x07'; read command; printf 'START:%s\\n' \"$command\"",
         );
         launch.startup = Some("agent task".into());
-        let session = Session(spawn(52, launch).unwrap());
+        let session = TestSession::spawn(52, launch);
         wait_until(|| session.0.info().exited);
         assert!(session.text().contains("START:agent task"));
     }
@@ -2011,7 +1868,7 @@ mod tests {
     #[test]
     fn stop_escalates_and_retains_output() {
         let session =
-            Session::new("trap '' TERM HUP; printf 'ready\\n'; while :; do read value; done");
+            TestSession::new("trap '' TERM HUP; printf 'ready\\n'; while :; do read value; done");
         session.wait_text("ready");
         let pid = session.0.info().shell_pid.unwrap();
         session.operate(Operation::Stop);
@@ -2023,7 +1880,7 @@ mod tests {
 
     #[test]
     fn stop_includes_background_jobs_in_other_process_groups() {
-        let session = Session::new(
+        let session = TestSession::new(
             "set -m; (trap '' TERM HUP; while :; do sleep 1; done) >/dev/null 2>&1 & printf 'CHILD:%s\\n' \"$!\"; read value",
         );
         session.wait_text("CHILD:");
@@ -2046,8 +1903,8 @@ mod tests {
 
     #[test]
     fn continuously_printing_session_does_not_starve_other_sessions() {
-        let flood = Session::new("exec yes flood");
-        let other = Session::new(
+        let flood = TestSession::new("exec yes flood");
+        let other = TestSession::new(
             "stty -echo; printf 'ready\\n'; read value; printf 'REPLY:%s\\n' \"$value\"; read last",
         );
         other.wait_text("ready");
@@ -2063,7 +1920,7 @@ mod tests {
 
     #[test]
     fn selection_search_and_scrolling_use_authoritative_scrollback() {
-        let session = Session::new(
+        let session = TestSession::new(
             "stty -echo; i=0; while [ \"$i\" -lt 30 ]; do printf 'history-%s\\r\\n' \"$i\"; i=$((i+1)); done; read value",
         );
         session.wait_text("history-29");
@@ -2088,7 +1945,7 @@ mod tests {
 
     #[test]
     fn snapshots_have_stable_revisions_and_no_replayed_terminal_effects() {
-        let session = Session::new(
+        let session = TestSession::new(
             "stty -echo; printf '\x1b]777;notify;Notice;needs input\x07\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\'; read value",
         );
         session.wait_text("click");
@@ -2114,7 +1971,7 @@ mod tests {
 
     #[test]
     fn natural_shell_exit_keeps_redirected_background_jobs_active() {
-        let session = Session::new(
+        let session = TestSession::new(
             "trap '' TERM HUP; set -m; (exec sleep 60) >/dev/null 2>&1 & printf 'CHILD:%s\\n' \"$!\"; exit 0",
         );
         session.wait_text("CHILD:");
@@ -2141,7 +1998,7 @@ mod tests {
 
     #[test]
     fn stale_attention_acknowledgement_preserves_a_later_event() {
-        let session = Session::new(
+        let session = TestSession::new(
             "stty -echo; printf '\x1b]777;notify;First;one\x07ready\\n'; read next; printf '\x1b]777;notify;Second;two\x07second\\n'; read last",
         );
         session.wait_text("ready");
@@ -2161,14 +2018,14 @@ mod tests {
     #[test]
     fn environment_is_explicit_and_pane_identity_is_authoritative() {
         let session =
-            Session::new("printf '%s|%s' \"$TERMINAL_PANE_ID\" \"$TERMINAL_CONTROL_TOKEN\"");
+            TestSession::new("printf '%s|%s' \"$TERMINAL_PANE_ID\" \"$TERMINAL_CONTROL_TOKEN\"");
         wait_until(|| session.0.info().exited);
         assert!(session.text().starts_with("51|"));
     }
 
     #[test]
     fn oversized_input_and_dimensions_are_rejected() {
-        let session = Session::new("read value");
+        let session = TestSession::new("read value");
         assert!(
             session
                 .0
