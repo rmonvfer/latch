@@ -4,9 +4,13 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hooks::{Bootstrapped, Completion};
+use crate::{
+    agent_events::{AgentEvent, AgentTurn, TurnState},
+    agent_resume::{AgentSession, ResumableAgent},
+    hooks::{Bootstrapped, Completion},
+};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,9 +38,11 @@ pub struct Launch {
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
     pub startup: Option<String>,
+    /// The agent session the startup command resumes.
+    pub agent_session: Option<AgentSession>,
     pub dimensions: Dimensions,
     pub colors: Colors,
-    /// Capability used by the existing GUI control API, never the runtime socket.
+    /// Capability identifying the pane to control clients and agent hooks.
     pub control_token: String,
     /// Show each command as a block once the shell's integration reports in.
     #[serde(default)]
@@ -52,6 +58,11 @@ pub struct SessionInfo {
     pub title: String,
     pub process: Option<String>,
     pub agent: Option<String>,
+    /// The coding agent session running here, as its hook reported it,
+    /// which a restored pane resumes.
+    pub agent_session: Option<AgentSession>,
+    /// How the agent's current turn goes, as its hooks report it.
+    pub agent_turn: Option<(ResumableAgent, TurnState)>,
     pub status: String,
     pub exited: bool,
     pub exit_code: Option<u32>,
@@ -75,6 +86,12 @@ pub enum Attention {
     CommandFinished {
         exit_code: Option<i32>,
         duration_ms: u64,
+    },
+    AgentTurn {
+        agent: ResumableAgent,
+        turn: AgentTurn,
+        prompt: Option<String>,
+        message: Option<String>,
     },
     AgentWaiting {
         agent: String,
@@ -164,6 +181,28 @@ pub struct Match {
     pub row: u32,
     pub start_col: u16,
     pub end_col: u16,
+}
+
+/// An agent hook's report, owned by the session runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentReport {
+    Session {
+        session: AgentSession,
+    },
+    Event {
+        agent: ResumableAgent,
+        event: AgentEvent,
+    },
+}
+
+impl AgentReport {
+    pub fn agent(&self) -> ResumableAgent {
+        match self {
+            Self::Session { session } => session.agent,
+            Self::Event { agent, .. } => *agent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +303,7 @@ pub enum Operation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
+    ReportAgent { token: String, report: AgentReport },
     Ping,
     Create(Launch),
     List,

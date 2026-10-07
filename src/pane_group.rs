@@ -42,6 +42,8 @@ pub const KEY_CONTEXT: &str = "Panes";
 const DIVIDER_HIT_SIZE: f32 = 5.;
 
 pub enum PaneGroupEvent {
+    /// A pane changed state saved with its session, regardless of focus.
+    SessionChanged,
     /// The focused pane changed, or its title, directory, or branch did.
     MetadataChanged,
     /// A pane was hidden and needs a session entry outside this arrangement.
@@ -358,6 +360,7 @@ impl PaneGroup {
         let focus = view.focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe_in(view, window, |group, view, event, _, cx| match event {
+                TerminalEvent::SessionChanged => cx.emit(PaneGroupEvent::SessionChanged),
                 TerminalEvent::MetadataChanged => {
                     if *view == group.active {
                         cx.emit(PaneGroupEvent::MetadataChanged);

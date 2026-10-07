@@ -46,6 +46,8 @@ terminal integrate claude
 terminal integrate codex
 ```
 
+Agent hooks report session identities and turn status directly to the runtime, including while the app is closed. Reopening the app restores that state and saves resume identities from every pane.
+
 Layout and session state are written to `~/.config/terminal/session.json`, with backups and rolling snapshots next to it. The safeguards and the agent resume approach follow [herdr](https://github.com/herdrdev/herdr) (Apache-2.0).
 
 ## Command blocks

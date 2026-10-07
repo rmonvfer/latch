@@ -27,14 +27,15 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
+    agent_resume,
     blocks::decode,
     grid::FrameRow,
     hooks::Bootstrapped,
     process_info,
     runtime_engine::{self, SessionHandle},
     runtime_protocol::{
-        Blocks, Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request, Response,
-        SessionInfo, Snapshot, VERSION,
+        AgentReport, Blocks, Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request,
+        Response, SessionInfo, Snapshot, VERSION,
     },
     settings::SettingsStore,
 };
@@ -259,7 +260,7 @@ mod secret_store {
     }
 }
 
-fn same_token(expected: &str, candidate: &str) -> bool {
+pub(crate) fn same_token(expected: &str, candidate: &str) -> bool {
     if expected.len() != candidate.len() {
         return false;
     }
@@ -419,6 +420,15 @@ impl Rpc {
             Response::Error(message) => Err(RemoteError(message).into()),
             response => Ok(response),
         }
+    }
+}
+
+/// Deliver a hook report without starting or replacing a runtime.
+pub fn report_agent(token: String, report: AgentReport) -> Result<()> {
+    let mut client = Rpc::connect(&Paths::configured())?;
+    match client.request(Request::ReportAgent { token, report })? {
+        Response::Done => Ok(()),
+        _ => bail!("session runtime returned an invalid hook response"),
     }
 }
 
@@ -668,6 +678,19 @@ struct Registry {
 impl State {
     fn handle(&self, request: Request) -> Result<Response> {
         match request {
+            Request::ReportAgent { token, report } => {
+                ensure!(!token.is_empty(), "agent report has no pane token");
+                let handle = self
+                    .registry
+                    .lock()
+                    .map_err(|_| anyhow!("session registry unavailable"))?
+                    .sessions
+                    .values()
+                    .find(|handle| same_token(&handle.info().control_token, &token))
+                    .cloned()
+                    .context("no session has that token")?;
+                handle.request(Request::ReportAgent { token, report })
+            }
             Request::Ping => Ok(Response::Ready { version: VERSION }),
             Request::Create(launch) => self.create(launch),
             Request::List => {
@@ -914,6 +937,18 @@ fn serve_connection(mut stream: UnixStream, state: &State) -> Result<()> {
                 )),
             )?;
             return Ok(());
+        }
+        if let Request::ReportAgent { report, .. } = &envelope.request {
+            let valid = peer_audit(&stream).is_some_and(|(pid, version)| {
+                agent_resume::reported_by(report.agent(), pid) && pid_version(pid) == Some(version)
+            });
+            if !valid {
+                write_frame(
+                    &mut stream,
+                    &Response::Error("not a report from the agent's own hook".into()),
+                )?;
+                continue;
+            }
         }
         drop(bytes);
         let response = state
@@ -1513,6 +1548,7 @@ mod tests {
             env: BTreeMap::new(),
             cwd: Some(PathBuf::from("/tmp")),
             startup: None,
+            agent_session: None,
             dimensions: Dimensions {
                 cols: 80,
                 rows: 24,
@@ -1611,6 +1647,170 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         assert!(peer_is_this_program(&ours));
         assert!(peer_is_this_program(&theirs));
+    }
+
+    #[test]
+    #[ignore = "agent hook subprocess entry point"]
+    fn agent_hook_process() {
+        let Some(directory) = std::env::var_os(TEST_DIRECTORY) else {
+            return;
+        };
+        let paths = Paths {
+            directory: PathBuf::from(directory),
+        };
+        let token = std::env::var(crate::control::TOKEN_VARIABLE).unwrap();
+        let agent = crate::agent_resume::ResumableAgent::Codex;
+        let mut client = Rpc::connect(&paths).unwrap();
+        let report = AgentReport::Session {
+            session: crate::agent_resume::AgentSession::new(agent, "detached-agent-session")
+                .unwrap(),
+        };
+        assert!(
+            client
+                .request(Request::ReportAgent {
+                    token: "incorrect-pane-token".into(),
+                    report: report.clone(),
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("no session has that token")
+        );
+        for report in [
+            report,
+            AgentReport::Event {
+                agent,
+                event: crate::agent_events::AgentEvent::PromptSubmitted {
+                    prompt: "fix the build".into(),
+                },
+            },
+            AgentReport::Event {
+                agent,
+                event: crate::agent_events::AgentEvent::Blocked {
+                    message: Some("Wants to use Bash".into()),
+                },
+            },
+        ] {
+            assert!(matches!(
+                client
+                    .request(Request::ReportAgent {
+                        token: token.clone(),
+                        report
+                    })
+                    .unwrap(),
+                Response::Done
+            ));
+        }
+    }
+
+    #[test]
+    fn agent_hooks_update_detached_sessions_and_restore_on_reattach() {
+        let runtime = TestRuntime::start();
+        // A named shell supplies an agent ancestor for the hook subprocess.
+        let agent = runtime.paths.directory.join("codex");
+        fs::copy("/bin/zsh", &agent).unwrap();
+        let mut command = launch("");
+        command.argv = vec!["/bin/zsh".into(), "-f".into(), "-i".into()];
+        command.env.insert(
+            "HOOK_PROGRAM".into(),
+            std::env::current_exe().unwrap().to_str().unwrap().into(),
+        );
+        command
+            .env
+            .insert("TEST_AGENT".into(), agent.to_str().unwrap().into());
+        command.env.insert(
+            TEST_DIRECTORY.into(),
+            runtime.paths.directory.to_str().unwrap().into(),
+        );
+        let id = command.id;
+        runtime.rpc().request(Request::Create(command)).unwrap();
+        let (view, frames) = SessionClient::attach_at(id, runtime.paths.clone()).unwrap();
+        wait_until(|| matches!(frames.try_recv(), Ok(ClientEvent::Frame(_))));
+        drop(view);
+        drop(frames);
+        runtime.rpc().request(Request::Operate {
+            session: id,
+            operation: Operation::Input {
+                bytes: concat!(r#""$TEST_AGENT" -c '"$HOOK_PROGRAM" --exact runtime::tests::agent_hook_process --ignored --nocapture; IFS= read -r line'"#, "\n").as_bytes().to_vec(),
+            },
+        }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sessions = runtime.list();
+            if sessions.iter().any(|info| {
+                info.id == id && info.agent_session.is_some() && info.status == "needs_input"
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hook timed out: {sessions:?}; output: {}",
+                read_session_at(&runtime.paths, id, 100).unwrap()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Keep the agent alive across metadata polls with no attached view.
+        thread::sleep(METADATA_TEST_INTERVAL);
+        let (view, frames) = SessionClient::attach_at(id, runtime.paths.clone()).unwrap();
+        let mut restored = None;
+        wait_until(|| {
+            if let Ok(ClientEvent::Frame(frame)) = frames.try_recv() {
+                restored = Some(frame.info);
+                true
+            } else {
+                false
+            }
+        });
+        let restored = restored.unwrap();
+        assert_eq!(
+            restored
+                .agent_session
+                .as_ref()
+                .map(|session| session.session_id.as_str()),
+            Some("detached-agent-session"),
+            "{restored:?}"
+        );
+        assert_eq!(restored.agent.as_deref(), Some("Codex"));
+        assert_eq!(restored.status, "needs_input");
+        assert_eq!(
+            restored.agent_turn.unwrap().1.turn,
+            Some(crate::agent_events::AgentTurn::Blocked)
+        );
+        assert!(matches!(
+            restored.attention,
+            Some(crate::runtime_protocol::Attention::AgentTurn { .. })
+        ));
+        drop(view);
+        drop(frames);
+    }
+
+    const METADATA_TEST_INTERVAL: Duration = Duration::from_millis(600);
+
+    #[test]
+    fn reports_from_unrelated_processes_do_not_change_the_session() {
+        let runtime = TestRuntime::start();
+        let session = runtime.create("IFS= read -r line");
+        let mut client = runtime.rpc();
+        let error = client
+            .request(Request::ReportAgent {
+                token: session.control_token,
+                report: AgentReport::Event {
+                    agent: crate::agent_resume::ResumableAgent::Claude,
+                    event: crate::agent_events::AgentEvent::Blocked { message: None },
+                },
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not a report from the agent's own hook")
+        );
+        let Response::Sessions(sessions) = client.request(Request::List).unwrap() else {
+            panic!("expected session list");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent_session, None);
+        assert_eq!(sessions[0].agent_turn, None);
+        assert_eq!(sessions[0].attention_serial, 0);
     }
 
     #[test]

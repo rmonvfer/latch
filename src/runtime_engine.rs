@@ -33,6 +33,8 @@ use libghostty_vt::{
 use portable_pty::CommandBuilder;
 
 use crate::{
+    agent_events::{self, AgentEvent, AgentTurn, TurnState},
+    agent_resume::AgentSession,
     agents::{self, Activity, Agent, AgentStatus},
     hooks::{Bootstrapped, Hook},
     osc::{OscEvent, OscScanner, Piece},
@@ -40,8 +42,8 @@ use crate::{
     pty::{MAX_INPUT_BYTES, Pty, PtyDimensions},
     runtime_blocks::{self, Blocks as BlockLog},
     runtime_protocol::{
-        Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions, Launch, Match,
-        Operation, Request, Response, SessionInfo, Snapshot,
+        AgentReport, Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions,
+        Launch, Match, Operation, Request, Response, SessionInfo, Snapshot,
     },
     search, shell_integration,
 };
@@ -91,7 +93,13 @@ impl SessionHandle {
 
     pub fn request(&self, request: Request) -> Result<Response> {
         ensure!(
-            matches!(&request, Request::Poll { session, .. } | Request::Operate { session, .. } if *session == self.id),
+            match &request {
+                Request::Poll { session, .. } | Request::Operate { session, .. } =>
+                    *session == self.id,
+                Request::ReportAgent { token, .. } =>
+                    crate::runtime::same_token(&self.info().control_token, token),
+                _ => false,
+            },
             "request targets another session"
         );
         let (reply, receive) = mpsc::sync_channel(1);
@@ -176,6 +184,7 @@ fn pty_dimensions(value: Dimensions) -> PtyDimensions {
 }
 
 struct Metadata {
+    requested_at: Instant,
     foreground: Option<i32>,
     process: Option<String>,
     cwd: Option<PathBuf>,
@@ -211,11 +220,12 @@ struct Engine {
     osc: OscScanner,
     activity: Activity,
     agent: Option<Agent>,
+    agent_reported_at: Option<Instant>,
     working_since: Option<Instant>,
     command_started: Option<Instant>,
     startup: Option<String>,
     started: Instant,
-    metadata_requests: mpsc::SyncSender<(Option<i32>, Option<i32>)>,
+    metadata_requests: mpsc::SyncSender<(Option<i32>, Option<i32>, Instant)>,
     metadata_results: mpsc::Receiver<Metadata>,
     metadata_at: Instant,
     metadata_pending: bool,
@@ -274,14 +284,16 @@ impl Engine {
             Rc::clone(&bell),
             Rc::clone(&reply_error),
         )?;
-        let (metadata_requests, requested) = mpsc::sync_channel::<(Option<i32>, Option<i32>)>(1);
+        let (metadata_requests, requested) =
+            mpsc::sync_channel::<(Option<i32>, Option<i32>, Instant)>(1);
         let (results, metadata_results) = mpsc::sync_channel(1);
         let worker = thread::current();
         thread::Builder::new()
             .name(format!("session-metadata-{id}"))
             .spawn(move || {
-                while let Ok((foreground, shell)) = requested.recv() {
+                while let Ok((foreground, shell, requested_at)) = requested.recv() {
                     let metadata = Metadata {
+                        requested_at,
                         foreground,
                         process: foreground.and_then(process_info::process_name),
                         cwd: shell.and_then(process_info::working_directory),
@@ -306,6 +318,7 @@ impl Engine {
             title: "shell".into(),
             status: "idle".into(),
             control_token: launch.control_token,
+            agent_session: launch.agent_session,
             ..Default::default()
         };
         Ok(Self {
@@ -330,6 +343,7 @@ impl Engine {
             osc: OscScanner::new(session_id),
             activity: Activity::default(),
             agent: None,
+            agent_reported_at: None,
             working_since: None,
             command_started: None,
             startup: launch.startup,
@@ -618,10 +632,17 @@ impl Engine {
                 if metadata.cwd.is_some() {
                     self.info.cwd = metadata.cwd;
                 }
-                if self.agent != metadata.agent {
-                    self.working_since = None;
+                // A hook is fresher evidence than a metadata request already in flight.
+                if self
+                    .agent_reported_at
+                    .is_none_or(|reported| metadata.requested_at >= reported)
+                {
+                    if self.agent != metadata.agent {
+                        self.working_since = None;
+                        self.clear_agent_reports(metadata.agent);
+                    }
+                    self.agent = metadata.agent;
                 }
-                self.agent = metadata.agent;
             }
         }
         if !self.metadata_pending
@@ -631,7 +652,11 @@ impl Engine {
             self.metadata_at = Instant::now();
             self.metadata_pending = self
                 .metadata_requests
-                .try_send((self.pty.foreground_pid(), self.pty.shell_pid()))
+                .try_send((
+                    self.pty.foreground_pid(),
+                    self.pty.shell_pid(),
+                    self.metadata_at,
+                ))
                 .is_ok();
         }
     }
@@ -662,9 +687,15 @@ impl Engine {
                 .is_ok_and(|processes| processes.is_empty());
         }
         self.info.exited = self.stopped;
+        if self.info.exited {
+            self.clear_agent_reports(None);
+        }
         self.info.agent = self.agent.map(|agent| agent.name().to_string());
         let activity = self.activity.status(Instant::now());
-        if let Some(agent) = self.agent.filter(|_| !self.info.exited) {
+        if let Some(agent) = self
+            .agent
+            .filter(|_| !self.info.exited && self.info.agent_turn.is_none())
+        {
             if activity == AgentStatus::Working {
                 self.working_since.get_or_insert_with(Instant::now);
             } else if let Some(started) = self.working_since.take()
@@ -680,6 +711,17 @@ impl Engine {
         }
         self.info.status = if self.info.exited {
             "exited"
+        } else if let Some(turn) = self
+            .info
+            .agent_turn
+            .as_ref()
+            .and_then(|(_, state)| state.turn)
+        {
+            match turn {
+                AgentTurn::InProgress => "working",
+                AgentTurn::Blocked => "needs_input",
+                AgentTurn::Done | AgentTurn::Failed => "idle",
+            }
         } else {
             match activity {
                 AgentStatus::Working => "working",
@@ -714,9 +756,105 @@ impl Engine {
                     Ok(Response::Snapshot(snapshot))
                 }
             }
+            Request::ReportAgent { report, .. } => {
+                self.report_agent(report)?;
+                Ok(Response::Done)
+            }
             Request::Operate { operation, .. } => self.operate(operation),
             _ => bail!("unsupported session request"),
         }
+    }
+
+    /// Discard reports when their agent is no longer running in the pane.
+    fn clear_agent_reports(&mut self, running: Option<Agent>) {
+        if self
+            .info
+            .agent_session
+            .as_ref()
+            .is_some_and(|session| Some(session.agent.running_as()) != running)
+        {
+            self.info.agent_session = None;
+        }
+        if self
+            .info
+            .agent_turn
+            .as_ref()
+            .is_some_and(|(agent, _)| Some(agent.running_as()) != running)
+        {
+            self.info.agent_turn = None;
+            if matches!(self.info.attention, Some(Attention::AgentTurn { .. })) {
+                self.info.attention = None;
+            }
+        }
+    }
+
+    /// Take in what the agent's hook reported about its turn, and call for
+    /// attention when the turn ends or needs the user.
+    fn report_agent(&mut self, report: AgentReport) -> Result<()> {
+        ensure!(!self.info.exited, "session has exited");
+        let agent = report.agent().running_as();
+        match report {
+            AgentReport::Session { session } => {
+                let session = AgentSession::new(session.agent, &session.session_id)
+                    .context("invalid agent session ID")?;
+                if self.info.agent_session.as_ref() != Some(&session) {
+                    self.info.agent_turn = None;
+                    if matches!(self.info.attention, Some(Attention::AgentTurn { .. })) {
+                        self.info.attention = None;
+                    }
+                }
+                self.info.agent_session = Some(session);
+            }
+            AgentReport::Event { agent, event } => {
+                if self
+                    .info
+                    .agent_turn
+                    .as_ref()
+                    .is_none_or(|(reporting, _)| *reporting != agent)
+                {
+                    self.info.agent_turn = Some((agent, TurnState::default()));
+                }
+                let event = match event {
+                    AgentEvent::PromptSubmitted { prompt } => AgentEvent::PromptSubmitted {
+                        prompt: agent_events::clean_text(&prompt),
+                    },
+                    AgentEvent::Blocked { message } => AgentEvent::Blocked {
+                        message: message.map(|text| agent_events::clean_text(&text)),
+                    },
+                    AgentEvent::Failed { message } => AgentEvent::Failed {
+                        message: message.map(|text| agent_events::clean_text(&text)),
+                    },
+                    event => event,
+                };
+                let (_, state) = self
+                    .info
+                    .agent_turn
+                    .as_mut()
+                    .expect("agent turn initialized");
+                let changed = state.apply(event);
+                let attention = state
+                    .turn
+                    .filter(|turn| changed && *turn != AgentTurn::InProgress)
+                    .map(|turn| Attention::AgentTurn {
+                        agent,
+                        turn,
+                        prompt: state.prompt.clone(),
+                        message: state.message.clone(),
+                    });
+                if let Some(attention) = attention {
+                    self.attention(attention);
+                } else if changed
+                    && matches!(self.info.attention, Some(Attention::AgentTurn { .. }))
+                {
+                    self.info.attention = None;
+                }
+            }
+        }
+        self.clear_agent_reports(Some(agent));
+        self.agent = Some(agent);
+        self.agent_reported_at = Some(Instant::now());
+        self.working_since = None;
+        Ok(())
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
@@ -1487,6 +1625,7 @@ mod tests {
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             cwd: Some(std::env::temp_dir()),
             startup: None,
+            agent_session: None,
             dimensions: Dimensions {
                 cols: 60,
                 rows: 8,
@@ -2039,3 +2178,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod agent_tests;

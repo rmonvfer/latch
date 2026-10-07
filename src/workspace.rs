@@ -542,6 +542,7 @@ impl Workspace {
                 &panes,
                 window,
                 move |this, _, event, window, cx| match event {
+                    PaneGroupEvent::SessionChanged => this.schedule_save(cx),
                     PaneGroupEvent::MetadataChanged => {
                         cx.notify();
                         this.schedule_save(cx);

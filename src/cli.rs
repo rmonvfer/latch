@@ -16,7 +16,8 @@ use crate::{
     agent_events,
     agent_resume::{self, ResumableAgent},
     control::{self, NewTab, PaneTarget, Request, SplitDirection},
-    mcp,
+    mcp, runtime,
+    runtime_protocol::AgentReport,
     terminal_view::PANE_ID_VARIABLE,
 };
 
@@ -168,29 +169,26 @@ fn report_agent_hook(agent: &str) {
         return;
     }
     // Outside this app's panes there is nothing to report to.
-    if std::env::var_os(control::TOKEN_VARIABLE).is_none() {
+    let Ok(token) = std::env::var(control::TOKEN_VARIABLE) else {
         return;
-    }
+    };
     let (Some(resumable), Ok(payload)) = (
         ResumableAgent::parse(agent),
         serde_json::from_str::<Value>(&input),
     ) else {
         return;
     };
-    let request = if let Some(session) = agent_resume::session_from_hook(resumable, &payload) {
-        Request::ReportAgentSession {
-            agent: agent.to_string(),
-            session_id: session.session_id,
-        }
+    let report = if let Some(session) = agent_resume::session_from_hook(resumable, &payload) {
+        AgentReport::Session { session }
     } else if let Some(event) = agent_events::event_from_hook(&payload) {
-        Request::ReportAgentEvent {
-            agent: agent.to_string(),
+        AgentReport::Event {
+            agent: resumable,
             event,
         }
     } else {
         return;
     };
-    let _ = control::ControlClient::connect().and_then(|mut client| client.request(request));
+    let _ = runtime::report_agent(token, report);
 }
 
 fn run(command: Command) -> Result<()> {

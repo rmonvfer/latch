@@ -29,7 +29,8 @@ pub const CODEX_EVENTS: [&str; 4] = [
 ];
 
 /// Where an agent's current turn stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentTurn {
     InProgress,
     Done,
@@ -57,7 +58,7 @@ pub enum AgentEvent {
 }
 
 /// A pane's agent turn, as its hooks have told it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnState {
     pub turn: Option<AgentTurn>,
     /// The prompt the turn works on.
