@@ -134,7 +134,7 @@ fn decode_hex(hex: &[u8]) -> Option<Vec<u8>> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn encode(hook: &str, session: &str, value: &str) -> Vec<u8> {
     let message = format!(r#"{{"hook":"{hook}","session":"{session}","value":{value}}}"#);
     let hex: String = message.bytes().map(|byte| format!("{byte:02x}")).collect();

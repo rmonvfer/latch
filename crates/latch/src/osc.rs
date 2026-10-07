@@ -4,7 +4,7 @@
 //! and desktop notification requests (OSC 9 and OSC 777). OSC sequences
 //! stay in the output, since libghostty uses OSC 133 itself.
 
-use crate::hooks::{self, Hook};
+use latch_core::shell::hooks::{self, Hook};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OscEvent {

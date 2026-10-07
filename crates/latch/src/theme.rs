@@ -20,7 +20,9 @@ use gpui::{
 use libghostty_vt::style::RgbColor;
 use serde::Deserialize;
 
-use crate::{paths, settings::SettingsStore};
+use latch_core::paths;
+
+use crate::settings::SettingsStore;
 
 /// Primary terminal font family, with fallbacks that ship with macOS.
 pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font";

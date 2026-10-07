@@ -32,24 +32,32 @@ use libghostty_vt::{
 };
 use portable_pty::CommandBuilder;
 
+use latch_core::{
+    agents::{
+        self, Activity, Agent, AgentStatus,
+        events::{self, AgentEvent, AgentTurn, TurnState},
+        resume::AgentSession,
+    },
+    environment,
+    paths::PROGRAM_NAME,
+    shell::{
+        hooks::{Bootstrapped, Hook},
+        integration,
+    },
+};
 use latch_platform::{
     process,
     pty::{MAX_INPUT_BYTES, Pty, PtyDimensions},
 };
 
 use crate::{
-    agent_events::{self, AgentEvent, AgentTurn, TurnState},
-    agent_resume::AgentSession,
-    agents::{self, Activity, Agent, AgentStatus},
-    hooks::{Bootstrapped, Hook},
     osc::{OscEvent, OscScanner, Piece},
-    paths::PROGRAM_NAME,
     runtime_blocks::{self, Blocks as BlockLog},
     runtime_protocol::{
         AgentReport, Attention, BlockContext, Blocks, Colors, Completions, Cursor, Dimensions,
         Launch, Match, Operation, Request, Response, SessionInfo, Snapshot,
     },
-    search, shell_integration,
+    search,
 };
 
 /// The reply to an XTVERSION query: the program's name and version.
@@ -261,13 +269,13 @@ impl Engine {
         for (key, value) in &launch.env {
             command.env(key, value);
         }
-        command.env(crate::terminal_view::PANE_ID_VARIABLE, id.to_string());
-        command.env(crate::control::TOKEN_VARIABLE, &launch.control_token);
+        command.env(environment::PANE_ID_VARIABLE, id.to_string());
+        command.env(environment::TOKEN_VARIABLE, &launch.control_token);
         // Lifecycle hooks carry this id; hooks with any other are ignored.
-        let session_id = crate::control::new_token()?;
-        command.env(shell_integration::SESSION_ID_VARIABLE, &session_id);
+        let session_id = environment::new_token()?;
+        command.env(integration::SESSION_ID_VARIABLE, &session_id);
         if launch.command_blocks {
-            command.env(shell_integration::COMMAND_BLOCKS_VARIABLE, "1");
+            command.env(integration::COMMAND_BLOCKS_VARIABLE, "1");
         }
         command.env("TERM_PROGRAM", PROGRAM_NAME);
         command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
@@ -609,7 +617,7 @@ impl Engine {
         let mut data = text.into_bytes();
         let mut encoded = vec![0; data.len() + 32];
         let len = paste::encode(&mut data, bracketed, &mut encoded)?;
-        let mut bytes = shell_integration::CLEAR_LINE_KEY.to_vec();
+        let mut bytes = integration::CLEAR_LINE_KEY.to_vec();
         bytes.extend_from_slice(&encoded[..len]);
         bytes.extend_from_slice(suffix);
         self.write_input(&bytes)
@@ -826,13 +834,13 @@ impl Engine {
                 }
                 let event = match event {
                     AgentEvent::PromptSubmitted { prompt } => AgentEvent::PromptSubmitted {
-                        prompt: agent_events::clean_text(&prompt),
+                        prompt: events::clean_text(&prompt),
                     },
                     AgentEvent::Blocked { message } => AgentEvent::Blocked {
-                        message: message.map(|text| agent_events::clean_text(&text)),
+                        message: message.map(|text| events::clean_text(&text)),
                     },
                     AgentEvent::Failed { message } => AgentEvent::Failed {
-                        message: message.map(|text| agent_events::clean_text(&text)),
+                        message: message.map(|text| events::clean_text(&text)),
                     },
                     event => event,
                 };
@@ -1150,7 +1158,7 @@ impl Engine {
             }
             Operation::RunCommand { command } => self.type_into_shell(command, b"\r")?,
             Operation::Complete { text } => {
-                self.type_into_shell(text, shell_integration::COMPLETE_KEY)?
+                self.type_into_shell(text, integration::COMPLETE_KEY)?
             }
             Operation::BlockRows { block, from } => {
                 let (version, rows) = self
@@ -1618,7 +1626,8 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use super::*;
-    use crate::shell_integration;
+
+    use latch_core::shell::integration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -1733,7 +1742,7 @@ mod tests {
     /// A launch of the default login shell (zsh) living in `home`, with the
     /// app's shell integration if asked.
     fn zsh_launch(home: &ShellHome, integration: bool) -> Launch {
-        let mut command = shell_integration::shell_command(None);
+        let mut command = integration::shell_command(None);
         assert!(command.is_default_prog());
         command.env_clear();
         command.env("SHELL", "/bin/zsh");

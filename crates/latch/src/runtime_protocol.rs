@@ -4,10 +4,12 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    agent_events::{AgentEvent, AgentTurn, TurnState},
-    agent_resume::{AgentSession, ResumableAgent},
-    hooks::{Bootstrapped, Completion},
+use latch_core::{
+    agents::{
+        events::{AgentEvent, AgentTurn, TurnState},
+        resume::{AgentSession, ResumableAgent},
+    },
+    shell::hooks::{Bootstrapped, Completion},
 };
 
 pub const VERSION: u32 = 3;

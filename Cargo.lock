@@ -2984,6 +2984,7 @@ dependencies = [
  "git2",
  "gpui",
  "gpui_platform",
+ "latch-core",
  "latch-platform",
  "libc",
  "libghostty-vt",
@@ -3000,6 +3001,19 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "latch-core"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "git2",
+ "latch-platform",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

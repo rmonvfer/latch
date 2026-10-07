@@ -18,12 +18,12 @@ use gpui::{
 };
 use libghostty_vt::style::RgbColor;
 
+use latch_core::{git::DiffStats, paths::shorten_home};
+
 use crate::{
     blocks::{Block, BlockPoint, BlockSelection, Rows},
     components::icon,
-    git::DiffStats,
     grid::{CellMetrics, Frame, paint_rows},
-    paths::shorten_home,
     runtime_protocol::BlockContext,
     selected_blocks::SelectionBorder,
     text_input::TextInput,

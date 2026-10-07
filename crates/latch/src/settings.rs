@@ -8,9 +8,10 @@ use anyhow::{Context as _, Result};
 use gpui::{App, AsyncApp, Global};
 use serde::{Deserialize, Serialize};
 
+use latch_core::paths;
+
 use crate::{
-    agents::{self, AgentProfile},
-    paths,
+    agent_profiles::{self, AgentProfile},
     sidebar::SidebarSettings,
     status_bar::StatusBarSettings,
 };
@@ -73,7 +74,7 @@ impl Default for Settings {
             shell_integration: true,
             notifications: true,
             confirm_close: true,
-            agent_profiles: agents::default_profiles(),
+            agent_profiles: agent_profiles::default_profiles(),
             agent_worktrees: false,
             control_api: true,
             command_blocks: true,

@@ -12,7 +12,7 @@ use std::{
 use tracing_chrome::{ChromeLayerBuilder, FlushGuard};
 use tracing_subscriber::prelude::*;
 
-use crate::paths;
+use latch_core::paths;
 
 /// Environment variable that turns tracing on; programs started from a
 /// traced app (the session runtime) inherit it.

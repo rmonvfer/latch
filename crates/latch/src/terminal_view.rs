@@ -23,10 +23,18 @@ use libghostty_vt::{
     terminal::{Options, Point, PointCoordinate},
 };
 
+use latch_core::{
+    agents::{Agent, events::AgentTurn, resume::AgentSession},
+    environment,
+    git::{self, DiffStats},
+    paths,
+    shell::{
+        hooks::{Bootstrapped, Completion},
+        integration,
+    },
+};
+
 use crate::{
-    agent_events::AgentTurn,
-    agent_resume::AgentSession,
-    agents::Agent,
     block_filter::{self, FilterOptions},
     block_view::{
         self, BlockAction, FilterBar, FilterChange, Item, ItemContent, OnBlockAction,
@@ -38,14 +46,11 @@ use crate::{
     components::{self, elevated_shadow, icon, icon_button, keybinding},
     control, editor_buffer,
     editor_menus::{self, HistoryMenu, HistorySearch},
-    git::{self, DiffStats},
     grid::{CellMetrics, Frame, GridRenderer},
     highlight::{self, CommandIndex, TokenKind},
     history::{self, History},
-    hooks::{Bootstrapped, Completion},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
-    paths,
     runtime::{self, ClientEvent, SessionClient},
     runtime_display::DisplayState,
     runtime_protocol::{
@@ -54,7 +59,7 @@ use crate::{
     search::SearchMatch,
     selected_blocks::SelectedBlocks,
     settings::SettingsStore,
-    shell_integration::{self, ShellIntegration},
+    shell_integration::ShellIntegration,
     text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, TerminalColors},
 };
@@ -174,9 +179,6 @@ pub enum Attention {
         message: Option<String>,
     },
 }
-
-/// Environment variable telling programs which session they run in.
-pub const PANE_ID_VARIABLE: &str = "TERMINAL_PANE_ID";
 
 /// How often uncommitted changes are recounted.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -2927,9 +2929,9 @@ fn configure_colors(
 /// How to start a login shell in `cwd` for session `id`, running `startup`
 /// once its prompt is ready.
 fn launch(id: u64, cwd: Option<&Path>, startup: Option<&str>, cx: &App) -> Result<Launch> {
-    let mut command = shell_integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
-    let control_token = control::new_token()?;
-    command.env(control::TOKEN_VARIABLE, &control_token);
+    let mut command = integration::shell_command(ShellIntegration::active_dir(cx).as_deref());
+    let control_token = environment::new_token()?;
+    command.env(environment::TOKEN_VARIABLE, &control_token);
     control::configure_command(&mut command, cx);
     Ok(Launch {
         id,

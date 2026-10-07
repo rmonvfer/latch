@@ -4,9 +4,9 @@
 
 use gpui::{AnyElement, Hsla, Pixels, div, prelude::*, rgb};
 
+use latch_core::agents::{Agent, events::AgentTurn};
+
 use crate::{
-    agent_events::AgentTurn,
-    agents::Agent,
     components::icon,
     terminal_view::AgentState,
     theme::{self, Theme},

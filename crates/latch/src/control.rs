@@ -43,6 +43,7 @@ use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use latch_core::{environment::TOKEN_VARIABLE, paths};
 use latch_platform::{
     peer::{peer_pid, same_user},
     process,
@@ -51,7 +52,7 @@ use latch_platform::{
 use crate::{
     agent_badge, notifications,
     pane_tree::Axis,
-    paths, runtime,
+    runtime,
     settings::SettingsStore,
     tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
@@ -159,15 +160,6 @@ pub struct Reply {
     pub error: Option<String>,
 }
 
-/// A random 128-bit secret, hex encoded.
-pub fn new_token() -> Result<String> {
-    let mut bytes = [0u8; 16];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut source| std::io::Read::read_exact(&mut source, &mut bytes))
-        .context("failed to read random bytes")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
 pub fn socket_path() -> PathBuf {
     paths::config_dir().join("control.sock")
 }
@@ -192,9 +184,6 @@ pub fn configure_command(command: &mut CommandBuilder, cx: &App) {
         command.env("PATH", joined);
     }
 }
-
-/// Environment variable holding a pane's control token.
-pub const TOKEN_VARIABLE: &str = "TERMINAL_CONTROL_TOKEN";
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
@@ -786,6 +775,8 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use latch_core::environment::new_token;
 
     #[test]
     fn tokens_are_random_and_carried_in_envelopes() {

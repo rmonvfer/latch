@@ -10,13 +10,14 @@ use gpui::{
 
 use serde::{Deserialize, Serialize};
 
+use latch_core::{agents::events, git::DiffStats};
+
 use crate::{
-    agent_badge, agent_events,
+    agent_badge,
     components::{
         DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
         menu_surface,
     },
-    git::DiffStats,
     pane_group::{DraggedPane, Edge},
     settings::{Settings, SettingsStore},
     tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
@@ -645,7 +646,7 @@ impl Workspace {
             Some(state) => state
                 .prompt
                 .clone()
-                .unwrap_or_else(|| agent_events::clean_title(&display.title).to_string().into()),
+                .unwrap_or_else(|| events::clean_title(&display.title).to_string().into()),
             None => display.title.clone(),
         };
         let icon_color = if active { theme.text } else { theme.text_muted };

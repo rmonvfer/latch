@@ -12,15 +12,19 @@ use anyhow::{Context as _, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
-use crate::{
-    agent_events,
-    agent_resume::{self, ResumableAgent},
-    control::{self, NewTab, PaneTarget, Request, SplitDirection},
-    mcp,
+use latch_core::{
+    agents::{
+        events,
+        resume::{self, ResumableAgent},
+    },
+    environment::{PANE_ID_VARIABLE, TOKEN_VARIABLE},
     paths::PROGRAM_NAME,
-    runtime,
+};
+
+use crate::{
+    control::{self, NewTab, PaneTarget, Request, SplitDirection},
+    mcp, runtime,
     runtime_protocol::AgentReport,
-    terminal_view::PANE_ID_VARIABLE,
 };
 
 #[derive(Parser)]
@@ -171,7 +175,7 @@ fn report_agent_hook(agent: &str) {
         return;
     }
     // Outside this app's panes there is nothing to report to.
-    let Ok(token) = std::env::var(control::TOKEN_VARIABLE) else {
+    let Ok(token) = std::env::var(TOKEN_VARIABLE) else {
         return;
     };
     let (Some(resumable), Ok(payload)) = (
@@ -180,9 +184,9 @@ fn report_agent_hook(agent: &str) {
     ) else {
         return;
     };
-    let report = if let Some(session) = agent_resume::session_from_hook(resumable, &payload) {
+    let report = if let Some(session) = resume::session_from_hook(resumable, &payload) {
         AgentReport::Session { session }
-    } else if let Some(event) = agent_events::event_from_hook(&payload) {
+    } else if let Some(event) = events::event_from_hook(&payload) {
         AgentReport::Event {
             agent: resumable,
             event,
@@ -281,7 +285,7 @@ fn run(command: Command) -> Result<()> {
         Command::Integrate { agent } => {
             let agent = ResumableAgent::parse(&agent)
                 .with_context(|| format!("no integration for {agent:?}; use claude or codex"))?;
-            for path in agent_resume::install(agent)? {
+            for path in resume::install(agent)? {
                 println!("updated {}", path.display());
             }
             println!(

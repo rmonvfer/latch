@@ -3,7 +3,7 @@
 //!
 //! Agents report their session through a `SessionStart` hook that runs
 //! `terminal agent-hook <agent>` with the hook's JSON on stdin; the same
-//! command, on the hooks `agent_events` lists, reports how each turn goes.
+//! command, on the hooks `events` lists, reports how each turn goes.
 //! A restored
 //! pane types the resume command into its fresh shell, so quitting the
 //! agent leaves a usable shell. The approach follows herdr
@@ -22,9 +22,9 @@ use serde_json::{Map, Value, json};
 
 use latch_platform::process;
 
-use crate::{
-    agent_events::{CLAUDE_EVENTS, CODEX_EVENTS},
-    agents::{self, Agent},
+use crate::agents::{
+    self, Agent,
+    events::{CLAUDE_EVENTS, CODEX_EVENTS},
 };
 
 /// Longest session id accepted from a hook.

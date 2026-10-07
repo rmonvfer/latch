@@ -9,7 +9,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::{hooks::Bootstrapped, links};
+use latch_core::shell::hooks::Bootstrapped;
+
+use crate::links;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {

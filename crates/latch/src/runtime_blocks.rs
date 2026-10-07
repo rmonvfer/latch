@@ -14,9 +14,9 @@ use libghostty_vt::{
     terminal::{Mode, ScrollViewport},
 };
 
+use latch_core::{git, shell::hooks::Precmd};
+
 use crate::{
-    git,
-    hooks::Precmd,
     runtime_engine::encode_row,
     runtime_protocol::{BlockContext, BlockSummary},
 };

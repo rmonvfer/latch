@@ -16,9 +16,10 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use latch_core::paths;
+
 use crate::{
     pane_group::PaneState,
-    paths,
     tabs::{TabColor, TabStyle},
     theme,
 };
@@ -202,11 +203,10 @@ fn keep_copy(dir: &Path, contents: &str, kept: usize, interval: Option<Duration>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        agent_resume::{AgentSession, ResumableAgent},
-        pane_tree::Axis,
-        tabs::TabIcon,
-    };
+
+    use latch_core::agents::resume::{AgentSession, ResumableAgent};
+
+    use crate::{pane_tree::Axis, tabs::TabIcon};
 
     #[test]
     fn session_round_trips_through_json() {

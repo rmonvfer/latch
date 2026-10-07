@@ -26,17 +26,15 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
+use latch_core::{agents::resume, paths, shell::hooks::Bootstrapped};
 use latch_platform::{
     peer::{peer_audit, same_user},
     process::{self, pid_version},
 };
 
 use crate::{
-    agent_resume,
     blocks::decode,
     grid::FrameRow,
-    hooks::Bootstrapped,
-    paths,
     runtime_engine::{self, SessionHandle},
     runtime_protocol::{
         AgentReport, Blocks, Envelope, Launch, MAX_MESSAGE_BYTES, Match, Operation, Request,
@@ -883,7 +881,7 @@ fn serve_connection(mut stream: UnixStream, state: &State) -> Result<()> {
         }
         if let Request::ReportAgent { report, .. } = &envelope.request {
             let valid = peer_audit(&stream).is_some_and(|(pid, version)| {
-                agent_resume::reported_by(report.agent(), pid) && pid_version(pid) == Some(version)
+                resume::reported_by(report.agent(), pid) && pid_version(pid) == Some(version)
             });
             if !valid {
                 write_frame(
@@ -1601,11 +1599,11 @@ mod tests {
         let paths = Paths {
             directory: PathBuf::from(directory),
         };
-        let token = std::env::var(crate::control::TOKEN_VARIABLE).unwrap();
-        let agent = crate::agent_resume::ResumableAgent::Codex;
+        let token = std::env::var(latch_core::environment::TOKEN_VARIABLE).unwrap();
+        let agent = latch_core::agents::resume::ResumableAgent::Codex;
         let mut client = Rpc::connect(&paths).unwrap();
         let report = AgentReport::Session {
-            session: crate::agent_resume::AgentSession::new(agent, "detached-agent-session")
+            session: latch_core::agents::resume::AgentSession::new(agent, "detached-agent-session")
                 .unwrap(),
         };
         assert!(
@@ -1622,13 +1620,13 @@ mod tests {
             report,
             AgentReport::Event {
                 agent,
-                event: crate::agent_events::AgentEvent::PromptSubmitted {
+                event: latch_core::agents::events::AgentEvent::PromptSubmitted {
                     prompt: "fix the build".into(),
                 },
             },
             AgentReport::Event {
                 agent,
-                event: crate::agent_events::AgentEvent::Blocked {
+                event: latch_core::agents::events::AgentEvent::Blocked {
                     message: Some("Wants to use Bash".into()),
                 },
             },
@@ -1716,7 +1714,7 @@ mod tests {
         assert_eq!(restored.status, "needs_input");
         assert_eq!(
             restored.agent_turn.unwrap().1.turn,
-            Some(crate::agent_events::AgentTurn::Blocked)
+            Some(latch_core::agents::events::AgentTurn::Blocked)
         );
         assert!(matches!(
             restored.attention,
@@ -1737,8 +1735,8 @@ mod tests {
             .request(Request::ReportAgent {
                 token: session.control_token,
                 report: AgentReport::Event {
-                    agent: crate::agent_resume::ResumableAgent::Claude,
-                    event: crate::agent_events::AgentEvent::Blocked { message: None },
+                    agent: latch_core::agents::resume::ResumableAgent::Claude,
+                    event: latch_core::agents::events::AgentEvent::Blocked { message: None },
                 },
             })
             .unwrap_err();

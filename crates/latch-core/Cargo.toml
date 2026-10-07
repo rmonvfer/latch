@@ -1,0 +1,17 @@
+[package]
+name = "latch-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+git2.workspace = true
+latch-platform.workspace = true
+libc.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+test-support = []

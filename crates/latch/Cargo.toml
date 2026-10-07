@@ -9,6 +9,7 @@ name = "terminal"
 path = "src/main.rs"
 
 [dependencies]
+latch-core.workspace = true
 latch-platform.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -33,3 +34,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-chrome.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+latch-core = { workspace = true, features = ["test-support"] }

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::agent_resume::ResumableAgent;
+
+use latch_core::agents::resume::ResumableAgent;
 
 fn launch() -> Launch {
     Launch {

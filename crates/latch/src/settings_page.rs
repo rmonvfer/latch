@@ -10,10 +10,13 @@ use gpui::{
     prelude::*, px, relative,
 };
 
-use crate::{
-    agent_resume::{self, ResumableAgent},
-    components::{button, icon},
+use latch_core::{
+    agents::resume::{self, ResumableAgent},
     paths::{self, shorten_home},
+};
+
+use crate::{
+    components::{button, icon},
     session,
     settings::{
         FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, Settings, SettingsStore, TERMINAL_PADDING_RANGE,
@@ -342,7 +345,7 @@ impl SettingsPage {
                                     theme,
                                 )
                                 .on_click(cx.listener(move |page, _: &ClickEvent, _, cx| {
-                                    page.integration_status = Some(match agent_resume::install(agent) {
+                                    page.integration_status = Some(match resume::install(agent) {
                                         Ok(paths) => format!(
                                             "{} reports its sessions now (updated {}).",
                                             agent.display_name(),

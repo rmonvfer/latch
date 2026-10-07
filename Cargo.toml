@@ -8,6 +8,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+latch-core = { path = "crates/latch-core" }
 latch-platform = { path = "crates/latch-platform" }
 
 anyhow = "1.0.86"

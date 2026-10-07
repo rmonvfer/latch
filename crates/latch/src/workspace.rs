@@ -10,19 +10,22 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity, Window, actions, deferred, div, prelude::*, px,
 };
 
+use latch_core::{
+    agents::events::AgentTurn,
+    git::{self, DiffStats},
+    paths::shorten_home,
+};
+
 use crate::{
-    agent_events::AgentTurn,
-    agents::AgentProfile,
+    agent_profiles::AgentProfile,
     command_palette::{
         self, CommandPalette, CommandPaletteEvent, PaletteItem, PaletteTarget, Section,
     },
     components::{self, icon, icon_button, keybinding},
     confirm::confirm_close,
-    git::{self, DiffStats},
     notifications,
     pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
     pane_tree::PaneNode,
-    paths::shorten_home,
     runtime,
     runtime_protocol::SessionInfo,
     session::{self, EntryState, GroupState, SessionState, TabKind, TabState},

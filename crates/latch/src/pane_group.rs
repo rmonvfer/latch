@@ -10,8 +10,9 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
+use latch_core::agents::resume::AgentSession;
+
 use crate::{
-    agent_resume::AgentSession,
     components::{DragPreview, icon_button},
     pane_tree::{Axis, PaneNode, PaneTree, Split},
     sidebar::DraggedTab,
