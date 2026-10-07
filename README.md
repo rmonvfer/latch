@@ -4,7 +4,7 @@
 <h1 align="center">Latch</h1>
 <p align="center">A native macOS terminal with persistent sessions, command blocks, and coding agents.</p>
 <p align="center">
-  <a href="https://github.com/rmonvfer/terminal/releases/latest">Download</a> · <a href="#building">Build</a> · <a href="#sessions">Sessions</a> · <a href="#driving-it-from-outside">CLI &amp; MCP</a>
+  <a href="https://github.com/rmonvfer/latch/releases/latest">Download</a> · <a href="#building">Build</a> · <a href="#sessions">Sessions</a> · <a href="#driving-it-from-outside">CLI &amp; MCP</a>
 </p>
 
 ![Latch with grouped tabs, git context, and a split workspace](docs/images/workspace.png)
@@ -15,9 +15,9 @@ It's early and macOS only.
 
 ## Installing
 
-[Production releases](https://github.com/rmonvfer/terminal/releases/latest) include macOS ZIPs for Apple Silicon (`arm64`) and Intel (`x86_64`), with SHA-256 checksums. Unzip the matching download and move `Terminal.app` to Applications; it displays as Latch. Keep the bundle at the same location across upgrades so its session runtime can reconnect. Builds are ad-hoc signed without Apple notarization; macOS may require approval in System Settings → Privacy & Security on first launch.
+[Production releases](https://github.com/rmonvfer/latch/releases/latest) include macOS ZIPs for Apple Silicon (`arm64`) and Intel (`x86_64`), with SHA-256 checksums. Unzip the matching download and move `Terminal.app` to Applications; it displays as Latch. Keep the bundle at the same location across upgrades so its session runtime can reconnect. Builds are ad-hoc signed without Apple notarization; macOS may require approval in System Settings → Privacy & Security on first launch.
 
-[Beta releases](https://github.com/rmonvfer/terminal/releases) are marked as prereleases. They use the same settings and sessions as production, so install one channel at a time.
+[Beta releases](https://github.com/rmonvfer/latch/releases) are marked as prereleases. They use the same settings and sessions as production, so install one channel at a time.
 
 ## Your workspace
 

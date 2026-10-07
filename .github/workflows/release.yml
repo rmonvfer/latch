@@ -64,12 +64,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: macos-${{ matrix.architecture }}
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check lints
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --release --all-targets -- -D warnings
       - name: Run tests
-        run: cargo test --locked --bin terminal
+        run: cargo test --locked --release --bin terminal
       - name: Build and package
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
