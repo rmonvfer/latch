@@ -1,4 +1,5 @@
 mod block_actions;
+pub mod shell_integration;
 
 use std::{
     cell::RefCell,
@@ -43,26 +44,32 @@ use latch_runtime::{
 };
 
 use crate::{
-    block_filter::{self, FilterOptions},
-    block_view::{
-        self, BlockAction, FilterBar, FilterChange, Item, ItemContent, OnBlockAction,
-        PaintedOutputs, RowMatch,
+    blocks::{
+        self, BlockList, BlockPoint, BlockSelection, ListChange, Rows,
+        filter::{self, FilterOptions},
+        selection::SelectedBlocks,
+        view::{
+            self, BlockAction, FilterBar, FilterChange, Item, ItemContent, OnBlockAction,
+            PaintedOutputs, RowMatch,
+        },
     },
-    blocks::{self, BlockList, BlockPoint, BlockSelection, ListChange, Rows},
-    command_editor::{CommandEditor, CommandEditorEvent, Highlight},
-    completion::{self, CompletionMenu},
-    components::{self, elevated_shadow, icon, icon_button, keybinding},
-    control, editor_buffer,
-    editor_menus::{self, HistoryMenu, HistorySearch},
+    command_editor::{
+        CommandEditor, CommandEditorEvent, Highlight, buffer,
+        completion::{self, CompletionMenu},
+        highlight::{self, CommandIndex, TokenKind},
+        history::{self, History},
+        menus::{self, HistoryMenu, HistorySearch},
+    },
+    components::{
+        self, elevated_shadow, icon, icon_button, keybinding,
+        text_input::{TextInput, TextInputEvent},
+    },
+    control,
     grid::{CellMetrics, Frame, FrameRow, GridRenderer},
-    highlight::{self, CommandIndex, TokenKind},
-    history::{self, History},
     input::{to_mods, translate_keystroke},
     links::{self, LinkTarget},
-    selected_blocks::SelectedBlocks,
     settings::SettingsStore,
-    shell_integration::ShellIntegration,
-    text_input::{TextInput, TextInputEvent},
+    terminal_view::shell_integration::ShellIntegration,
     theme::{self, ActiveTheme, ActiveThemeExt, TerminalColors},
 };
 
@@ -354,7 +361,7 @@ impl BlockFilter {
             return cached.clone();
         }
         let texts: Vec<String> = rows.iter().map(|row| row.text()).collect();
-        let filtered = block_filter::filter(&texts, &options);
+        let filtered = filter::filter(&texts, &options);
         let result = FilteredRows {
             source: rows.clone(),
             rows: Rc::new(filtered.kept.iter().map(|&row| rows[row].clone()).collect()),
@@ -373,7 +380,7 @@ impl BlockFilter {
             FilterChange::ToggleCaseSensitive => self.case_sensitive = !self.case_sensitive,
             FilterChange::ToggleInvert => self.invert = !self.invert,
             FilterChange::MoreContext => {
-                self.context = (self.context + 1).min(block_filter::MAX_CONTEXT);
+                self.context = (self.context + 1).min(filter::MAX_CONTEXT);
             }
             FilterChange::LessContext => self.context = self.context.saturating_sub(1),
         }
@@ -1300,12 +1307,12 @@ impl TerminalView {
         if context.git_branch.is_none() {
             context.git_branch.clone_from(&self.branch);
         }
-        let chips = block_view::context_chips(&context, self.diff, metrics, theme);
+        let chips = view::context_chips(&context, self.diff, metrics, theme);
         // A menu opens above the input, over the blocks.
         let menu = if let Some(menu) = &self.completion {
-            Some(editor_menus::render_completions(menu, metrics, theme))
+            Some(menus::render_completions(menu, metrics, theme))
         } else if let Some(menu) = &self.history_menu {
-            Some(editor_menus::render_history_menu(
+            Some(menus::render_history_menu(
                 menu,
                 &self.history,
                 metrics,
@@ -1313,7 +1320,7 @@ impl TerminalView {
             ))
         } else {
             self.history_search.as_ref().map(|search| {
-                editor_menus::render_history_search(
+                menus::render_history_search(
                     search,
                     &self.history,
                     self.editor.read(cx).text(),
@@ -1334,7 +1341,7 @@ impl TerminalView {
             // hairline) at 60% above the chips, 15px between them and the
             // command, and 24px below it.
             .gap(px(15.))
-            .pl(metrics.padding + block_view::HORIZONTAL_INSET)
+            .pl(metrics.padding + view::HORIZONTAL_INSET)
             .pr(px(16.))
             .pt((metrics.height * 1.1 - px(1.)) * 0.6)
             .pb(px(24.))
@@ -1641,7 +1648,7 @@ impl TerminalView {
         self.bounds = Some(bounds);
         // Blocks are inset from the sides; full-screen programs are not.
         let grid_bounds = if self.shows_blocks() {
-            let inset = block_view::HORIZONTAL_INSET;
+            let inset = view::HORIZONTAL_INSET;
             Bounds::new(
                 bounds.origin + gpui::point(inset, px(0.)),
                 gpui::size(bounds.size.width - inset * 2., bounds.size.height),
@@ -2678,7 +2685,7 @@ impl Render for TerminalView {
                 let background = frame
                     .as_ref()
                     .map_or(cx.theme().terminal_background(), |frame| frame.background);
-                let list = block_view::render_list(
+                let list = view::render_list(
                     &self.block_list,
                     Rc::new(items),
                     frame.map(Rc::new),

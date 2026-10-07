@@ -19,9 +19,11 @@ use serde::{Deserialize, Serialize};
 use latch_core::paths;
 
 use crate::{
-    pane_group::PaneState,
-    tabs::{TabColor, TabStyle},
     theme,
+    workspace::{
+        pane_group::PaneState,
+        tabs::{TabColor, TabStyle},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +208,7 @@ mod tests {
 
     use latch_core::agents::resume::{AgentSession, ResumableAgent};
 
-    use crate::{pane_tree::Axis, tabs::TabIcon};
+    use crate::workspace::{pane_tree::Axis, tabs::TabIcon};
 
     #[test]
     fn session_round_trips_through_json() {

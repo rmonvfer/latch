@@ -21,11 +21,9 @@ use latch_core::{
     paths::PROGRAM_NAME,
 };
 use latch_runtime::protocol::AgentReport;
+use latch_ui::control::{self, NewTab, PaneTarget, Request, SplitDirection};
 
-use crate::{
-    control::{self, NewTab, PaneTarget, Request, SplitDirection},
-    mcp,
-};
+use crate::mcp;
 
 #[derive(Parser)]
 #[command(name = PROGRAM_NAME, version, about = "Control the terminal app")]

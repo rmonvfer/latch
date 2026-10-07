@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 
 use latch_core::shell::hooks::Completion;
 
-use crate::{highlight::CommandIndex, links};
+use crate::{command_editor::highlight::CommandIndex, links};
 
 /// Completions offered for the text before the cursor.
 #[derive(Clone, Debug, PartialEq)]

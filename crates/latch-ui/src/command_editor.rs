@@ -2,6 +2,12 @@
 //! on the terminal's cell grid in the terminal font, with selection,
 //! clipboard, and IME support.
 
+pub mod buffer;
+pub mod completion;
+pub mod highlight;
+pub mod history;
+pub mod menus;
+
 use std::{ops::Range, time::Duration};
 
 use gpui::{
@@ -12,7 +18,7 @@ use gpui::{
 };
 
 use crate::{
-    editor_buffer::{self, EditorBuffer, VisualRow},
+    command_editor::buffer::{EditorBuffer, VisualRow},
     grid::CellMetrics,
     settings::SettingsStore,
     theme::{self, ActiveThemeExt},
@@ -506,13 +512,13 @@ impl CommandEditor {
         if row >= self.rows.len() {
             return self.buffer.text().len();
         }
-        editor_buffer::offset_at(self.buffer.text(), &self.rows, row, col)
+        buffer::offset_at(self.buffer.text(), &self.rows, row, col)
     }
 
     /// Top-left of the cell at byte `offset`, in window coordinates.
     fn point_for_offset(&self, offset: usize) -> Option<Point<Pixels>> {
         let (bounds, metrics) = (self.bounds?, self.metrics?);
-        let (row, col) = editor_buffer::position_of(self.buffer.text(), &self.rows, offset);
+        let (row, col) = buffer::position_of(self.buffer.text(), &self.rows, offset);
         Some(
             bounds.origin
                 + point(
@@ -552,8 +558,7 @@ impl CommandEditor {
 
     /// Keep the cursor's row inside the visible rows.
     fn scroll_to_cursor(&mut self) {
-        let (row, _) =
-            editor_buffer::position_of(self.buffer.text(), &self.rows, self.buffer.cursor());
+        let (row, _) = buffer::position_of(self.buffer.text(), &self.rows, self.buffer.cursor());
         if row < self.scroll_row {
             self.scroll_row = row;
         } else if row >= self.scroll_row + MAX_VISIBLE_ROWS {
@@ -702,7 +707,7 @@ impl Render for CommandEditor {
             self.cursor_shown = true;
         }
         self.metrics = Some(metrics);
-        self.rows = editor_buffer::layout_rows(self.buffer.text(), self.cols());
+        self.rows = buffer::layout_rows(self.buffer.text(), self.cols());
         self.scroll_to_cursor();
 
         let theme = cx.theme().clone();
@@ -747,8 +752,8 @@ impl Render for CommandEditor {
                     let selected =
                         (selection.start.max(row.start)..selection.end.min(row.end)).clone();
                     let selection = (!selected.is_empty()).then(|| {
-                        editor_buffer::columns(&text[row.start..selected.start])
-                            ..editor_buffer::columns(&text[row.start..selected.end])
+                        buffer::columns(&text[row.start..selected.start])
+                            ..buffer::columns(&text[row.start..selected.end])
                     });
                     PaintRow {
                         text: row_text.to_string().into(),
@@ -759,7 +764,7 @@ impl Render for CommandEditor {
                 .collect()
         };
         let cursor = (focused && selection.is_empty() && self.cursor_shown).then(|| {
-            let (row, col) = editor_buffer::position_of(text, &self.rows, self.buffer.cursor());
+            let (row, col) = buffer::position_of(text, &self.rows, self.buffer.cursor());
             (row - self.scroll_row, col)
         });
         let ghost = self
@@ -767,7 +772,7 @@ impl Render for CommandEditor {
             .as_ref()
             .filter(|_| focused && selection.is_empty() && self.buffer.cursor() == text.len())
             .and_then(|suggestion| {
-                let (row, col) = editor_buffer::position_of(text, &self.rows, text.len());
+                let (row, col) = buffer::position_of(text, &self.rows, text.len());
                 let room = self.cols().saturating_sub(col);
                 let first_line = suggestion.lines().next().unwrap_or_default();
                 let fitted = fit_columns(first_line, room);
@@ -960,7 +965,7 @@ fn fit_columns(text: &str, cols: usize) -> &str {
     let mut width = 0;
     for (index, grapheme) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
     {
-        width += editor_buffer::columns(grapheme);
+        width += buffer::columns(grapheme);
         if width > cols {
             return &text[..index];
         }

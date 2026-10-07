@@ -13,17 +13,18 @@ use serde::{Deserialize, Serialize};
 use latch_core::{agents::events, git::DiffStats};
 
 use crate::{
-    agent_badge,
     components::{
-        DragPreview, icon, icon_button, menu_caption, menu_choice, menu_item, menu_separator,
-        menu_surface,
+        DragPreview, agent_badge, icon, icon_button, menu_caption, menu_choice, menu_item,
+        menu_separator, menu_surface,
     },
-    pane_group::{DraggedPane, Edge},
     settings::{Settings, SettingsStore},
-    tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
     terminal_view::TerminalView,
     theme::{self, Theme},
-    workspace::{MenuKind, Target, Workspace},
+    workspace::{
+        MenuKind, Target, Workspace,
+        pane_group::{DraggedPane, Edge},
+        tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout},
+    },
 };
 
 /// How much each tab row shows.
@@ -1457,7 +1458,7 @@ fn tab_details(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tabs::TabStyle;
+    use crate::workspace::tabs::TabStyle;
 
     fn named_layout(names: &[&str]) -> (TabLayout, Vec<TabId>) {
         let mut layout = TabLayout::default();

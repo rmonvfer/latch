@@ -1,3 +1,8 @@
+pub mod agent_badge;
+pub mod confirm;
+pub mod text_input;
+pub mod tooltip;
+
 use gpui::{
     BoxShadow, Context, Div, ElementId, Hsla, MouseButton, Pixels, SharedString, Stateful, Svg,
     Window, div, hsla, point, prelude::*, px, svg,

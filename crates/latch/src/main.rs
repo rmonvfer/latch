@@ -1,42 +1,6 @@
-mod agent_badge;
-mod agent_profiles;
-mod app_menus;
-mod assets;
-mod block_filter;
-mod block_view;
-mod blocks;
 mod cli;
-mod command_editor;
-mod command_palette;
-mod completion;
-mod components;
-mod confirm;
-mod control;
-mod editor_buffer;
-mod editor_menus;
-mod grid;
-mod highlight;
-mod history;
-mod input;
-mod links;
 mod mcp;
-mod notifications;
-mod pane_group;
-mod pane_tree;
 mod profiling;
-mod selected_blocks;
-mod session;
-mod settings;
-mod settings_page;
-mod shell_integration;
-mod sidebar;
-mod status_bar;
-mod tabs;
-mod terminal_view;
-mod text_input;
-mod theme;
-mod tooltip;
-mod workspace;
 
 use gpui::{
     App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
@@ -44,7 +8,8 @@ use gpui::{
 };
 use gpui_platform::application;
 
-use crate::{
+use latch_ui::{
+    APP_NAME,
     app_menus::{DecreaseFontSize, Hide, HideOthers, IncreaseFontSize, Minimize, ResetFontSize},
     assets::Assets,
     settings::SettingsStore,
@@ -57,7 +22,6 @@ use crate::{
 
 /// Bundle identifier, matching the app bundle built by script/bundle-mac.
 const APP_IDENTIFIER: &str = "me.egrati.terminal";
-const APP_NAME: &str = "Latch";
 
 fn main() {
     if std::env::args_os()
@@ -82,13 +46,13 @@ fn main() {
 
     application().with_assets(Assets).run(|cx: &mut App| {
         cx.set_app_identity(APP_IDENTIFIER, APP_NAME);
-        assets::load_fonts(cx);
+        latch_ui::assets::load_fonts(cx);
         SettingsStore::init(cx);
-        theme::init(cx);
-        shell_integration::ShellIntegration::init(cx);
+        latch_ui::theme::init(cx);
+        latch_ui::terminal_view::shell_integration::ShellIntegration::init(cx);
         bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        app_menus::init(cx);
+        latch_ui::app_menus::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -130,8 +94,8 @@ fn main() {
             workspace
         });
         if let Ok(workspace) = workspace {
-            notifications::init(handle.into(), workspace.downgrade(), cx);
-            control::start(handle, cx);
+            latch_ui::workspace::notifications::init(handle.into(), workspace.downgrade(), cx);
+            latch_ui::control::start(handle, cx);
         }
         cx.activate(true);
     });
@@ -172,10 +136,10 @@ fn bind_keys(cx: &mut App) {
             Some("Workspace"),
         ));
     }
-    bindings.extend(text_input::key_bindings());
-    bindings.extend(command_editor::key_bindings());
-    bindings.extend(command_palette::key_bindings());
-    bindings.extend(pane_group::key_bindings());
-    bindings.extend(terminal_view::key_bindings());
+    bindings.extend(latch_ui::components::text_input::key_bindings());
+    bindings.extend(latch_ui::command_editor::key_bindings());
+    bindings.extend(latch_ui::workspace::command_palette::key_bindings());
+    bindings.extend(latch_ui::workspace::pane_group::key_bindings());
+    bindings.extend(latch_ui::terminal_view::key_bindings());
     cx.bind_keys(bindings);
 }

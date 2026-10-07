@@ -3,7 +3,7 @@
 
 use gpui::{AnyWindowHandle, App, Global, SystemNotification, WeakEntity};
 
-use crate::{tabs::TabId, workspace::Workspace};
+use crate::{workspace::Workspace, workspace::tabs::TabId};
 
 const TAG_PREFIX: &str = "tab-";
 

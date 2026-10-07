@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::tabs::{TabColor, TabIcon};
+use crate::workspace::tabs::{TabColor, TabIcon};
 
 /// A way to start an agent in a new tab, as listed in the `+` menu.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

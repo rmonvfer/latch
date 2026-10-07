@@ -6,13 +6,13 @@ use gpui::{App, Menu, MenuItem, OsAction, PromptLevel, SystemMenuType, Window, a
 
 use crate::{
     APP_NAME,
-    pane_group::{
+    settings::{Settings, SettingsStore},
+    terminal_view::{ClearScrollback, Copy, Find, Paste, SearchNext, SearchPrevious, SelectAll},
+    workspace::pane_group::{
         ClosePane, EqualizePanes, FocusDown, FocusLeft, FocusRight, FocusUp, SplitDown, SplitRight,
         ToggleZoom,
     },
-    settings::{Settings, SettingsStore},
-    sidebar::TabDensity,
-    terminal_view::{ClearScrollback, Copy, Find, Paste, SearchNext, SearchPrevious, SelectAll},
+    workspace::sidebar::TabDensity,
     workspace::{
         ActivateTab, CloseTab, CloseWindow, NewAgent, NewTab, NextAttention, NextTab, OpenSettings,
         PreviousTab, Quit, RenameTab, StopTab, ToggleCommandPalette, ToggleSidebar,

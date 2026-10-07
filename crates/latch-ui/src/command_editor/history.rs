@@ -54,7 +54,7 @@ impl History {
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 

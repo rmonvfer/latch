@@ -16,15 +16,19 @@ use latch_core::{
 };
 
 use crate::{
-    components::{button, icon},
-    session,
+    components::{
+        button, icon,
+        text_input::{TextInput, TextInputEvent},
+    },
     settings::{
         FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, Settings, SettingsStore, TERMINAL_PADDING_RANGE,
     },
-    sidebar::TabDensity,
-    status_bar::{Side, StatusItem},
-    text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Appearance, Theme, ThemeRegistry, ThemeSource},
+    workspace::{
+        session,
+        sidebar::TabDensity,
+        status_bar::{Side, StatusItem},
+    },
 };
 
 const NAV_WIDTH: f32 = 208.;

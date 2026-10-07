@@ -2977,31 +2977,21 @@ name = "latch"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "async-channel",
- "chrono",
  "clap",
  "env_logger",
- "git2",
  "gpui",
  "gpui_platform",
  "latch-core",
- "latch-platform",
  "latch-runtime",
- "libc",
- "libghostty-vt",
+ "latch-ui",
  "log",
- "portable-pty",
- "regex",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "tokio",
- "tracing",
  "tracing-chrome",
  "tracing-subscriber",
- "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]
@@ -3043,6 +3033,28 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "unicode-width",
+]
+
+[[package]]
+name = "latch-ui"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "chrono",
+ "gpui",
+ "latch-core",
+ "latch-platform",
+ "latch-runtime",
+ "libghostty-vt",
+ "log",
+ "portable-pty",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

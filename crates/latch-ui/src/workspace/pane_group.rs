@@ -14,12 +14,14 @@ use latch_core::agents::resume::AgentSession;
 
 use crate::{
     components::{DragPreview, icon_button},
-    pane_tree::{Axis, PaneNode, PaneTree, Split},
-    sidebar::DraggedTab,
-    tabs::TabId,
     terminal_view::{Attention, TabMetadata, TerminalEvent, TerminalView},
     theme::ActiveThemeExt,
-    workspace::CloseTab,
+    workspace::{
+        CloseTab,
+        pane_tree::{Axis, PaneNode, PaneTree, Split},
+        sidebar::DraggedTab,
+        tabs::TabId,
+    },
 };
 
 actions!(

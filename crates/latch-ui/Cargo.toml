@@ -1,0 +1,27 @@
+[package]
+name = "latch-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+gpui.workspace = true
+latch-core.workspace = true
+latch-platform.workspace = true
+latch-runtime.workspace = true
+libghostty-vt.workspace = true
+log.workspace = true
+portable-pty.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+latch-core = { workspace = true, features = ["test-support"] }
+latch-runtime = { workspace = true, features = ["test-support"] }

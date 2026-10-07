@@ -19,8 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use latch_core::paths::PROGRAM_NAME;
-
-use crate::control::{ControlClient, NewTab, PaneTarget, Request, SplitDirection};
+use latch_ui::control::{ControlClient, NewTab, PaneTarget, Request, SplitDirection};
 
 const INSTRUCTIONS: &str = "Controls the terminal app the user is running. Tabs and panes \
 have numeric ids from list_tabs. Pane-targeted tools take either a pane id or a tab id \

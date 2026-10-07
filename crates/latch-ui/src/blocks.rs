@@ -1,6 +1,10 @@
 //! A view's copy of its session's command blocks: what the runtime reports
 //! about each block, with its rows decoded for painting.
 
+pub mod filter;
+pub mod selection;
+pub mod view;
+
 use std::{
     rc::Rc,
     time::{Duration, Instant},

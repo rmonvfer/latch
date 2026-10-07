@@ -1,3 +1,12 @@
+pub mod command_palette;
+pub mod notifications;
+pub mod pane_group;
+pub mod pane_tree;
+pub mod session;
+pub mod sidebar;
+pub mod status_bar;
+pub mod tabs;
+
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -18,24 +27,28 @@ use latch_core::{
 use latch_runtime::protocol::SessionInfo;
 
 use crate::{
-    agent_profiles::AgentProfile,
-    command_palette::{
-        self, CommandPalette, CommandPaletteEvent, PaletteItem, PaletteTarget, Section,
+    components::{
+        self,
+        confirm::confirm_close,
+        icon, icon_button, keybinding,
+        text_input::{TextInput, TextInputEvent},
     },
-    components::{self, icon, icon_button, keybinding},
-    confirm::confirm_close,
-    notifications,
-    pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
-    pane_tree::PaneNode,
-    session::{self, EntryState, GroupState, SessionState, TabKind, TabState},
-    settings::SettingsStore,
-    settings_page::SettingsPage,
-    sidebar::{SidebarDrop, sidebar_child_index},
-    status_bar::{StatusItem, format_duration},
-    tabs::{Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout, TabStyle},
+    settings::{SettingsStore, agent_profiles::AgentProfile, page::SettingsPage},
     terminal_view::{AgentState, Attention, TabMetadata, TerminalView},
-    text_input::{TextInput, TextInputEvent},
     theme::{self, ActiveTheme, ActiveThemeExt, Theme},
+    workspace::{
+        command_palette::{
+            CommandPalette, CommandPaletteEvent, PaletteItem, PaletteTarget, Section,
+        },
+        pane_group::{Detached, DraggedPane, Edge, PaneGroup, PaneGroupEvent},
+        pane_tree::PaneNode,
+        session::{EntryState, GroupState, SessionState, TabKind, TabState},
+        sidebar::{SidebarDrop, sidebar_child_index},
+        status_bar::{StatusItem, format_duration},
+        tabs::{
+            Entry, GroupId, Row, TabColor, TabDestination, TabIcon, TabId, TabLayout, TabStyle,
+        },
+    },
 };
 
 actions!(

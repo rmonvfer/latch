@@ -50,12 +50,14 @@ use latch_platform::{
 };
 
 use crate::{
-    agent_badge, notifications,
-    pane_tree::Axis,
+    components::agent_badge,
     settings::SettingsStore,
-    tabs::{TabDestination, TabId, TabStyle},
     terminal_view::TerminalView,
-    workspace::Workspace,
+    workspace::{
+        Workspace, notifications,
+        pane_tree::Axis,
+        tabs::{TabDestination, TabId, TabStyle},
+    },
 };
 
 /// Environment variable holding the socket path for programs in a pane.

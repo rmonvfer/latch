@@ -5,11 +5,11 @@ use gpui::{AnyElement, ClickEvent, Context, SharedString, div, prelude::*, px};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent_badge,
+    components::agent_badge,
     components::{icon, status_divider, status_item},
     settings::SettingsStore,
-    sidebar,
     theme::{self, Theme},
+    workspace::sidebar,
     workspace::{OpenSettings, ToggleSidebar, Workspace},
 };
 

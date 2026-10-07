@@ -10,10 +10,10 @@ use gpui::{
 };
 
 use crate::{
-    completion::CompletionMenu,
+    command_editor::completion::CompletionMenu,
+    command_editor::history::{self, History},
     components::{elevated_shadow, icon},
     grid::CellMetrics,
-    history::{self, History},
     theme::{self, Theme},
 };
 

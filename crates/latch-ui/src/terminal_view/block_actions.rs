@@ -100,7 +100,7 @@ impl TerminalView {
             BlockAction::Rerun => self.run_command(&command, cx),
             BlockAction::ScrollToTop => {
                 let top = targets.first().copied().unwrap_or(index);
-                self.block_list.scroll_to(block_view::block_start(top));
+                self.block_list.scroll_to(view::block_start(top));
             }
             BlockAction::ScrollToBottom => {
                 self.scroll_to_block_bottom(targets.last().copied().unwrap_or(index));
@@ -271,7 +271,7 @@ impl TerminalView {
                 bounds.top() >= viewport.top() && bounds.top() < viewport.bottom()
             });
         if !top_visible {
-            self.block_list.scroll_to(block_view::block_start(index));
+            self.block_list.scroll_to(view::block_start(index));
         }
     }
 
@@ -409,7 +409,7 @@ impl TerminalView {
         };
         if let Some(index) = next {
             self.selected_blocks.select(index);
-            self.block_list.scroll_to(block_view::block_start(index));
+            self.block_list.scroll_to(view::block_start(index));
             cx.notify();
         }
     }
@@ -550,13 +550,13 @@ impl TerminalView {
             for (row, text) in self.block_row_texts(index, cx).iter().enumerate() {
                 let lower = text.to_lowercase();
                 for (start, found) in lower.match_indices(&query) {
-                    let start_col = editor_buffer::columns(&lower[..start]);
+                    let start_col = buffer::columns(&lower[..start]);
                     matches.push((
                         index,
                         RowMatch {
                             row,
                             start: start_col,
-                            end: start_col + editor_buffer::columns(found),
+                            end: start_col + buffer::columns(found),
                             current: false,
                         },
                     ));
@@ -588,7 +588,7 @@ impl TerminalView {
             .and_then(|blocks| blocks.blocks().get(index))
             .is_some_and(|block| !block.command.is_empty());
         let top = if has_header {
-            block_view::output_top(metrics)
+            view::output_top(metrics)
         } else {
             metrics.height * 0.5
         };

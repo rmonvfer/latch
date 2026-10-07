@@ -22,13 +22,10 @@ use latch_core::{git::DiffStats, paths::shorten_home};
 use latch_runtime::protocol::BlockContext;
 
 use crate::{
-    blocks::{Block, BlockPoint, BlockSelection, Rows},
-    components::icon,
+    blocks::{Block, BlockPoint, BlockSelection, Rows, selection::SelectionBorder},
+    components::{icon, text_input::TextInput, tooltip::text_tooltip},
     grid::{CellMetrics, Frame, paint_rows},
-    selected_blocks::SelectionBorder,
-    text_input::TextInput,
     theme::{self, Theme},
-    tooltip::text_tooltip,
 };
 
 /// Space between a block's content and the pane's sides, on top of the

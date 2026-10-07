@@ -1,3 +1,6 @@
+pub mod agent_profiles;
+pub mod page;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -11,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use latch_core::paths;
 
 use crate::{
-    agent_profiles::{self, AgentProfile},
-    sidebar::SidebarSettings,
-    status_bar::StatusBarSettings,
+    settings::agent_profiles::AgentProfile,
+    workspace::{sidebar::SidebarSettings, status_bar::StatusBarSettings},
 };
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(1);

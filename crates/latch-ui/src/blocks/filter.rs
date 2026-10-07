@@ -4,7 +4,7 @@
 
 use regex::{Regex, RegexBuilder};
 
-use crate::{block_view::RowMatch, editor_buffer};
+use crate::{blocks::view::RowMatch, command_editor::buffer};
 
 /// Most lines of context kept around a match.
 pub const MAX_CONTEXT: usize = 99;
@@ -101,11 +101,11 @@ pub fn filter(texts: &[String], options: &FilterOptions) -> Filtered {
                 .matches
                 .extend(found[row].iter().filter(|(start, end)| end > start).map(
                     |&(start, end)| {
-                        let start_col = editor_buffer::columns(&text[..start]);
+                        let start_col = buffer::columns(&text[..start]);
                         RowMatch {
                             row: position,
                             start: start_col,
-                            end: start_col + editor_buffer::columns(&text[start..end]),
+                            end: start_col + buffer::columns(&text[start..end]),
                             current: false,
                         }
                     },
