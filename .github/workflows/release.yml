@@ -1,0 +1,135 @@
+name: macOS release
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test release planning
+        run: python3 script/test-release-plan.py
+      - id: release
+        name: Select release channel and tag
+        env:
+          BRANCH: ${{ github.base_ref || github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          EVENT: ${{ github.event_name }}
+        run: script/release-plan "$BRANCH" "$RUN_NUMBER" "$EVENT" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            architecture: arm64
+          - runner: macos-26-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_TERM_COLOR: always
+      LATCH_BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          brew install zig@0.15
+          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
+          xcodebuild -downloadComponent MetalToolchain
+          rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: macos-${{ matrix.architecture }}
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --bin terminal
+      - name: Build and package
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: script/package-mac "$RELEASE_TAG"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-${{ matrix.architecture }}
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      RELEASE_COMMIT: ${{ github.sha }}
+      RELEASE_BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: macos-*
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check ./*.sha256
+      - name: Publish GitHub release
+        run: |
+          if gh release list --limit 1000 --json tagName,isDraft --jq \
+            '.[] | select(.tagName == env.RELEASE_TAG and .isDraft == false) | .tagName' \
+            | grep -Fxq "$RELEASE_TAG"; then
+            echo "$RELEASE_TAG is already published."
+            exit 0
+          fi
+          flags=(--latest)
+          create_flags=()
+          title="Latch $RELEASE_TAG"
+          if [[ "$RELEASE_BRANCH" == dev ]]; then
+            flags=(--prerelease --latest=false)
+            create_flags=(--prerelease)
+            title="Latch $RELEASE_TAG (Beta)"
+          fi
+          cat > notes.md <<'NOTES'
+          Download the ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`), unzip it, and move `Terminal.app` to Applications. The app displays as Latch. Keep it at that location across upgrades so the session runtime can reconnect.
+
+          Builds are ad-hoc signed, without Apple notarization. macOS may require approval under System Settings > Privacy & Security on first launch.
+
+          Each ZIP has a SHA-256 checksum. The app bundle includes the application and theme licenses.
+          NOTES
+          drafts=$(gh release list --limit 1000 --json tagName,isDraft --jq \
+            '.[] | select(.tagName == env.RELEASE_TAG and .isDraft == true) | .tagName')
+          if [[ "$drafts" != "$RELEASE_TAG" ]]; then
+            gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" \
+              --title "$title" --draft --generate-notes --notes-file notes.md "${create_flags[@]}"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false "${flags[@]}"

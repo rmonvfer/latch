@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Print GitHub Actions outputs for a branch release without changing tags.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+branch=${1:?usage: script/release-plan branch run-number event}
+run_number=${2:?run number is required}
+event=${3:?event is required}
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "$run_number" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Releases require a numeric Cargo version and a positive run number" >&2
+  exit 1
+fi
+
+case "$branch" in
+  dev) tag="v$version-beta.$run_number" ;;
+  main) tag="v$version" ;;
+  *) echo "Releases are only supported on dev and main" >&2; exit 1 ;;
+esac
+
+publish=true
+if [[ "$event" == pull_request ]]; then
+  publish=false
+elif git show-ref --verify --quiet "refs/tags/$tag"; then
+  if [[ "$(git rev-list -n 1 "$tag")" != "$(git rev-parse HEAD)" ]]; then
+    if [[ "$branch" == main ]]; then
+      echo "$tag already names another commit; bump Cargo.toml before the next production release." >&2
+      publish=false
+    else
+      echo "Beta tag $tag already names another commit" >&2
+      exit 1
+    fi
+  fi
+fi
+
+printf 'version=%s\ntag=%s\npublish=%s\n' "$version" "$tag" "$publish"

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Package the signed bundle with its resource forks and a SHA-256 checksum.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+tag=${1:?usage: script/package-mac release-tag}
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
+  echo "Expected a version tag such as v0.1.0 or v0.1.0-beta.1" >&2
+  exit 1
+fi
+
+script/bundle-mac
+bundle=target/release/Terminal.app
+plutil -lint "$bundle/Contents/Info.plist"
+codesign --verify --deep --strict "$bundle"
+architecture=$(uname -m)
+case "$architecture" in
+  arm64|x86_64) ;;
+  *) echo "Unsupported macOS architecture: $architecture" >&2; exit 1 ;;
+esac
+actual_architecture=$(lipo -archs "$bundle/Contents/MacOS/terminal")
+if [[ "$actual_architecture" != "$architecture" ]]; then
+  echo "Bundle architecture $actual_architecture does not match $architecture" >&2
+  exit 1
+fi
+
+mkdir -p target/dist
+archive="Latch-$tag-macos-$architecture.zip"
+ditto -c -k --sequesterRsrc --keepParent "$bundle" "target/dist/$archive"
+(cd target/dist && shasum -a 256 "$archive" > "$archive.sha256")
+echo "target/dist/$archive"

@@ -4,7 +4,7 @@
 <h1 align="center">Latch</h1>
 <p align="center">A native macOS terminal with persistent sessions, command blocks, and coding agents.</p>
 <p align="center">
-  <a href="#building">Build</a> · <a href="#sessions">Sessions</a> · <a href="#driving-it-from-outside">CLI &amp; MCP</a>
+  <a href="https://github.com/rmonvfer/terminal/releases/latest">Download</a> · <a href="#building">Build</a> · <a href="#sessions">Sessions</a> · <a href="#driving-it-from-outside">CLI &amp; MCP</a>
 </p>
 
 ![Latch with grouped tabs, git context, and a split workspace](docs/images/workspace.png)
@@ -12,6 +12,12 @@
 A macOS terminal built on [GPUI](https://github.com/zed-industries/zed) (Zed's UI framework) and [libghostty-vt](https://github.com/uzaaft/libghostty-rs) (Ghostty's terminal emulation, as a library). Ghostty parses the bytes and GPUI draws the grid. Everything around those two parts is written here: tabs, a block view of commands, an input editor, and sessions that keep running when the window closes.
 
 It's early and macOS only.
+
+## Installing
+
+[Production releases](https://github.com/rmonvfer/terminal/releases/latest) include macOS ZIPs for Apple Silicon (`arm64`) and Intel (`x86_64`), with SHA-256 checksums. Unzip the matching download and move `Terminal.app` to Applications; it displays as Latch. Keep the bundle at the same location across upgrades so its session runtime can reconnect. Builds are ad-hoc signed without Apple notarization; macOS may require approval in System Settings → Privacy & Security on first launch.
+
+[Beta releases](https://github.com/rmonvfer/terminal/releases) are marked as prereleases. They use the same settings and sessions as production, so install one channel at a time.
 
 ## Your workspace
 
@@ -90,6 +96,12 @@ PATH="$(brew --prefix zig@0.15)/bin:$PATH" cargo build
 `.cargo/config.toml` builds Ghostty's Zig core with `ReleaseFast` even in dev builds. In Debug mode, parsing terminal output is dozens of times slower.
 
 Notifications only show up when the app runs from a bundle. `script/bundle-mac` builds `target/release/Terminal.app`, or a debug bundle with `--debug`. The app displays as Latch; its bundle location stays stable because the session runtime authenticates connections by executable path.
+
+## Releases
+
+The [macOS release workflow](.github/workflows/release.yml) checks formatting, runs Clippy and tests, then builds native Apple Silicon and Intel bundles. A push to `dev` publishes a beta prerelease tagged `v<VERSION>-beta.<RUN_NUMBER>`. A push to `main` publishes `v<VERSION>` as the latest production release, where `VERSION` is the package version in `Cargo.toml`. Published versions are never moved to another commit; bump the version in both `Cargo.toml` and `Cargo.lock` for the next production release. Pull requests run the same checks and packaging without publishing.
+
+Develop on `dev` and merge it into `main` to promote a version. The workflow creates tags at the built commit, uploads both ZIPs and their checksums to a draft release, and publishes only after both architecture builds succeed. Manual runs on either branch can retry a release; beta run numbers distinguish builds. Apple Developer ID signing and notarization are not configured.
 
 ## Profiling
 

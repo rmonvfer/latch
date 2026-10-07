@@ -15,16 +15,23 @@ if [[ "${1:-}" == "--debug" ]]; then
   cargo_flags=()
 fi
 
-cargo build "${cargo_flags[@]+"${cargo_flags[@]}"}"
+cargo build --locked "${cargo_flags[@]+"${cargo_flags[@]}"}"
 
 name="Latch"
 identifier="me.egrati.terminal"
 executable="terminal"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+build_number=${LATCH_BUILD_NUMBER:-$version}
+if [[ ! "$build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+  echo "LATCH_BUILD_NUMBER must contain one to three numeric components" >&2
+  exit 1
+fi
 # The runtime authenticates peers by executable path, so the bundle location is stable.
 bundle="target/$profile/Terminal.app"
 
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+cp LICENSE "$bundle/Contents/Resources/LICENSE"
+cp assets/themes/LICENSES "$bundle/Contents/Resources/THEME-LICENSES"
 cp "target/$profile/$executable" "$bundle/Contents/MacOS/$executable.tmp"
 mv "$bundle/Contents/MacOS/$executable.tmp" "$bundle/Contents/MacOS/$executable"
 xcrun actool assets/app-icon/Latch.icon \
@@ -49,7 +56,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
   <key>CFBundleIconName</key><string>Latch</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
-  <key>CFBundleVersion</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$build_number</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
