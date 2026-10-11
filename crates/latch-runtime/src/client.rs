@@ -299,13 +299,11 @@ fn client_loop<Row>(
                     // background.
                     let blocks = snapshot.blocks.clone();
                     let painting = (snapshot.dimensions.cols, snapshot.background);
-                    if events
-                        .try_send(ClientEvent::Frame(Box::new(snapshot)))
-                        .is_ok()
-                    {
-                        revision = Some(next_revision);
-                        reported_error = None;
+                    if !deliver(events, ClientEvent::Frame(Box::new(snapshot)), stopped) {
+                        return;
                     }
+                    revision = Some(next_revision);
+                    reported_error = None;
                     if let Some(blocks) = &blocks
                         && !fetch_block_updates(
                             client,
@@ -436,4 +434,143 @@ fn fetch_block_updates<Row>(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use latch_core::shell::integration;
+
+    use crate::{
+        protocol::Response,
+        tests::{TestRuntime, launch},
+    };
+
+    fn text_rows(rows: &[String], _: u16, _: [u8; 3]) -> Result<Vec<String>> {
+        Ok(rows.to_vec())
+    }
+
+    #[test]
+    fn backpressured_frames_arrive_before_their_block_history() {
+        let runtime = TestRuntime::start();
+        let directory = runtime.paths.directory.join("integration");
+        integration::install(&directory).unwrap();
+        let mut launch = launch("");
+        launch.argv = vec!["/bin/zsh".into(), "-l".into()];
+        launch.env.insert(
+            "HOME".into(),
+            runtime.paths.directory.to_string_lossy().into_owned(),
+        );
+        launch.env.insert("PATH".into(), "/usr/bin:/bin".into());
+        launch.env.insert(
+            "ZDOTDIR".into(),
+            directory.join("zsh").to_string_lossy().into_owned(),
+        );
+        launch.env.insert(
+            "TERMINAL_SHELL_INTEGRATION_DIR".into(),
+            directory.to_string_lossy().into_owned(),
+        );
+        launch.command_blocks = true;
+        launch.startup = Some("printf 'PRESERVED-BLOCK-HISTORY\\n'".into());
+        let session = launch.id;
+        assert!(matches!(
+            runtime.rpc().request(Request::Create(launch)).unwrap(),
+            Response::Created(_)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let Response::Snapshot(frame) = runtime
+                .rpc()
+                .request(Request::Poll {
+                    session,
+                    revision: None,
+                })
+                .unwrap()
+            else {
+                panic!("expected a session snapshot");
+            };
+            if frame.blocks.is_some_and(|blocks| {
+                blocks
+                    .items
+                    .iter()
+                    .any(|item| !item.running && item.rows > 0)
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "command history was not captured"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let (operations, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (events, output) = async_channel::bounded(2);
+        for _ in 0..2 {
+            events
+                .try_send(ClientEvent::Error("queued event".into()))
+                .unwrap();
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&stopped);
+        let paths = runtime.paths.clone();
+        let connection = thread::spawn(move || {
+            client_loop(
+                session,
+                &paths,
+                text_rows,
+                receiver,
+                &AtomicUsize::new(0),
+                &events,
+                &cancellation,
+                &AtomicBool::new(false),
+            );
+        });
+        // Keep the consumer busy while the first snapshot meets a full queue.
+        thread::sleep(Duration::from_millis(100));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut announced = HashMap::new();
+        let mut recovered = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while Instant::now() < deadline {
+                match output.try_recv() {
+                    Ok(ClientEvent::Frame(frame)) => {
+                        if let Some(blocks) = frame.blocks {
+                            announced = blocks
+                                .items
+                                .iter()
+                                .map(|item| (item.id, item.version))
+                                .collect();
+                        }
+                    }
+                    Ok(ClientEvent::BlockRows {
+                        block,
+                        version,
+                        rows,
+                        ..
+                    }) => {
+                        assert_eq!(announced.get(&block), Some(&version));
+                        recovered |= rows.join("").contains("PRESERVED-BLOCK-HISTORY");
+                        if recovered {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(async_channel::TryRecvError::Empty) => {
+                        thread::sleep(Duration::from_millis(4));
+                    }
+                    Err(async_channel::TryRecvError::Closed) => break,
+                }
+            }
+            assert!(recovered, "block history was not delivered to the view");
+        }));
+        stopped.store(true, Ordering::Release);
+        drop(output);
+        drop(operations);
+        connection.join().unwrap();
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
 }

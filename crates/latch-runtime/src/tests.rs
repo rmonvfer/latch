@@ -42,13 +42,13 @@ fn text_rows(rows: &[String], _columns: u16, _background: [u8; 3]) -> Result<Vec
 const TEST_DIRECTORY: &str = "TERMINAL_RUNTIME_TEST_DIRECTORY";
 const TEST_SESSION: &str = "TERMINAL_RUNTIME_TEST_SESSION";
 
-struct TestRuntime {
-    paths: Paths,
+pub(crate) struct TestRuntime {
+    pub(crate) paths: Paths,
     child: Child,
 }
 
 impl TestRuntime {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         Self::start_with_file_limit(None)
     }
 
@@ -106,7 +106,7 @@ impl TestRuntime {
         }
     }
 
-    fn rpc(&self) -> Rpc {
+    pub(crate) fn rpc(&self) -> Rpc {
         Rpc::connect(&self.paths).unwrap()
     }
 
@@ -164,7 +164,7 @@ fn temporary_paths() -> Paths {
     }
 }
 
-fn launch(command: &str) -> Launch {
+pub(crate) fn launch(command: &str) -> Launch {
     Launch {
         id: new_session_id().unwrap(),
         argv: vec!["/bin/sh".into(), "-c".into(), command.into()],
@@ -590,6 +590,54 @@ fn detached_runtime_preserves_process_output_input_and_exit_status() {
         Response::Done
     ));
     assert!(runtime.list().is_empty());
+}
+
+#[test]
+fn reattached_client_restores_live_program_screen_and_shell_state() {
+    let runtime = TestRuntime::start();
+    let info = runtime.create(
+        "stty -echo; state=retained; printf 'PRIMARY-HISTORY\\r\\n'; IFS= read -r first; printf '\\033[?1049h\\033[2J\\033[HLIVE-PROGRAM'; IFS= read -r second; printf '\\033[?1049lSTATE:%s INPUT:%s\\r\\n' \"$state\" \"$second\"; IFS= read -r last",
+    );
+    let pid = info.shell_pid;
+    let (view, frames) =
+        SessionClient::attach_at(info.id, runtime.paths.clone(), text_rows).unwrap();
+    wait_until(
+        || matches!(frames.try_recv(), Ok(ClientEvent::Frame(frame)) if frame.rows.join("").contains("PRIMARY-HISTORY")),
+    );
+    drop(view);
+    drop(frames);
+    runtime
+        .rpc()
+        .request(Request::Operate {
+            session: info.id,
+            operation: Operation::Input {
+                bytes: b"continue\n".to_vec(),
+            },
+        })
+        .unwrap();
+    wait_until(|| {
+        read_session_at(&runtime.paths, info.id, 100)
+            .unwrap()
+            .contains("LIVE-PROGRAM")
+    });
+    let (view, frames) =
+        SessionClient::attach_at(info.id, runtime.paths.clone(), text_rows).unwrap();
+    wait_until(
+        || matches!(frames.try_recv(), Ok(ClientEvent::Frame(frame)) if frame.info.shell_pid == pid && frame.rows.join("").contains("LIVE-PROGRAM")),
+    );
+    view.send(Operation::Input {
+        bytes: b"reattached\n".to_vec(),
+    })
+    .unwrap();
+    wait_until(|| {
+        matches!(frames.try_recv(), Ok(ClientEvent::Frame(frame)) if {
+            let text = frame.rows.join("");
+            frame.info.shell_pid == pid
+                && text.contains("PRIMARY-HISTORY")
+                && text.contains("STATE:retained INPUT:reattached")
+                && !text.contains("LIVE-PROGRAM")
+        })
+    });
 }
 
 #[test]
