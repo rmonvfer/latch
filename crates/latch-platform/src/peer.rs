@@ -217,8 +217,17 @@ mod signing {
             }
             let info = Owned(info);
             let flags = CFDictionaryGetValue(info.0, kSecCodeInfoFlags);
+            if flags.is_null() {
+                // Unsigned executables have no signing flags. Only the explicit
+                // unsigned status permits development path authentication.
+                return if SecCodeCheckValidity(code.0, 0, ptr::null()) == -67062 {
+                    Identity::Development
+                } else {
+                    Identity::Untrusted
+                };
+            }
             let mut value = 0i32;
-            if flags.is_null() || !CFNumberGetValue(flags, 3, (&mut value as *mut i32).cast()) {
+            if !CFNumberGetValue(flags, 3, (&mut value as *mut i32).cast()) {
                 return Identity::Untrusted;
             }
             if value & 2 != 0 {
@@ -286,21 +295,23 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("latch-signed-peer-{}", std::process::id()));
         fs::create_dir(&directory).unwrap();
-        for (index, signer, identifier, expected) in [
+        let variants = [
             (0, identity.as_str(), "me.egrati.terminal", true),
             (1, identity.as_str(), "me.egrati.other", false),
             (2, "-", "me.egrati.terminal", false),
-        ] {
+        ];
+        // Intel permits unsigned executables; Apple silicon requires a signature.
+        let unsigned = cfg!(target_arch = "x86_64").then_some((3, "", "me.egrati.terminal", false));
+        for (index, signer, identifier, expected) in variants.into_iter().chain(unsigned) {
             let executable = directory.join(format!("peer-{index}"));
             fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-            assert!(
-                Command::new("/usr/bin/codesign")
-                    .args(["--force", "--sign", signer, "--identifier", identifier])
-                    .arg(&executable)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            let mut signing = Command::new("/usr/bin/codesign");
+            if signer.is_empty() {
+                signing.arg("--remove-signature");
+            } else {
+                signing.args(["--force", "--sign", signer, "--identifier", identifier]);
+            }
+            assert!(signing.arg(&executable).status().unwrap().success());
             let socket = directory.join(format!("socket-{index}"));
             let mut child = Command::new(&executable)
                 .args([
@@ -328,7 +339,7 @@ mod tests {
                 own_identity[0],
                 if expected {
                     1
-                } else if signer == "-" {
+                } else if signer == "-" || signer.is_empty() {
                     2
                 } else {
                     3
