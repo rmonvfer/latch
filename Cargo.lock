@@ -2974,7 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "latch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2982,6 +2982,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "latch-core",
+ "latch-platform",
  "latch-runtime",
  "latch-ui",
  "log",
@@ -2996,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "latch-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "git2",
@@ -3009,10 +3010,11 @@ dependencies = [
 
 [[package]]
 name = "latch-platform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
+ "cc",
  "libc",
  "log",
  "portable-pty",
@@ -3020,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "latch-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3038,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "latch-ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",

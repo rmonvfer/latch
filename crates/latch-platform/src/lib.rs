@@ -4,3 +4,4 @@
 pub mod peer;
 pub mod process;
 pub mod pty;
+pub mod updater;

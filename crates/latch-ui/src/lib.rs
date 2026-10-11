@@ -13,6 +13,7 @@ pub mod links;
 pub mod settings;
 pub mod terminal_view;
 pub mod theme;
+pub mod updater;
 pub mod workspace;
 
 /// The app's name as people see it, in menus and window titles.

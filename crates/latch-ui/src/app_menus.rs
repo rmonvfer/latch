@@ -23,6 +23,7 @@ actions!(
     app,
     [
         About,
+        CheckForUpdates,
         Hide,
         HideOthers,
         ShowAll,
@@ -44,6 +45,21 @@ const FONT_SIZE_STEP: f32 = 1.;
 /// Install the menu bar and the handlers for its app-wide actions. Call
 /// after key bindings are registered so menu items show their shortcuts.
 pub fn init(cx: &mut App) {
+    cx.on_action(|_: &CheckForUpdates, cx| {
+        if crate::updater::available(cx) {
+            crate::updater::check(cx);
+        } else {
+            with_active_window(cx, |window, cx| {
+                let _acknowledged = window.prompt(
+                    PromptLevel::Info,
+                    "Software Updates",
+                    Some(crate::updater::status(cx)),
+                    &["OK"],
+                    cx,
+                );
+            });
+        }
+    });
     cx.on_action(|_: &About, cx| {
         with_active_window(cx, |window, cx| {
             let detail = format!("Version {}", env!("CARGO_PKG_VERSION"));
@@ -122,6 +138,7 @@ pub fn app_menus(cx: &App) -> Vec<Menu> {
     vec![
         Menu::new(APP_NAME).items([
             MenuItem::action(format!("About {APP_NAME}"), About),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),

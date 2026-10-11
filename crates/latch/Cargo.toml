@@ -15,6 +15,7 @@ env_logger.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 latch-core.workspace = true
+latch-platform.workspace = true
 latch-runtime.workspace = true
 latch-ui.workspace = true
 log.workspace = true

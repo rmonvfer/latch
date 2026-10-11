@@ -1,6 +1,6 @@
 //! The settings page: the terminal's settings grouped into sections picked
-//! from a left column. Every change applies immediately and is saved to the
-//! settings file.
+//! from a left column. Terminal preferences apply immediately and are saved
+//! to the settings file; software update preferences are managed by Sparkle.
 
 use std::{fs, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
@@ -16,6 +16,7 @@ use latch_core::{
 };
 
 use crate::{
+    APP_NAME,
     components::{
         button, icon,
         text_input::{TextInput, TextInputEvent},
@@ -24,6 +25,7 @@ use crate::{
         FONT_SIZE_RANGE, LINE_HEIGHT_RANGE, Settings, SettingsStore, TERMINAL_PADDING_RANGE,
     },
     theme::{self, ActiveTheme, ActiveThemeExt, Appearance, Theme, ThemeRegistry, ThemeSource},
+    updater,
     workspace::{
         session,
         sidebar::TabDensity,
@@ -87,7 +89,7 @@ impl Section {
             Section::Terminal => "Text, shell integration, and command blocks.",
             Section::StatusBar => "The bar along the bottom of the window and what it shows.",
             Section::Keyboard => "Shortcuts available throughout the app.",
-            Section::About => "Version and the files settings live in.",
+            Section::About => "Version, software updates, and settings files.",
         }
     }
 }
@@ -901,7 +903,7 @@ impl SettingsPage {
                             div()
                                 .text_size(px(18.))
                                 .text_color(theme.text)
-                                .child("Terminal"),
+                                .child(APP_NAME),
                         )
                         .child(
                             div()
@@ -911,6 +913,39 @@ impl SettingsPage {
                         ),
                 )
                 .into_any_element(),
+            group(
+                "Software Updates",
+                vec![
+                    row("Updates", updater::status(cx), theme)
+                        .child(
+                            button(
+                                "check-for-updates",
+                                Some("refresh-cw"),
+                                "Check for Updates…",
+                                theme,
+                            )
+                            .when(!updater::can_check(cx), |button| button.opacity(0.4))
+                            .on_click(|_: &ClickEvent, _, cx| updater::check(cx)),
+                        )
+                        .into_any_element(),
+                    row(
+                        "Check automatically",
+                        "Check for releases periodically. You choose when to install and relaunch.",
+                        theme,
+                    )
+                    .child(self.toggle(
+                        "automatic-update-checks",
+                        updater::automatic_checks(),
+                        updater::available(cx),
+                        theme,
+                        cx,
+                        |enabled, _, _| updater::set_automatic_checks(enabled),
+                    ))
+                    .into_any_element(),
+                ],
+                theme,
+            )
+            .into_any_element(),
             group(
                 "Files",
                 vec![

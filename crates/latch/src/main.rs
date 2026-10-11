@@ -24,6 +24,10 @@ use latch_ui::{
 const APP_IDENTIFIER: &str = "me.egrati.terminal";
 
 fn main() {
+    if std::env::args_os().len() == 1 {
+        // GUI startup has not started threads or read any profile paths yet.
+        unsafe { latch_platform::updater::restore_relaunch_environment() };
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--session-runtime")
@@ -46,6 +50,7 @@ fn main() {
 
     application().with_assets(Assets).run(|cx: &mut App| {
         cx.set_app_identity(APP_IDENTIFIER, APP_NAME);
+        latch_ui::updater::init(cx);
         latch_ui::assets::load_fonts(cx);
         SettingsStore::init(cx);
         latch_ui::theme::init(cx);
