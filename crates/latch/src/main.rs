@@ -1,4 +1,5 @@
 mod cli;
+mod instance;
 mod mcp;
 mod profiling;
 
@@ -46,6 +47,17 @@ fn main() {
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let _instance = match instance::acquire(&latch_core::paths::config_dir()) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            log::warn!("Latch is already running for this profile");
+            return;
+        }
+        Err(error) => {
+            log::error!("cannot open application profile: {error:#}");
+            std::process::exit(1);
+        }
+    };
     profiling::init("app");
 
     application().with_assets(Assets).run(|cx: &mut App| {
