@@ -42,26 +42,31 @@ impl Paths {
         if let Some(parent) = self.directory.parent() {
             fs::create_dir_all(parent).context("failed to create runtime parent directory")?;
         }
-        match fs::DirBuilder::new().mode(0o700).create(&self.directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("failed to create runtime directory"),
-        }
-        let metadata = fs::symlink_metadata(&self.directory)?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "runtime directory must be a real directory"
-        );
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() },
-            "runtime directory belongs to another user"
-        );
-        ensure!(
-            metadata.mode() & 0o777 == 0o700,
-            "runtime directory must have owner-only permissions (0700)"
-        );
-        Ok(())
+        private_directory(&self.directory)
     }
+}
+
+/// Create or validate a real directory owned only by this user.
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("failed to create runtime directory"),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "runtime directory must be a real directory"
+    );
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "runtime directory belongs to another user"
+    );
+    ensure!(
+        metadata.mode() & 0o777 == 0o700,
+        "runtime directory must have owner-only permissions (0700)"
+    );
+    Ok(())
 }
 
 pub(crate) struct FileLock(File);

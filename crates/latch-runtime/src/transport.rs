@@ -2,7 +2,6 @@
 //! connection that authenticates both ends before sending requests.
 
 use std::{
-    fs,
     io::{Read, Write},
     os::unix::net::UnixStream,
     sync::atomic::{AtomicUsize, Ordering},
@@ -12,10 +11,7 @@ use std::{
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
-use latch_platform::{
-    peer::{peer_audit, same_user},
-    process::{self, pid_version},
-};
+use latch_platform::peer::same_user;
 
 use crate::{
     directory::Paths,
@@ -36,24 +32,7 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// program cannot connect, pass the socket on, and then exec this binary to
 /// pass the check.
 pub(crate) fn peer_is_this_program(stream: &UnixStream) -> bool {
-    let Some((pid, version)) = peer_audit(stream) else {
-        return false;
-    };
-    let still_connected_process = || pid_version(pid) == Some(version);
-    if !still_connected_process() {
-        return false;
-    }
-    let Some(peer) = process::executable_path(pid) else {
-        return false;
-    };
-    let (Ok(peer), Ok(own)) = (
-        fs::canonicalize(peer),
-        std::env::current_exe().and_then(fs::canonicalize),
-    ) else {
-        return false;
-    };
-    // Checked again: the path must belong to the process that connected.
-    peer == own && still_connected_process()
+    latch_platform::peer::peer_is_this_program(stream)
 }
 
 pub(crate) struct Rpc {
