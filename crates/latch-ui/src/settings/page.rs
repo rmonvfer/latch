@@ -6,8 +6,8 @@ use std::{fs, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, ClickEvent, Context, Div, Entity, FocusHandle,
-    Focusable, ScrollHandle, SharedString, Stateful, Subscription, Window, div, ease_in_out, point,
-    prelude::*, px, relative,
+    Focusable, ScrollHandle, SharedString, Stateful, Subscription, Window, div, ease_in_out, img,
+    point, prelude::*, px, relative,
 };
 
 use latch_core::{
@@ -883,17 +883,7 @@ impl SettingsPage {
                 .items_center()
                 .gap(px(16.))
                 .p(px(16.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .size(px(48.))
-                        .rounded(theme::RADIUS_LG)
-                        .bg(theme.element_background)
-                        .child(icon("terminal", px(24.), theme.text_muted)),
-                )
+                .child(img("app-icon/latch.png").flex_none().size(px(64.)))
                 .child(
                     div()
                         .flex()

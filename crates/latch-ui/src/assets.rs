@@ -6,7 +6,11 @@ use gpui::{App, AssetSource, SharedString};
 /// Icons and fonts compiled into the binary.
 pub struct Assets;
 
-const ICONS: [(&str, &[u8]); 49] = [
+const ICONS: [(&str, &[u8]); 50] = [
+    (
+        "app-icon/latch.png",
+        include_bytes!("../../../assets/app-icon/latch.png"),
+    ),
     (
         "icons/bookmark-filled.svg",
         include_bytes!("../../../assets/icons/bookmark-filled.svg"),
