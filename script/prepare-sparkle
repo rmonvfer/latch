@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Fetch the pinned macOS updater framework and publishing tools.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+version=2.10.0
+checksum=c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
+directory="target/sparkle/$version"
+archive="target/sparkle/Sparkle-$version.tar.xz"
+mkdir -p target/sparkle
+if [[ ! -f "$archive" ]]; then
+  curl --fail --location --proto '=https' --tlsv1.2 \
+    "https://github.com/sparkle-project/Sparkle/releases/download/$version/Sparkle-$version.tar.xz" \
+    --output "$archive.tmp"
+  mv "$archive.tmp" "$archive"
+fi
+printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 --check >&2
+if [[ ! -d "$directory" ]]; then
+  temporary=$(mktemp -d target/sparkle/extract.XXXXXX)
+  trap 'rm -rf "$temporary"' EXIT
+  tar -xJf "$archive" -C "$temporary"
+  mv "$temporary" "$directory"
+fi
+printf '%s\n' "$directory"

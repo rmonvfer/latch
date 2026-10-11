@@ -51,7 +51,9 @@ class ReleasePlanTests(unittest.TestCase):
 
     def test_beta_and_production_tags(self):
         self.assertEqual(self.plan("dev")["tag"], "v1.2.3-beta.7")
+        self.assertEqual(self.plan("dev")["channel"], "beta")
         self.assertEqual(self.plan()["tag"], "v1.2.3")
+        self.assertEqual(self.plan()["channel"], "production")
         self.assertEqual(self.plan()["publish"], "true")
 
     def test_pull_requests_cannot_publish(self):

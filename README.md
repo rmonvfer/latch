@@ -19,6 +19,8 @@ It's early and macOS only.
 
 [Beta releases](https://github.com/rmonvfer/latch/releases) are marked as prereleases. They use the same settings and sessions as production, so install one channel at a time.
 
+Latch checks for updates automatically and offers a native download and relaunch dialog. Use **Latch → Check for Updates…** to check immediately, or configure automatic checks in **Settings → About**. Production installations follow production releases; beta installations follow beta releases. Update feeds and downloads carry Ed25519 signatures, and installed apps use Developer ID signing. Compatible updates preserve running shells through a versioned session runtime. Update relaunches retain a custom `XDG_CONFIG_HOME` through a one-time handoff scoped to the app's location.
+
 ## Your workspace
 
 Split panes horizontally or vertically, resize them, and zoom into one pane when you need the space. Group and pin tabs in the sidebar, give them names, colors, and icons, and see each shell’s directory, git branch, and changes without switching tabs.
@@ -99,15 +101,21 @@ The code is a Cargo workspace. `latch-platform` holds the system services that d
 
 `.cargo/config.toml` builds Ghostty's Zig core with `ReleaseFast` even in dev builds. In Debug mode, parsing terminal output is dozens of times slower.
 
-Notifications only show up when the app runs from a bundle. `script/bundle-mac` builds `target/release/Latch.app`, or a debug bundle with `--debug`. Keep its bundle location stable because the session runtime authenticates connections by executable path. The script uses the available Developer ID certificate, or an ad-hoc signature when none is installed. Set `LATCH_SIGNING_IDENTITY` to select a certificate, or `-` for ad-hoc signing; `LATCH_SIGNING_KEYCHAIN` selects its keychain.
+Notifications and native updates require an app bundle. `script/bundle-mac` builds `target/release/Latch.app`, or a debug bundle with `--debug`, and embeds the pinned Sparkle framework. The script uses the available Developer ID certificate, or an ad-hoc signature when none is installed. Set `LATCH_SIGNING_IDENTITY` to select a certificate, or `-` for ad-hoc signing; `LATCH_SIGNING_KEYCHAIN` selects its keychain. Signed session runtimes use immutable copies under the private runtime directory so replacing the app does not interrupt compatible sessions. Unbundled development builds use executable-path authentication and disable native updates.
 
-`script/package-mac v0.1.1` builds a release ZIP and checksum. Set `LATCH_NOTARY_PROFILE` to a stored `notarytool` credential profile to submit the app to Apple, staple its accepted ticket, and validate it before packaging. `LATCH_NOTARY_KEYCHAIN` selects the profile's keychain, and `LATCH_REQUIRE_NOTARIZATION=1` requires a profile.
+`script/package-mac v0.1.2` builds a release ZIP and checksum. Set `LATCH_NOTARY_PROFILE` to a stored `notarytool` credential profile to submit the app to Apple, staple its accepted ticket, and validate it before packaging. `LATCH_NOTARY_KEYCHAIN` selects the profile's keychain, and `LATCH_REQUIRE_NOTARIZATION=1` requires a profile. `LATCH_REQUIRE_DEVELOPER_ID=1` requires the distribution identity, hardened runtime, and trusted timestamp for the app and every updater helper.
 
 ## Releases
 
 The [macOS release workflow](.github/workflows/release.yml) checks formatting, runs Clippy and tests, then builds native Apple Silicon and Intel bundles. A push to `dev` publishes a beta prerelease tagged `v<VERSION>-beta.<RUN_NUMBER>`. A push to `main` publishes `v<VERSION>` as the latest production release, where `VERSION` is the workspace package version in the root `Cargo.toml`. Published versions are never moved to another commit; bump that version, and the matching entries in `Cargo.lock`, for the next production release. Pull requests run the same checks and packaging without publishing.
 
 Develop on `dev` and merge it into `main` to promote a version. The workflow creates tags at the built commit, uploads both ZIPs and their checksums to a draft release, and publishes only after both architecture builds succeed. Manual runs on either branch can retry a release; beta run numbers distinguish builds. Publishing requires the Developer ID signing credentials configured in the repository's Actions secrets. Pull requests use ad-hoc signatures.
+
+`SPARKLE_PRIVATE_KEY` is the Actions secret for signing update archives and feeds; its public key is checked in at `assets/updates/public-key.txt`. Publishing requires this secret. The workflow stores signed appcasts alongside their versioned release, then promotes each channel and architecture feed to the `update-feeds` release. Retries use the published archive's matching metadata, and older builds cannot replace newer feeds. Install an update-enabled release manually once; subsequent releases arrive through Sparkle.
+
+Runtimes started by releases without immutable runtime staging need one explicit restart after their sessions finish. Installing an update-enabled release does not terminate those sessions automatically. Updates that change the session protocol also require an explicit runtime restart.
+
+For Apple notarization, configure the Actions secrets `APPLE_NOTARY_KEY` (the App Store Connect API key's PEM contents), `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER_ID`. The workflow stores credentials in its temporary signing keychain, notarizes and staples the bundle before signing the update archive, and removes the credentials afterward. Set the repository variable `LATCH_REQUIRE_NOTARIZATION=1` to prevent publication without a ticket. Developer ID signing and Apple notarization are separate checks; a valid signature alone does not satisfy Gatekeeper's notarization requirement.
 
 ## Profiling
 

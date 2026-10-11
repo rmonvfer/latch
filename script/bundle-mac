@@ -34,22 +34,36 @@ if [[ -z "$signing_identity" ]]; then
 fi
 
 cargo build --locked "${cargo_flags[@]+"${cargo_flags[@]}"}"
+sparkle_directory=$(script/prepare-sparkle)
 
 name="Latch"
 identifier="me.egrati.terminal"
 executable="terminal"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 build_number=${LATCH_BUILD_NUMBER:-$version}
+update_channel=${LATCH_UPDATE_CHANNEL:-production}
+case "$update_channel" in
+  production|beta) ;;
+  *) echo "LATCH_UPDATE_CHANNEL must be production or beta" >&2; exit 1 ;;
+esac
+architecture=$(uname -m)
+case "$architecture" in
+  arm64|x86_64) ;;
+  *) echo "Unsupported macOS architecture: $architecture" >&2; exit 1 ;;
+esac
+update_public_key=$(cat assets/updates/public-key.txt)
 if [[ ! "$build_number" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
   echo "LATCH_BUILD_NUMBER must contain one to three numeric components" >&2
   exit 1
 fi
-# The runtime authenticates peers by executable path, so the bundle location is stable.
+# The runtime authenticates signed peers using the application's Developer ID.
 bundle="target/$profile/Latch.app"
 
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$bundle/Contents/Frameworks"
+ditto "$sparkle_directory/Sparkle.framework" "$bundle/Contents/Frameworks/Sparkle.framework"
 cp LICENSE "$bundle/Contents/Resources/LICENSE"
 cp assets/themes/LICENSES "$bundle/Contents/Resources/THEME-LICENSES"
+cp "$sparkle_directory/LICENSE" "$bundle/Contents/Resources/SPARKLE-LICENSE"
 cp "target/$profile/$executable" "$bundle/Contents/MacOS/$executable.tmp"
 mv "$bundle/Contents/MacOS/$executable.tmp" "$bundle/Contents/MacOS/$executable"
 xcrun actool assets/app-icon/Latch.icon \
@@ -77,6 +91,13 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$build_number</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>LatchUpdateChannel</key><string>$update_channel</string>
+  <key>SUFeedURL</key><string>https://github.com/rmonvfer/latch/releases/download/update-feeds/$update_channel-$architecture.xml</string>
+  <key>SUPublicEDKey</key><string>$update_public_key</string>
+  <key>SURequireSignedFeed</key><true/>
+  <key>SUVerifyUpdateBeforeExtraction</key><true/>
+  <key>SUEnableAutomaticChecks</key><true/>
+  <key>SUAllowsAutomaticUpdates</key><false/>
 </dict>
 </plist>
 PLIST
@@ -86,6 +107,18 @@ signing_options=()
 if [[ "$signing_identity" != "-" ]]; then
   signing_options=(--timestamp --options runtime)
 fi
+framework="$bundle/Contents/Frameworks/Sparkle.framework"
+for component in \
+  "$framework/Versions/B/XPCServices/Downloader.xpc" \
+  "$framework/Versions/B/XPCServices/Installer.xpc" \
+  "$framework/Versions/B/Updater.app" \
+  "$framework/Versions/B/Autoupdate" \
+  "$framework"; do
+  codesign --force --sign "$signing_identity" \
+    --preserve-metadata=entitlements \
+    "${signing_keychain[@]+"${signing_keychain[@]}"}" \
+    "${signing_options[@]+"${signing_options[@]}"}" "$component" >/dev/null
+done
 codesign --force --sign "$signing_identity" \
   "${signing_keychain[@]+"${signing_keychain[@]}"}" \
   "${signing_options[@]+"${signing_options[@]}"}" "$bundle" >/dev/null

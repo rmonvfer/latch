@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Verify the distribution identity of the app and its updater helpers.
+set -euo pipefail
+
+bundle=${1:?usage: script/verify-mac-signature app-bundle}
+identity='anchor apple generic and certificate leaf[subject.OU] = "888FLB45R8" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+codesign --verify --deep --strict -R "=$identity and identifier \"me.egrati.terminal\"" "$bundle"
+framework="$bundle/Contents/Frameworks/Sparkle.framework"
+components=("$bundle")
+if [[ -d "$framework" ]]; then
+  components+=(
+    "$framework/Versions/B/XPCServices/Downloader.xpc"
+    "$framework/Versions/B/XPCServices/Installer.xpc"
+    "$framework/Versions/B/Updater.app"
+    "$framework/Versions/B/Autoupdate"
+    "$framework"
+  )
+fi
+for component in "${components[@]}"; do
+  codesign --verify --strict -R "=$identity" "$component"
+  information=$(codesign --display --verbose=4 "$component" 2>&1)
+  if ! printf '%s\n' "$information" | grep -Eq '^CodeDirectory .*flags=.*\(.*runtime.*\)'; then
+    echo "Hardened runtime is missing: $component" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$information" | grep -Eq '^Timestamp=.+$'; then
+    echo "A trusted signing timestamp is missing: $component" >&2
+    exit 1
+  fi
+done

@@ -13,8 +13,8 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "$run_number" =~ ^[1-9][0-9]
 fi
 
 case "$branch" in
-  dev) tag="v$version-beta.$run_number" ;;
-  main) tag="v$version" ;;
+  dev) tag="v$version-beta.$run_number"; channel=beta ;;
+  main) tag="v$version"; channel=production ;;
   *) echo "Releases are only supported on dev and main" >&2; exit 1 ;;
 esac
 
@@ -33,4 +33,4 @@ elif git show-ref --verify --quiet "refs/tags/$tag"; then
   fi
 fi
 
-printf 'version=%s\ntag=%s\npublish=%s\n' "$version" "$tag" "$publish"
+printf 'version=%s\ntag=%s\nchannel=%s\npublish=%s\n' "$version" "$tag" "$channel" "$publish"

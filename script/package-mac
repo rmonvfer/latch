@@ -4,9 +4,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 tag=${1:?usage: script/package-mac release-tag}
+if [[ "${LATCH_REQUIRE_UPDATE_SIGNATURE:-0}" == 1 && -z "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+  echo "SPARKLE_PRIVATE_KEY is required for update publishing" >&2
+  exit 1
+fi
 if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
   echo "Expected a version tag such as v0.1.0 or v0.1.0-beta.1" >&2
   exit 1
+fi
+if [[ "$tag" == *-beta.* ]]; then
+  export LATCH_UPDATE_CHANNEL=beta
+else
+  export LATCH_UPDATE_CHANNEL=production
 fi
 if [[ "${LATCH_REQUIRE_NOTARIZATION:-0}" == 1 && -z "${LATCH_NOTARY_PROFILE:-}" ]]; then
   echo "LATCH_NOTARY_PROFILE is required for notarized packaging" >&2
@@ -17,6 +26,9 @@ script/bundle-mac
 bundle=target/release/Latch.app
 plutil -lint "$bundle/Contents/Info.plist"
 codesign --verify --deep --strict "$bundle"
+if [[ "${LATCH_REQUIRE_DEVELOPER_ID:-0}" == 1 ]]; then
+  script/verify-mac-signature "$bundle"
+fi
 architecture=$(uname -m)
 case "$architecture" in
   arm64|x86_64) ;;
@@ -57,4 +69,16 @@ PY
   ditto -c -k --sequesterRsrc --keepParent "$bundle" "target/dist/$archive"
 fi
 (cd target/dist && shasum -a 256 "$archive" > "$archive.sha256")
+if [[ -n "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+  sparkle_directory=$(script/prepare-sparkle)
+  signature=$(printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+    "$sparkle_directory/bin/sign_update" --ed-key-file - -p "target/dist/$archive")
+  feed="target/dist/$LATCH_UPDATE_CHANNEL-$architecture.xml"
+  build_number=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$bundle/Contents/Info.plist")
+  python3 script/update-feed.py --channel "$LATCH_UPDATE_CHANNEL" \
+    --architecture "$architecture" --tag "$tag" --build "$build_number" \
+    --archive "target/dist/$archive" --signature "$signature" --output "$feed"
+  printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+    "$sparkle_directory/bin/sign_update" --ed-key-file - "$feed"
+fi
 echo "target/dist/$archive"

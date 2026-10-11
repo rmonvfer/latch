@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      channel: ${{ steps.release.outputs.channel }}
       publish: ${{ steps.release.outputs.publish }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -26,7 +27,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Test release planning
-        run: python3 script/test-release-plan.py
+        run: |
+          python3 script/test-release-plan.py
+          python3 script/test-update-feed.py
       - id: release
         name: Select release channel and tag
         env:
@@ -71,6 +74,11 @@ jobs:
         run: cargo clippy --locked --release --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked --release --workspace
+      - name: Test update relaunch handoff
+        run: |
+          xcrun clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation \
+            crates/latch-platform/tests/updater_relaunch.m -o target/updater-relaunch-test
+          ./target/updater-relaunch-test
       - name: Import Developer ID certificate
         if: github.event_name != 'pull_request'
         env:
@@ -102,9 +110,43 @@ jobs:
       - name: Select pull request signing
         if: github.event_name == 'pull_request'
         run: echo 'LATCH_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+      - name: Configure Apple notarization
+        if: github.event_name != 'pull_request'
+        env:
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          REQUIRE_NOTARIZATION: ${{ vars.LATCH_REQUIRE_NOTARIZATION }}
+        run: |
+          if [[ -z "$NOTARY_KEY" && -z "$NOTARY_KEY_ID" && -z "$NOTARY_ISSUER_ID" ]]; then
+            if [[ "$REQUIRE_NOTARIZATION" == 1 ]]; then
+              echo "Apple notarization credentials are required for this release." >&2
+              exit 1
+            fi
+            echo "Notarization credentials are absent; this release will be Developer ID signed without an Apple ticket."
+            exit 0
+          fi
+          if [[ -z "$NOTARY_KEY" || -z "$NOTARY_KEY_ID" || -z "$NOTARY_ISSUER_ID" ]]; then
+            echo "All three APPLE_NOTARY_KEY, APPLE_NOTARY_KEY_ID and APPLE_NOTARY_ISSUER_ID secrets are required." >&2
+            exit 1
+          fi
+          notary_key="$RUNNER_TEMP/latch-notary.p8"
+          umask 077
+          printf '%s' "$NOTARY_KEY" > "$notary_key"
+          xcrun notarytool store-credentials latch-release \
+            --key "$notary_key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$LATCH_SIGNING_KEYCHAIN"
+          {
+            echo 'LATCH_NOTARY_PROFILE=latch-release'
+            echo "LATCH_NOTARY_KEYCHAIN=$LATCH_SIGNING_KEYCHAIN"
+            echo 'LATCH_REQUIRE_NOTARIZATION=1'
+          } >> "$GITHUB_ENV"
       - name: Build and package
         env:
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          SPARKLE_PRIVATE_KEY: ${{ github.event_name != 'pull_request' && secrets.SPARKLE_PRIVATE_KEY || '' }}
+          LATCH_REQUIRE_UPDATE_SIGNATURE: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          LATCH_REQUIRE_DEVELOPER_ID: ${{ github.event_name != 'pull_request' && '1' || '0' }}
         run: script/package-mac "$RELEASE_TAG"
       - name: Remove signing credentials
         if: always()
@@ -114,10 +156,14 @@ jobs:
             security delete-keychain "$keychain_path"
           fi
           rm -f "$RUNNER_TEMP/latch-signing.p12"
+          rm -f "$RUNNER_TEMP/latch-notary.p8"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ matrix.architecture }}
-          path: target/dist/*
+          path: |
+            target/dist/Latch-${{ needs.plan.outputs.tag }}-macos-${{ matrix.architecture }}.zip
+            target/dist/Latch-${{ needs.plan.outputs.tag }}-macos-${{ matrix.architecture }}.zip.sha256
+            ${{ github.event_name != 'pull_request' && format('target/dist/{0}-{1}.xml', needs.plan.outputs.channel, matrix.architecture) || '' }}
           if-no-files-found: error
           retention-days: 14
 
@@ -159,9 +205,9 @@ jobs:
             title="Latch $RELEASE_TAG (Beta)"
           fi
           cat > notes.md <<'NOTES'
-          Download the ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`), unzip it, and move `Latch.app` to Applications. Keep it at that location across upgrades so the session runtime can reconnect.
+          Download the ZIP for Apple Silicon (`arm64`) or Intel (`x86_64`), unzip it, and move `Latch.app` to Applications. Latch checks its channel for signed updates and preserves compatible running terminal sessions across app replacement.
 
-          Builds are signed with an Apple Developer ID certificate and hardened runtime, without Apple notarization. macOS may require approval under System Settings > Privacy & Security on first launch.
+          Builds are signed with an Apple Developer ID certificate and hardened runtime. Apple notarization is included when the release has notarization credentials; without a notarization ticket, macOS may require approval under System Settings > Privacy & Security on first launch.
 
           Each ZIP has a SHA-256 checksum. The app bundle includes the application and theme licenses.
           NOTES
@@ -173,3 +219,33 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" dist/* --clobber
           gh release edit "$RELEASE_TAG" --draft=false "${flags[@]}"
+      - name: Publish signed update feeds
+        run: |
+          if ! gh release view update-feeds >/dev/null 2>&1; then
+            gh release create update-feeds --target "$RELEASE_COMMIT" \
+              --title "Latch update feeds" --prerelease --latest=false \
+              --notes "Signed update metadata for Latch's production and beta channels. Download the app from its versioned releases." \
+              || gh release view update-feeds >/dev/null
+          fi
+          gh release download "$RELEASE_TAG" --pattern '*.xml' --dir published-feeds
+          for feed in published-feeds/*.xml; do
+            name=$(basename "$feed")
+            if gh release view update-feeds --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              mkdir -p current-feeds
+              gh release download update-feeds --pattern "$name" --dir current-feeds
+              if ! python3 - "$feed" "current-feeds/$name" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          version = './channel/item/{http://www.andymatuschak.org/xml-namespaces/sparkle}version'
+          incoming = ET.parse(sys.argv[1]).findtext(version)
+          current = ET.parse(sys.argv[2]).findtext(version)
+          sys.exit(0 if current is None or int(incoming) >= int(current) else 1)
+          PY
+              then
+                echo "A newer $name feed is already published."
+                continue
+              fi
+            fi
+            gh release upload update-feeds "$feed" --clobber
+          done
